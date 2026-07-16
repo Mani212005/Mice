@@ -1,0 +1,13 @@
+[package]
+name = "mice-linux-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mice-linux-agent"
+path = "src/main.rs"
+
+[dependencies]
+mice-ipc = { path = "../crates/mice-ipc" }
+serde_json.workspace = true
