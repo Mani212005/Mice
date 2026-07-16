@@ -1,0 +1,19 @@
+# Rust and Swift build output
+/target/
+/agent-macos/.build/
+
+# macOS and editor state
+.DS_Store
+.idea/
+.vscode/
+
+# Local extension/package artifacts
+/browser-ext/*.zip
+
+# Never commit local configuration, credentials, captures, or clipboard data
+config.toml
+*.pem
+*.key
+*.png
+*.jpg
+*.jpeg
