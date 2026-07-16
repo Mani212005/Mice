@@ -1,0 +1,18 @@
+[package]
+name = "mice-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mice"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+mice-core = { path = "../mice-core" }
+mice-ipc = { path = "../mice-ipc" }
+mice-providers = { path = "../mice-providers" }
+ratatui = "0.29"
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "mice-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mice-ipc = { path = "../mice-ipc" }
+mice-providers = { path = "../mice-providers" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
