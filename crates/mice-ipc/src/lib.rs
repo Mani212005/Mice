@@ -203,6 +203,9 @@ pub enum AgentCommand {
     ClipboardSet {
         contents: ClipboardContents,
     },
+    /// Paste the already-prepared clipboard contents into the app that remains
+    /// frontmost behind MICE's non-activating overlay panel.
+    ClipboardPaste,
     OverlayDismiss,
     AgentStop,
 }
@@ -273,6 +276,7 @@ impl AgentCommand {
                     "pngBase64": contents.png_base64,
                 }),
             ),
+            Self::ClipboardPaste => ("clipboard.paste", json!({})),
             Self::OverlayDismiss => ("overlay.dismiss", json!({})),
             Self::AgentStop => ("agent.stop", json!({})),
         };
@@ -377,6 +381,15 @@ mod tests {
                 jsonrpc: "2.0".into(),
                 method: "clipboard.set".into(),
                 params: json!({"text": "summary", "html": "<p>summary</p>", "rtf": "{\\rtf1 summary}", "pngBase64": null}),
+            }
+        );
+
+        assert_eq!(
+            AgentCommand::ClipboardPaste.notification(),
+            RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: "clipboard.paste".into(),
+                params: json!({}),
             }
         );
     }

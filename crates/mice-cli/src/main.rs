@@ -2349,6 +2349,10 @@ fn selection_result_actions() -> Vec<mice_ipc::OverlayAction> {
             id: "copy".into(),
             label: "Copy".into(),
         },
+        mice_ipc::OverlayAction {
+            id: "send_to".into(),
+            label: "Send to…".into(),
+        },
     ]
 }
 
@@ -2627,6 +2631,16 @@ fn handle_overlay_action(
             if let Some(entry) = cache.as_mut() {
                 entry.response = response;
             }
+        }
+        "send_paste" => {
+            send_command(writer, AgentCommand::ClipboardPaste)?;
+            send_command(
+                writer,
+                AgentCommand::OverlayResult {
+                    session_id: session_id.to_owned(),
+                    actions: selection_result_actions(),
+                },
+            )?;
         }
         _ => {}
     }
@@ -3784,6 +3798,15 @@ mod hover_tests {
         ));
         assert!(!is_short_phrase("line one\nline two"));
         assert!(!is_short_phrase("   "));
+    }
+
+    #[test]
+    fn selection_results_offer_copy_deeper_explanation_and_send_to() {
+        let action_ids = selection_result_actions()
+            .into_iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        assert_eq!(action_ids, ["go_deeper", "copy", "send_to"]);
     }
 
     #[test]

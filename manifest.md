@@ -64,6 +64,9 @@ models, or user configuration belong in this repository.
   map-reduce path as a large selection, so it does not overflow a local model
   after an otherwise successful file-scale summary. `mice stop` sends an
   owner-only shutdown frame to the running daemon's bridge socket.
+- **Phase 2b Send to…:** completed text results offer a native Send to… menu.
+  Its first destination pastes MICE's existing rich clipboard result into the
+  app that remains frontmost behind the non-activating panel.
 - **Goal Guide (M6a):** press **Control+Option+Space**, describe a goal, then
   review, revise, or accept a 3–8 step advisory plan. Plans flag login,
   payment, account-setup, and personal-data steps as user-only. The flow has

@@ -383,6 +383,22 @@ struct MiceMacAgent {
         writeFrame(data)
     }
 
+    /// The overlay is a non-activating panel, so the user's document remains
+    /// the key destination. The result was already placed on the pasteboard by
+    /// the core; synthesize the same Command-V a person would use to preserve
+    /// its text/HTML/RTF representations.
+    static func pasteClipboard() {
+        guard let source = CGEventSource(stateID: .combinedSessionState),
+              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else {
+            return
+        }
+        keyDown.flags = .maskCommand
+        keyUp.flags = .maskCommand
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+    }
+
     static func selectedText() -> (text: String, html: String?, source: String) {
         if let text = try? AXSupport.selectedText(), !text.isEmpty {
             return (text, nil, "ax")
@@ -642,6 +658,8 @@ private final class OverlayController: NSObject {
                let data = Data(base64Encoded: pngBase64) {
                 pasteboard.setData(data, forType: .png)
             }
+        case "clipboard.paste":
+            MiceMacAgent.pasteClipboard()
         case "overlay.dismiss":
             panel.orderOut(nil)
         case "agent.stop":
@@ -697,7 +715,28 @@ private final class OverlayController: NSObject {
 
     @objc private func actionButtonClicked(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue, let session = currentSessionId else { return }
+        if id == "send_to" {
+            showSendMenu(from: sender)
+            return
+        }
         MiceMacAgent.sendOverlayAction(sessionID: session, actionID: id)
+    }
+
+    private func showSendMenu(from sender: NSButton) {
+        let menu = NSMenu()
+        let paste = NSMenuItem(
+            title: "Paste into frontmost app",
+            action: #selector(sendPasteToFrontmostApp(_:)),
+            keyEquivalent: ""
+        )
+        paste.target = self
+        menu.addItem(paste)
+        menu.popUp(positioning: paste, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
+    @objc private func sendPasteToFrontmostApp(_ sender: NSMenuItem) {
+        guard let session = currentSessionId else { return }
+        MiceMacAgent.sendOverlayAction(sessionID: session, actionID: "send_paste")
     }
 
     private func showPrompt(

@@ -32,9 +32,9 @@ Done:
   auto-detection routes a single word / short phrase to a dictionary-style
   answer on the same summarize gesture.
 
-Not built (this plan): Phase 2b (Send to…), Phase 3 (MICE MCP server), Phase 4
-(MICE MCP client), Phase 5 (M8–M10), the curl→ureq migration, and the review
-fixes below.
+Not built (this plan): Phase 3 (MICE MCP server), Phase 4 (MICE MCP client),
+Phase 5 (M8–M10), and the curl→ureq migration. Phase 2b and the bounded Go
+Deeper / `mice stop` review fixes are complete.
 
 ## Review findings to fold in
 
@@ -54,6 +54,12 @@ fixes below.
 ---
 
 ## Phase 2b — "Send to…" button
+
+**Complete (v1):** result actions now include **Send to…**, whose native menu
+offers **Paste into frontmost app**. It reuses the rich text/HTML/RTF clipboard
+already set for the result and synthesizes a normal Command-V; the overlay is
+non-activating, so it does not take focus from the destination. Richer MCP and
+Codex destinations remain deferred to Phases 3–4.
 
 Add a `Send to…` action to the result panel (`selection_result_actions` in
 `mice-cli` + the button row in `OverlayController`). v1 destinations, chosen
