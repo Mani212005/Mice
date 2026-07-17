@@ -400,9 +400,16 @@ struct MiceMacAgent {
     /// its text/HTML/RTF representations.
     static func pasteClipboard() {
         // A menu click can temporarily take focus even though the panel itself
-        // is non-activating. Restore the document app first, then wait until
-        // AppKit has completed activation before posting the normal shortcut.
-        pasteDestination?.activate(options: [])
+        // is non-activating. Prefer the app that is frontmost *when Send to…
+        // is chosen, so a person can switch from the source page to their
+        // document before sending. Fall back to the app remembered when the
+        // result opened if the menu temporarily owns frontmost status.
+        let currentDestination = NSWorkspace.shared.frontmostApplication
+            .flatMap { app in
+                app.processIdentifier == ProcessInfo.processInfo.processIdentifier ? nil : app
+            }
+        let destination = currentDestination ?? pasteDestination
+        destination?.activate(options: [])
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) {
             postPasteShortcut()
         }

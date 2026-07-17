@@ -58,9 +58,10 @@ Deeper / `mice stop` review fixes are complete.
 **Complete (v1):** result actions now include **Send to…**, whose native menu
 offers **Paste into frontmost app**. It reuses the rich text/HTML/RTF clipboard
 already set for the result and synthesizes a normal Command-V; the overlay is
-non-activating, and MICE reactivates the destination captured when the result
-opened before pasting. Richer MCP and Codex destinations remain deferred to
-Phases 3–4.
+non-activating, and MICE reactivates the app frontmost at Send to… time before
+pasting, falling back to the app captured when the result opened. A person may
+therefore switch to a destination document first. Richer MCP and Codex
+destinations remain deferred to Phases 3–4.
 
 Add a `Send to…` action to the result panel (`selection_result_actions` in
 `mice-cli` + the button row in `OverlayController`). v1 destinations, chosen
