@@ -67,8 +67,12 @@ models, or user configuration belong in this repository.
   after an otherwise successful file-scale summary. `mice stop` sends an
   owner-only shutdown frame to the running daemon's bridge socket.
 - **Concise first summaries:** the normal selected-text summarize action asks
-  for—and enforces—a 500-character maximum. Go Deeper is deliberately not
-  capped.
+  for—and enforces—a 500-character maximum. It is a quick recap of the
+  selection's purpose and two or three key points; Go Deeper is deliberately
+  not capped. After the recap completes, MICE silently prepares one deeper
+  answer in the configured provider/privacy lane. It is never shown, copied,
+  or pasted unless the user presses **Go Deeper**; one background job at a time
+  prevents local-model contention when selections change quickly.
 - **Phase 3 local MCP server:** `mice mcp-server` provides stdio JSON-RPC MCP
   tools for `summarize_text`, `summarize_file`, `explain_code`, `define_word`,
   and `quick_answer`. These use only the configured local Ollama model; MICE

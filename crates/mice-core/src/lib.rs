@@ -495,9 +495,9 @@ pub fn looks_like_code(text: &str) -> bool {
 
 pub fn selection_summary_instruction(text: &str) -> &'static str {
     if looks_like_code(text) {
-        "In no more than 500 characters, state what this file or module does, its main components and entry points, and notable dependencies. Give a newcomer's orientation rather than a line-by-line walkthrough."
+        "Give a quick newcomer-oriented recap in no more than 500 characters: state what this file or module is for, then only its two or three most important components, entry points, or dependencies. Skip introductions and line-by-line detail."
     } else {
-        "Summarize the selected content and its key points in no more than 500 characters."
+        "Give a quick recap in no more than 500 characters: state the page or selection's main purpose, then only its two or three most important points. Skip introductions, examples, and minor detail."
     }
 }
 
@@ -818,7 +818,7 @@ mod tests {
         assert!(!looks_like_code(prose));
         assert_eq!(
             selection_summary_instruction(prose),
-            "Summarize the selected content and its key points in no more than 500 characters."
+            "Give a quick recap in no more than 500 characters: state the page or selection's main purpose, then only its two or three most important points. Skip introductions, examples, and minor detail."
         );
     }
 

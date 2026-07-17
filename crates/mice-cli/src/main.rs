@@ -9,7 +9,11 @@ use std::{
     },
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -2037,6 +2041,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let mut goal_plans = HashMap::<String, GoalPlanResult>::new();
     let mut active_guides = HashMap::<String, ActiveGuide>::new();
     let mut selection_cache: Option<SelectionCache> = None;
+    // At most one speculative deeper explanation runs at once. This keeps a
+    // local model responsive if someone makes several selections in a row.
+    let go_deeper_prefetch_in_flight = Arc::new(AtomicBool::new(false));
     while let Ok(msg) = read_frame::<mice_ipc::RpcNotification>(&mut agent.reader) {
         if msg.method == "goal.request" {
             let Some(session_id) = msg.params["sessionId"].as_str() else {
@@ -2122,10 +2129,16 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             let text = selection.text.clone();
             match handle_selection_action(&mut agent.stdin, &config, selection) {
                 Ok(Some(response)) => {
+                    let prepared_go_deeper = start_go_deeper_prefetch(
+                        &config,
+                        text.clone(),
+                        Arc::clone(&go_deeper_prefetch_in_flight),
+                    );
                     selection_cache = Some(SelectionCache {
                         session_id,
                         text,
                         response,
+                        prepared_go_deeper,
                     });
                 }
                 Ok(None) => {}
@@ -2329,6 +2342,7 @@ struct SelectionCache {
     session_id: String,
     text: String,
     response: String,
+    prepared_go_deeper: Option<Receiver<Result<String, String>>>,
 }
 
 /// A single word or very short phrase is treated as "define this" rather than a
@@ -2538,6 +2552,128 @@ fn stream_chunked_go_deeper(
     )
 }
 
+/// Begin a deeper explanation only after the compact recap is complete. It is
+/// intentionally silent: the result is displayed only if the person selects
+/// Go Deeper. A single in-flight job avoids competing local-model requests.
+fn start_go_deeper_prefetch(
+    config: &mice_core::Config,
+    text: String,
+    in_flight: Arc<AtomicBool>,
+) -> Option<Receiver<Result<String, String>>> {
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let config = config.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = prepare_go_deeper(&config, &text).map_err(|error| error.to_string());
+        let _ = sender.send(result);
+        in_flight.store(false, Ordering::Release);
+    });
+    Some(receiver)
+}
+
+/// Produce a deeper explanation without touching the overlay or clipboard, so
+/// it can be ready when the user explicitly asks to see it.
+fn prepare_go_deeper(
+    config: &mice_core::Config,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let request = RouteRequest {
+        artifacts: Artifacts {
+            text: Some(text.to_owned()),
+            ..Default::default()
+        },
+        instruction: GO_DEEPER_INSTRUCTION.to_owned(),
+        action: Some(Action::Explain),
+        privacy_mode: config.privacy_mode,
+        cost_policy: config.cost_policy,
+        model_preferences: ModelPreferences {
+            local_model: config.local_model.clone(),
+            cloud_model: config.cloud_model.clone(),
+        },
+    };
+    match route_selection_summary(&request, estimate_tokens(text))? {
+        SelectionSummaryRoute::SingleShot(route) => {
+            collect_selected_response(&route.model, &request.instruction, text)
+        }
+        SelectionSummaryRoute::Chunked { model } => collect_chunked_go_deeper(&model, text),
+    }
+}
+
+fn collect_selected_response(
+    selected: &mice_providers::ModelDescriptor,
+    instruction: &str,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut response = String::new();
+    if selected.locality == mice_providers::Locality::Local {
+        stream_ollama(selected.id, instruction, Some(text), |chunk| {
+            response.push_str(chunk);
+            Ok(())
+        })?;
+    } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
+        stream_groq(selected.id, instruction, Some(text), |chunk| {
+            response.push_str(chunk);
+            Ok(())
+        })?;
+    } else {
+        stream_openai(selected.id, instruction, Some(text), |chunk| {
+            response.push_str(chunk);
+            Ok(())
+        })?;
+    }
+    if response.trim().is_empty() {
+        return Err("The model returned an empty deeper explanation.".into());
+    }
+    Ok(response)
+}
+
+fn collect_chunked_go_deeper(
+    model: &mice_providers::ModelDescriptor,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let chunks = structural_summary_chunks(text, LOCAL_SUMMARY_CHUNK_TOKENS);
+    if chunks.is_empty() {
+        return Ok(String::new());
+    }
+    let mut summaries = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        summaries.push(collect_selected_response(
+            model,
+            GO_DEEPER_PART_INSTRUCTION,
+            &chunk,
+        )?);
+    }
+    let reduce_budget = model
+        .input_budget_tokens
+        .unwrap_or(LOCAL_SUMMARY_REDUCE_TOKENS)
+        .min(LOCAL_SUMMARY_REDUCE_TOKENS);
+    loop {
+        let batches = summary_reduce_batches(&summaries, reduce_budget);
+        if batches.len() == 1 {
+            return collect_selected_response(
+                model,
+                GO_DEEPER_INSTRUCTION,
+                &batches[0].join("\n\n"),
+            );
+        }
+        summaries = batches
+            .iter()
+            .map(|batch| {
+                collect_selected_response(
+                    model,
+                    GO_DEEPER_REDUCTION_INSTRUCTION,
+                    &batch.join("\n\n"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+}
+
 /// Re-run the cached selection with a deeper-explanation prompt, streaming into
 /// the same panel and re-offering the action buttons.
 fn run_go_deeper(
@@ -2589,6 +2725,31 @@ fn run_go_deeper(
     Ok(response)
 }
 
+fn present_prepared_go_deeper(
+    writer: &mut ChildStdin,
+    session_id: &str,
+    response: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !response.is_empty() {
+        send_command(
+            writer,
+            AgentCommand::OverlayAppendResult {
+                chunk: response.clone(),
+            },
+        )?;
+        send_command(writer, clipboard_command(&response))?;
+    }
+    send_command(writer, AgentCommand::OverlayFinishResult { text: None })?;
+    send_command(
+        writer,
+        AgentCommand::OverlayResult {
+            session_id: session_id.to_owned(),
+            actions: selection_result_actions(),
+        },
+    )?;
+    Ok(response)
+}
+
 /// Handle a button press from the interactive result panel.
 fn handle_overlay_action(
     writer: &mut ChildStdin,
@@ -2618,7 +2779,27 @@ fn handle_overlay_action(
             )?;
         }
         "go_deeper" => {
-            let response = run_go_deeper(writer, config, session_id, &text)?;
+            let prepared = cache
+                .as_mut()
+                .and_then(|entry| entry.prepared_go_deeper.take());
+            let response = if let Some(receiver) = prepared {
+                send_command(
+                    writer,
+                    AgentCommand::OverlayShow {
+                        text: "Preparing your deeper explanation…".into(),
+                    },
+                )?;
+                match receiver.recv() {
+                    Ok(Ok(response)) => present_prepared_go_deeper(writer, session_id, response)?,
+                    Ok(Err(error)) => {
+                        eprintln!("MICE prepared Go Deeper failed; retrying on request: {error}");
+                        run_go_deeper(writer, config, session_id, &text)?
+                    }
+                    Err(_) => run_go_deeper(writer, config, session_id, &text)?,
+                }
+            } else {
+                run_go_deeper(writer, config, session_id, &text)?
+            };
             if let Some(entry) = cache.as_mut() {
                 entry.response = response;
             }
