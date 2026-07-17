@@ -708,6 +708,17 @@ mod tests {
     }
 
     #[test]
+    fn large_local_only_explanation_uses_the_chunked_selection_route() {
+        let mut request = summary_request(PrivacyMode::LocalOnly, ModelPreferences::default());
+        request.action = Some(Action::Explain);
+        request.instruction = "Explain this in depth".into();
+        assert!(matches!(
+            route_selection_summary(&request, 12_001).unwrap(),
+            SelectionSummaryRoute::Chunked { model } if model.id == DEFAULT_LOCAL_MODEL
+        ));
+    }
+
+    #[test]
     fn ollama_http_client_sends_context_budget_and_streams_ndjson() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());

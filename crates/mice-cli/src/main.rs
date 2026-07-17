@@ -62,6 +62,7 @@ fn main() {
         Some("setup-browser") => setup_browser(),
         Some("autopilot") => autopilot(),
         Some("start") => start(),
+        Some("stop") => stop(),
         Some("route") => route_preview(),
         Some("ask") => ask(),
         _ if chrome_native_host => native_host(),
@@ -299,6 +300,16 @@ fn handle_native_bridge(
     loop {
         let message: serde_json::Value = read_frame(&mut stream)?;
         match message["type"].as_str() {
+            Some("daemon.stop") => {
+                write_frame(&mut stream, &serde_json::json!({"type":"daemon.stopping"}))?;
+                let path = bridge_socket_path()?;
+                let _ = std::fs::remove_file(path);
+                // `mice start` owns the native agent. Exiting this process
+                // closes the IPC pipes; the agent treats that as shutdown and
+                // terminates too. The socket is removed first so a subsequent
+                // start never mistakes it for a live daemon.
+                std::process::exit(0);
+            }
             Some("autopilot.start") => {
                 let goal = message["goal"]
                     .as_str()
@@ -1146,6 +1157,21 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
     }
+    Ok(())
+}
+
+/// Ask the running daemon to stop over its owner-only bridge socket. This is
+/// deliberately not a process-name kill: it cannot affect another MICE run or
+/// an unrelated program, and the daemon can acknowledge the request first.
+fn stop() -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream =
+        UnixStream::connect(bridge_socket_path()?).map_err(|_| "MICE is not running.")?;
+    write_frame(&mut stream, &serde_json::json!({"type":"daemon.stop"}))?;
+    let response: serde_json::Value = read_frame(&mut stream)?;
+    if response["type"] != "daemon.stopping" {
+        return Err("The MICE daemon did not acknowledge the stop request.".into());
+    }
+    println!("MICE is stopping.");
     Ok(())
 }
 
@@ -2379,6 +2405,38 @@ fn stream_chunked_selection_summary(
     text: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let source_is_code = looks_like_code(text);
+    stream_chunked_local_text(
+        writer,
+        model,
+        text,
+        ChunkedTextPlan {
+            part_instruction: chunk_summary_instruction(source_is_code),
+            reduction_instruction: reduce_summary_instruction(source_is_code),
+            final_instruction: reduce_summary_instruction(source_is_code),
+            part_verb: "Summarizing",
+            combine_verb: "Combining summaries",
+            final_status: "Preparing your complete summary…",
+        },
+    )
+}
+
+struct ChunkedTextPlan<'a> {
+    part_instruction: &'a str,
+    reduction_instruction: &'a str,
+    final_instruction: &'a str,
+    part_verb: &'a str,
+    combine_verb: &'a str,
+    final_status: &'a str,
+}
+
+/// Keep a large local text action within its model context. Partial model
+/// output stays private; only the final response streams into the overlay.
+fn stream_chunked_local_text(
+    writer: &mut ChildStdin,
+    model: &mice_providers::ModelDescriptor,
+    text: &str,
+    plan: ChunkedTextPlan<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let chunks = structural_summary_chunks(text, LOCAL_SUMMARY_CHUNK_TOKENS);
     if chunks.is_empty() {
         return Ok(String::new());
@@ -2389,21 +2447,16 @@ fn stream_chunked_selection_summary(
         send_command(
             writer,
             AgentCommand::OverlayUpdate {
-                text: format!("Summarizing part {} of {}…", index + 1, chunks.len()),
+                text: format!("{} part {} of {}…", plan.part_verb, index + 1, chunks.len()),
             },
         )?;
         let mut summary = String::new();
-        stream_ollama(
-            model.id,
-            chunk_summary_instruction(source_is_code),
-            Some(chunk),
-            |output| {
-                summary.push_str(output);
-                Ok(())
-            },
-        )?;
+        stream_ollama(model.id, plan.part_instruction, Some(chunk), |output| {
+            summary.push_str(output);
+            Ok(())
+        })?;
         if summary.trim().is_empty() {
-            return Err("The local model returned an empty summary chunk.".into());
+            return Err("The local model returned an empty partial result.".into());
         }
         summaries.push(summary);
     }
@@ -2418,13 +2471,13 @@ fn stream_chunked_selection_summary(
             send_command(
                 writer,
                 AgentCommand::OverlayUpdate {
-                    text: "Preparing your complete summary…".into(),
+                    text: plan.final_status.into(),
                 },
             )?;
             let mut response = String::new();
             stream_ollama(
                 model.id,
-                reduce_summary_instruction(source_is_code),
+                plan.final_instruction,
                 Some(&batches[0].join("\n\n")),
                 |output| {
                     response.push_str(output);
@@ -2445,13 +2498,13 @@ fn stream_chunked_selection_summary(
             send_command(
                 writer,
                 AgentCommand::OverlayUpdate {
-                    text: format!("Combining summaries {} of {}…", index + 1, total_batches),
+                    text: format!("{} {} of {}…", plan.combine_verb, index + 1, total_batches),
                 },
             )?;
             let mut summary = String::new();
             stream_ollama(
                 model.id,
-                reduce_summary_instruction(source_is_code),
+                plan.reduction_instruction,
                 Some(&batch.join("\n\n")),
                 |output| {
                     summary.push_str(output);
@@ -2465,6 +2518,29 @@ fn stream_chunked_selection_summary(
         }
         summaries = reduced;
     }
+}
+
+const GO_DEEPER_PART_INSTRUCTION: &str = "Extract the specific facts, definitions, background, and implications from this part of the selected content. Preserve enough context for a later answer to explain the whole selection in depth.";
+const GO_DEEPER_REDUCTION_INSTRUCTION: &str = "Combine these partial analyses into a compact, accurate foundation for a deeper explanation. Retain key terms, context, nuance, and implications from every part.";
+
+fn stream_chunked_go_deeper(
+    writer: &mut ChildStdin,
+    model: &mice_providers::ModelDescriptor,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    stream_chunked_local_text(
+        writer,
+        model,
+        text,
+        ChunkedTextPlan {
+            part_instruction: GO_DEEPER_PART_INSTRUCTION,
+            reduction_instruction: GO_DEEPER_REDUCTION_INSTRUCTION,
+            final_instruction: GO_DEEPER_INSTRUCTION,
+            part_verb: "Going deeper into",
+            combine_verb: "Combining context",
+            final_status: "Preparing your deeper explanation…",
+        },
+    )
 }
 
 /// Re-run the cached selection with a deeper-explanation prompt, streaming into
@@ -2489,14 +2565,21 @@ fn run_go_deeper(
             cloud_model: config.cloud_model.clone(),
         },
     };
-    let selected = route(&request)?.model;
-    send_command(
-        writer,
-        AgentCommand::OverlayShow {
-            text: "Going deeper…".into(),
-        },
-    )?;
-    let response = stream_selected(writer, &selected, &request.instruction, text)?;
+    let (selected, route_notice, chunked_model) =
+        match route_selection_summary(&request, estimate_tokens(text))? {
+            SelectionSummaryRoute::SingleShot(route) => (route.model, route.user_notice, None),
+            SelectionSummaryRoute::Chunked { model } => (model.clone(), None, Some(model)),
+        };
+    let status = route_notice.map_or_else(
+        || "Going deeper…".into(),
+        |notice| format!("{notice}\n\nGoing deeper…"),
+    );
+    send_command(writer, AgentCommand::OverlayShow { text: status })?;
+    let response = if let Some(model) = chunked_model {
+        stream_chunked_go_deeper(writer, &model, text)?
+    } else {
+        stream_selected(writer, &selected, &request.instruction, text)?
+    };
     if !response.is_empty() {
         send_command(writer, clipboard_command(&response))?;
     }

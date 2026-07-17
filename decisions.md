@@ -239,6 +239,17 @@ captures.
   prose receives a general key-points summary. Content is transient and is not
   written to the repository or a runtime history.
 
+## Product-polish follow-on fixes
+
+- Go Deeper shares M7's selection-size routing. Large `local_only` selections
+  are analyzed and reduced locally; large `cloud_allowed` selections use the
+  configured cloud lane with a visible notice. This prevents a cached original
+  selection from bypassing the local model's context budget.
+- `mice stop` sends a shutdown request only through MICE's mode-0600 bridge
+  socket. The daemon acknowledges, removes its runtime socket, and exits; the
+  native child receives closed IPC and exits with it. No process-name or PID
+  kill is used.
+
 ## Linux preparation
 
 - `agent-linux/` is a Rust scaffold that sends the shared IPC initialization

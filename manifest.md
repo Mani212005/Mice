@@ -60,6 +60,10 @@ models, or user configuration belong in this repository.
   selections are structurally chunked and map-reduced with visible progress;
   oversized `cloud_allowed` selections visibly use the configured cloud model.
   Small selections remain single-shot.
+- **M7 follow-on fixes:** Go Deeper applies the same bounded routing and local
+  map-reduce path as a large selection, so it does not overflow a local model
+  after an otherwise successful file-scale summary. `mice stop` sends an
+  owner-only shutdown frame to the running daemon's bridge socket.
 - **Goal Guide (M6a):** press **Control+Option+Space**, describe a goal, then
   review, revise, or accept a 3–8 step advisory plan. Plans flag login,
   payment, account-setup, and personal-data steps as user-only. The flow has
@@ -74,6 +78,13 @@ models, or user configuration belong in this repository.
   highlights the verified selector—without clicking or typing.
 - `agent-linux` implements the shared handshake only and advertises no Linux
   desktop capabilities yet.
+
+## Product-polish review findings
+
+- Resolved: Go Deeper now uses the bounded M7 selection route; `mice stop`
+  cleanly requests shutdown through the owner-only bridge socket.
+- Open: cloud-provider requests still put API keys in `curl` arguments. The
+  planned curl-to-`ureq` migration must move authorization into HTTP headers.
 
 ## Product polish — Phase 1 (interactive overlay)
 
@@ -216,8 +227,8 @@ models, or user configuration belong in this repository.
    vision and add multi-viewport spreadsheet reading.
 2. Remove API keys from curl argument lists, preferably by moving provider HTTP
    calls to a Rust client.
-3. Add `mice stop`, input-monitoring status, correct multi-display capture, and
-   a lightweight/overlay-only mode for one-shot commands.
+3. Add input-monitoring status, correct multi-display capture, and a
+   lightweight/overlay-only mode for one-shot commands.
 4. Address prompt/agent backpressure, stream error-body reporting, Unicode RTF,
    settings validation, and long-result overlay presentation.
 5. Add a non-persistent native clipboard observer after user Cmd-C, then build
