@@ -42,6 +42,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 fn main() {
     let command = env::args().nth(1);
@@ -65,6 +66,7 @@ fn main() {
         Some("stop") => stop(),
         Some("route") => route_preview(),
         Some("ask") => ask(),
+        Some("mcp-server") => mcp_server(),
         _ if chrome_native_host => native_host(),
         _ => usage(),
     };
@@ -76,10 +78,11 @@ fn main() {
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Usage: mice <start|stop|status|doctor|settings|actions|browser-bridge|setup-browser|autopilot|route|ask>"
+        "Usage: mice <start|stop|status|doctor|settings|actions|browser-bridge|setup-browser|autopilot|route|ask|mcp-server>"
     );
     println!("       mice ask [--action <preset>] <instruction>");
     println!("       mice autopilot <goal>");
+    println!("       mice mcp-server");
     Ok(())
 }
 
@@ -98,6 +101,9 @@ struct BrowserElement {
 }
 
 const MAX_GUIDE_CANDIDATES: usize = 60;
+/// A first-pass selection summary should be easy to scan. The streaming guard
+/// below enforces this even when a provider ignores the instruction.
+const INITIAL_SUMMARY_MAX_CHARACTERS: usize = 500;
 const MAX_GUIDE_LABEL_CHARS: usize = 120;
 const MAX_GUIDE_ROLE_CHARS: usize = 40;
 const MAX_GUIDE_SELECTOR_CHARS: usize = 256;
@@ -2363,37 +2369,20 @@ fn stream_selected(
     selected: &mice_providers::ModelDescriptor,
     instruction: &str,
     text: &str,
+    max_response_characters: Option<usize>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut response = String::new();
     let result = if selected.locality == mice_providers::Locality::Local {
         stream_ollama(selected.id, instruction, Some(text), |chunk| {
-            response.push_str(chunk);
-            send_command(
-                writer,
-                AgentCommand::OverlayAppendResult {
-                    chunk: chunk.into(),
-                },
-            )
+            append_limited_overlay_chunk(writer, &mut response, chunk, max_response_characters)
         })
     } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
         stream_groq(selected.id, instruction, Some(text), |chunk| {
-            response.push_str(chunk);
-            send_command(
-                writer,
-                AgentCommand::OverlayAppendResult {
-                    chunk: chunk.into(),
-                },
-            )
+            append_limited_overlay_chunk(writer, &mut response, chunk, max_response_characters)
         })
     } else {
         stream_openai(selected.id, instruction, Some(text), |chunk| {
-            response.push_str(chunk);
-            send_command(
-                writer,
-                AgentCommand::OverlayAppendResult {
-                    chunk: chunk.into(),
-                },
-            )
+            append_limited_overlay_chunk(writer, &mut response, chunk, max_response_characters)
         })
     };
     result?;
@@ -2420,6 +2409,7 @@ fn stream_chunked_selection_summary(
             part_verb: "Summarizing",
             combine_verb: "Combining summaries",
             final_status: "Preparing your complete summary…",
+            max_response_characters: Some(INITIAL_SUMMARY_MAX_CHARACTERS),
         },
     )
 }
@@ -2431,6 +2421,7 @@ struct ChunkedTextPlan<'a> {
     part_verb: &'a str,
     combine_verb: &'a str,
     final_status: &'a str,
+    max_response_characters: Option<usize>,
 }
 
 /// Keep a large local text action within its model context. Partial model
@@ -2484,12 +2475,11 @@ fn stream_chunked_local_text(
                 plan.final_instruction,
                 Some(&batches[0].join("\n\n")),
                 |output| {
-                    response.push_str(output);
-                    send_command(
+                    append_limited_overlay_chunk(
                         writer,
-                        AgentCommand::OverlayAppendResult {
-                            chunk: output.into(),
-                        },
+                        &mut response,
+                        output,
+                        plan.max_response_characters,
                     )
                 },
             )?;
@@ -2543,6 +2533,7 @@ fn stream_chunked_go_deeper(
             part_verb: "Going deeper into",
             combine_verb: "Combining context",
             final_status: "Preparing your deeper explanation…",
+            max_response_characters: None,
         },
     )
 }
@@ -2582,7 +2573,7 @@ fn run_go_deeper(
     let response = if let Some(model) = chunked_model {
         stream_chunked_go_deeper(writer, &model, text)?
     } else {
-        stream_selected(writer, &selected, &request.instruction, text)?
+        stream_selected(writer, &selected, &request.instruction, text, None)?
     };
     if !response.is_empty() {
         send_command(writer, clipboard_command(&response))?;
@@ -2731,7 +2722,13 @@ fn handle_selection_action(
     let response = if let Some(model) = chunked_model {
         stream_chunked_selection_summary(writer, &model, &selection.text)
     } else {
-        stream_selected(writer, &selected, &request.instruction, &selection.text)
+        stream_selected(
+            writer,
+            &selected,
+            &request.instruction,
+            &selection.text,
+            (action == Action::Summarize).then_some(INITIAL_SUMMARY_MAX_CHARACTERS),
+        )
     };
     match response {
         Ok(response) => {
@@ -3313,6 +3310,251 @@ fn route_preview() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Serve MICE's local, text-only capabilities over MCP's stdio transport.
+/// This intentionally never routes through cloud providers: callers can use a
+/// larger harness without silently sending their repository text elsewhere.
+fn mcp_server() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    let stdin = std::io::stdin();
+    let mut output = std::io::BufWriter::new(std::io::stdout().lock());
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                write_mcp_message(
+                    &mut output,
+                    &mcp_error(Value::Null, -32700, format!("Invalid JSON: {error}")),
+                )?;
+                continue;
+            }
+        };
+        let id = request.get("id").cloned();
+        let Some(method) = request.get("method").and_then(Value::as_str) else {
+            if let Some(id) = id {
+                write_mcp_message(&mut output, &mcp_error(id, -32600, "Missing method"))?;
+            }
+            continue;
+        };
+
+        let response = match method {
+            "initialize" => id.map(|id| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "mice", "version": env!("CARGO_PKG_VERSION")}
+                    }
+                })
+            }),
+            "tools/list" => id.map(|id| mcp_result(id, json!({"tools": mcp_tools()}))),
+            "tools/call" => id.map(|id| {
+                let result = match request.get("params") {
+                    Some(params) => mcp_call_tool(&config, params),
+                    None => Err("Missing tool parameters".into()),
+                };
+                match result {
+                    Ok(text) => mcp_result(
+                        id,
+                        json!({"content": [{"type": "text", "text": text}], "isError": false}),
+                    ),
+                    Err(error) => mcp_result(
+                        id,
+                        json!({"content": [{"type": "text", "text": error.to_string()}], "isError": true}),
+                    ),
+                }
+            }),
+            _ => id.map(|id| mcp_error(id, -32601, format!("Unknown method: {method}"))),
+        };
+        if let Some(response) = response {
+            write_mcp_message(&mut output, &response)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_mcp_message(
+    output: &mut impl Write,
+    message: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serde_json::to_writer(&mut *output, message)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn mcp_result(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn mcp_error(id: Value, code: i32, message: impl Into<String>) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
+}
+
+fn mcp_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "summarize_text",
+            "description": "Summarize text using MICE's configured local Ollama model.",
+            "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+        }),
+        json!({
+            "name": "summarize_file",
+            "description": "Read and summarize a local text file without sending it to a cloud provider.",
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        }),
+        json!({
+            "name": "explain_code",
+            "description": "Explain a code snippet with the configured local Ollama model.",
+            "inputSchema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
+        }),
+        json!({
+            "name": "define_word",
+            "description": "Define a word or short phrase using the configured local Ollama model.",
+            "inputSchema": {"type": "object", "properties": {"word": {"type": "string"}}, "required": ["word"]}
+        }),
+        json!({
+            "name": "quick_answer",
+            "description": "Answer a short question using the configured local Ollama model.",
+            "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}
+        }),
+    ]
+}
+
+fn mcp_call_tool(
+    config: &mice_core::Config,
+    params: &Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("Missing tool name")?;
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    let string_argument = |key| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("Missing non-empty `{key}` argument"))
+    };
+    match name {
+        "summarize_text" => mcp_summarize(config, string_argument("text")?),
+        "summarize_file" => {
+            let path = string_argument("path")?;
+            let contents = std::fs::read_to_string(path)
+                .map_err(|error| format!("Could not read `{path}`: {error}"))?;
+            mcp_summarize(config, &contents)
+        }
+        "explain_code" => mcp_local_response(
+            config,
+            "Explain this code clearly. Cover its purpose, main components, control flow, and notable dependencies.",
+            Some(string_argument("code")?),
+        ),
+        "define_word" => mcp_local_response(
+            config,
+            &action_instruction(Action::Define, ""),
+            Some(string_argument("word")?),
+        ),
+        "quick_answer" => mcp_local_response(
+            config,
+            "Answer this question briefly and directly. Say when the provided context is insufficient.",
+            Some(string_argument("question")?),
+        ),
+        _ => Err(format!("Unknown MICE tool: {name}").into()),
+    }
+}
+
+fn mcp_local_response(
+    config: &mice_core::Config,
+    instruction: &str,
+    text: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    mcp_local_response_limited(config, instruction, text, None)
+}
+
+fn mcp_local_response_limited(
+    config: &mice_core::Config,
+    instruction: &str,
+    text: Option<&str>,
+    maximum_characters: Option<usize>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut response = String::new();
+    stream_ollama(&config.local_model, instruction, text, |chunk| {
+        response.push_str(&bounded_stream_chunk(&response, chunk, maximum_characters));
+        Ok(())
+    })?;
+    if response.trim().is_empty() {
+        return Err("The local model returned an empty response.".into());
+    }
+    Ok(response)
+}
+
+fn mcp_summarize(
+    config: &mice_core::Config,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let model = mice_providers::model_descriptor(&config.local_model).ok_or_else(|| {
+        format!(
+            "MICE has no local model descriptor for `{}`",
+            config.local_model
+        )
+    })?;
+    let instruction = selection_summary_instruction(text);
+    if estimate_tokens(text)
+        <= model
+            .input_budget_tokens
+            .unwrap_or(LOCAL_SUMMARY_REDUCE_TOKENS)
+    {
+        return mcp_local_response_limited(
+            config,
+            instruction,
+            Some(text),
+            Some(INITIAL_SUMMARY_MAX_CHARACTERS),
+        );
+    }
+
+    let source_is_code = looks_like_code(text);
+    let mut summaries = Vec::new();
+    for chunk in structural_summary_chunks(text, LOCAL_SUMMARY_CHUNK_TOKENS) {
+        summaries.push(mcp_local_response(
+            config,
+            chunk_summary_instruction(source_is_code),
+            Some(&chunk),
+        )?);
+    }
+    let reduce_budget = model
+        .input_budget_tokens
+        .unwrap_or(LOCAL_SUMMARY_REDUCE_TOKENS)
+        .min(LOCAL_SUMMARY_REDUCE_TOKENS);
+    loop {
+        let batches = summary_reduce_batches(&summaries, reduce_budget);
+        if batches.len() == 1 {
+            return mcp_local_response_limited(
+                config,
+                reduce_summary_instruction(source_is_code),
+                Some(&batches[0].join("\n\n")),
+                Some(INITIAL_SUMMARY_MAX_CHARACTERS),
+            );
+        }
+        summaries = batches
+            .iter()
+            .map(|batch| {
+                mcp_local_response(
+                    config,
+                    reduce_summary_instruction(source_is_code),
+                    Some(&batch.join("\n\n")),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+}
+
 fn ask() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let mut arguments = env::args().skip(2).collect::<Vec<_>>();
@@ -3591,6 +3833,32 @@ fn is_generic_hover_label(value: &str) -> bool {
     )
 }
 
+/// Append a streamed chunk without exceeding a user-facing character budget.
+/// `chars` preserves Unicode boundaries, unlike byte slicing.
+fn append_limited_overlay_chunk(
+    writer: &mut ChildStdin,
+    response: &mut String,
+    chunk: &str,
+    maximum_characters: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bounded = bounded_stream_chunk(response, chunk, maximum_characters);
+    if bounded.is_empty() {
+        return Ok(());
+    }
+    response.push_str(&bounded);
+    send_command(writer, AgentCommand::OverlayAppendResult { chunk: bounded })
+}
+
+fn bounded_stream_chunk(response: &str, chunk: &str, maximum_characters: Option<usize>) -> String {
+    match maximum_characters {
+        Some(maximum) => chunk
+            .chars()
+            .take(maximum.saturating_sub(response.chars().count()))
+            .collect(),
+        None => chunk.into(),
+    }
+}
+
 fn bounded_for_model(value: &str, maximum_characters: usize) -> String {
     let mut characters = value.chars();
     let bounded = characters
@@ -3837,6 +4105,13 @@ mod hover_tests {
     fn hover_context_is_bounded_without_splitting_unicode() {
         assert_eq!(bounded_for_model("ab😀cd", 3), "ab😀…");
         assert_eq!(bounded_for_model("Netflix", 20), "Netflix");
+    }
+
+    #[test]
+    fn initial_summary_stream_cap_preserves_unicode_boundaries() {
+        assert_eq!(bounded_stream_chunk("ab", "😀cd", Some(3)), "😀");
+        assert_eq!(bounded_stream_chunk("abc", "more", Some(3)), "");
+        assert_eq!(bounded_stream_chunk("abc", "more", None), "more");
     }
 
     #[test]

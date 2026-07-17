@@ -28,7 +28,7 @@ models, or user configuration belong in this repository.
 | M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. |
 | M11 Guide-me that acts | Complete in the M12 companion flow: native transport, verified actions, and double-enforced sensitive-control blocklist. |
 | M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
-| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; Phase 1 (interactive overlay), Phase 2a (word-meaning "Define"), and M7 file-scale summarization are complete. |
+| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; Phases 1, 2a, 3 (local MCP server), and M7 file-scale summarization are complete. |
 
 ## Current capabilities
 
@@ -66,6 +66,14 @@ models, or user configuration belong in this repository.
   map-reduce path as a large selection, so it does not overflow a local model
   after an otherwise successful file-scale summary. `mice stop` sends an
   owner-only shutdown frame to the running daemon's bridge socket.
+- **Concise first summaries:** the normal selected-text summarize action asks
+  for—and enforces—a 500-character maximum. Go Deeper is deliberately not
+  capped.
+- **Phase 3 local MCP server:** `mice mcp-server` provides stdio JSON-RPC MCP
+  tools for `summarize_text`, `summarize_file`, `explain_code`, `define_word`,
+  and `quick_answer`. These use only the configured local Ollama model; MICE
+  never routes MCP tool text to a cloud provider. Large local summaries reuse
+  M7's structural chunk-and-reduce flow.
 - **Phase 2b Send to…:** completed text results offer a native Send to… menu.
   Its first destination pastes MICE's existing rich clipboard result into the
   app that is frontmost when Send to… is chosen (or the original app as a
@@ -93,6 +101,9 @@ models, or user configuration belong in this repository.
   cleanly requests shutdown through the owner-only bridge socket.
 - Open: cloud-provider requests still put API keys in `curl` arguments. The
   planned curl-to-`ureq` migration must move authorization into HTTP headers.
+- Open: Phase 4 will add explicitly granted external MCP clients (such as web
+  search). AXI command-line tools remain separate, opt-in integrations so they
+  cannot bypass MICE's browser-consent and sensitive-control safeguards.
 
 ## Product polish — Phase 1 (interactive overlay)
 

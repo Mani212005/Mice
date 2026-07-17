@@ -32,7 +32,7 @@ Done:
   auto-detection routes a single word / short phrase to a dictionary-style
   answer on the same summarize gesture.
 
-Not built (this plan): Phase 3 (MICE MCP server), Phase 4 (MICE MCP client),
+Not built (this plan): Phase 4 (MICE MCP client),
 Phase 5 (M8–M10), and the curl→ureq migration. Phase 2b and the bounded Go
 Deeper / `mice stop` review fixes are complete.
 
@@ -77,7 +77,7 @@ Wire: the button posts `overlay.action { actionId: "send_paste" }`; the CLI
 `handle_overlay_action` sends a `text.inject`-style command (add the IPC command
 if absent) with the cached response.
 
-## Phase 3 — MICE as an MCP server (Codex pairing; token-saving)
+## Phase 3 — MICE as an MCP server (Codex pairing; token-saving) — Complete
 
 New subcommand `mice mcp-server` (stdio) exposing MICE's cheap local abilities
 as MCP tools so a bigger agent (Codex) offloads small queries to the **local
@@ -91,7 +91,10 @@ model** instead of spending big-model tokens.
   `initialize`, `tools/list`, `tools/call`. Put the tool logic in a new
   `mice-mcp` module/crate or inside `mice-cli`; reuse `mice-core`/`mice-providers`
   summarization directly (no HTTP to self).
-- Codex/other agents add MICE to their MCP config and call these tools.
+- Codex/other agents add MICE to their MCP config and call these tools. The
+  implemented server is local-only by design and has a line-delimited stdio
+  smoke test; end-to-end calls require the user's Ollama service and configured
+  local model to be running.
 
 ## Phase 4 — MICE as an MCP client (web/dictionary → live features)
 

@@ -495,9 +495,9 @@ pub fn looks_like_code(text: &str) -> bool {
 
 pub fn selection_summary_instruction(text: &str) -> &'static str {
     if looks_like_code(text) {
-        "State what this file or module does, its main components and entry points, and notable dependencies. Give a newcomer's orientation rather than a line-by-line walkthrough."
+        "In no more than 500 characters, state what this file or module does, its main components and entry points, and notable dependencies. Give a newcomer's orientation rather than a line-by-line walkthrough."
     } else {
-        "Summarize the selected content with its key points."
+        "Summarize the selected content and its key points in no more than 500 characters."
     }
 }
 
@@ -818,7 +818,7 @@ mod tests {
         assert!(!looks_like_code(prose));
         assert_eq!(
             selection_summary_instruction(prose),
-            "Summarize the selected content with its key points."
+            "Summarize the selected content and its key points in no more than 500 characters."
         );
     }
 
