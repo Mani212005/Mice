@@ -1,6 +1,8 @@
 //! Capability-based provider routing. Network transports are intentionally isolated
 //! behind the provider clients so the router remains deterministic and testable.
 
+use std::io::{BufRead, BufReader};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -109,6 +111,11 @@ pub struct ModelDescriptor {
     pub reasoning_tier: u8,
     pub speed_rank: u8,
     pub cost_rank: u8,
+    /// Maximum estimated input tokens reserved for a single local request.
+    /// Cloud models do not use this local-only budget.
+    pub input_budget_tokens: Option<usize>,
+    /// Ollama context window requested for a local model invocation.
+    pub num_ctx: Option<usize>,
 }
 
 pub const MODELS: [ModelDescriptor; 9] = [
@@ -120,6 +127,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 2,
         speed_rank: 1,
         cost_rank: 0,
+        input_budget_tokens: Some(12_000),
+        num_ctx: Some(16_384),
     },
     ModelDescriptor {
         id: "phi4-mini",
@@ -129,6 +138,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 1,
         speed_rank: 0,
         cost_rank: 0,
+        input_budget_tokens: Some(6_000),
+        num_ctx: Some(8_192),
     },
     ModelDescriptor {
         id: "gpt-oss:20b",
@@ -138,6 +149,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 1,
         speed_rank: 2,
         cost_rank: 0,
+        input_budget_tokens: Some(24_000),
+        num_ctx: Some(32_768),
     },
     ModelDescriptor {
         id: DEFAULT_CLOUD_MODEL,
@@ -147,6 +160,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 2,
         speed_rank: 0,
         cost_rank: 1,
+        input_budget_tokens: None,
+        num_ctx: None,
     },
     ModelDescriptor {
         id: "gpt-5.6-terra",
@@ -156,6 +171,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 3,
         speed_rank: 1,
         cost_rank: 2,
+        input_budget_tokens: None,
+        num_ctx: None,
     },
     ModelDescriptor {
         id: "gpt-5.6-sol",
@@ -165,6 +182,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 4,
         speed_rank: 2,
         cost_rank: 3,
+        input_budget_tokens: None,
+        num_ctx: None,
     },
     ModelDescriptor {
         id: "gpt-image-2",
@@ -174,6 +193,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 0,
         speed_rank: 3,
         cost_rank: 2,
+        input_budget_tokens: None,
+        num_ctx: None,
     },
     ModelDescriptor {
         id: "llama-3.3-70b-versatile",
@@ -183,6 +204,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 3,
         speed_rank: 0,
         cost_rank: 1,
+        input_budget_tokens: None,
+        num_ctx: None,
     },
     ModelDescriptor {
         id: "llama-3.1-8b-instant",
@@ -192,6 +215,8 @@ pub const MODELS: [ModelDescriptor; 9] = [
         reasoning_tier: 2,
         speed_rank: 0,
         cost_rank: 1,
+        input_budget_tokens: None,
+        num_ctx: None,
     },
 ];
 
@@ -207,6 +232,53 @@ pub enum RouteError {
     CloudCapabilityBlocked,
     #[error("No provider satisfies this request.")]
     NoCandidate,
+}
+
+/// The execution shape selected for a text selection summary. Oversized
+/// local-only inputs stay private, but need multiple bounded model calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionSummaryRoute {
+    SingleShot(Route),
+    Chunked { model: ModelDescriptor },
+}
+
+pub fn model_descriptor(id: &str) -> Option<&'static ModelDescriptor> {
+    MODELS.iter().find(|model| model.id == id)
+}
+
+/// Select the large-input behavior for selection summaries without changing
+/// routing for ordinary asks, hover explanations, or Goal Guide calls.
+pub fn route_selection_summary(
+    request: &RouteRequest,
+    estimated_tokens: usize,
+) -> Result<SelectionSummaryRoute, RouteError> {
+    if request.privacy_mode == PrivacyMode::CloudOnly {
+        return route(request).map(SelectionSummaryRoute::SingleShot);
+    }
+
+    let local = model_descriptor(&request.model_preferences.local_model)
+        .filter(|model| model.locality == Locality::Local)
+        .ok_or(RouteError::NoCandidate)?;
+    let budget = local.input_budget_tokens.ok_or(RouteError::NoCandidate)?;
+    if estimated_tokens <= budget {
+        return route(request).map(SelectionSummaryRoute::SingleShot);
+    }
+
+    match request.privacy_mode {
+        PrivacyMode::LocalOnly => Ok(SelectionSummaryRoute::Chunked {
+            model: local.clone(),
+        }),
+        PrivacyMode::CloudAllowed => {
+            let cloud = model_descriptor(&request.model_preferences.cloud_model)
+                .filter(|model| model.locality == Locality::Cloud)
+                .ok_or(RouteError::NoCandidate)?;
+            Ok(SelectionSummaryRoute::SingleShot(Route {
+                model: cloud.clone(),
+                user_notice: Some(format!("Large selection — routed to {}", cloud.id)),
+            }))
+        }
+        PrivacyMode::CloudOnly => unreachable!("handled above"),
+    }
 }
 
 pub fn route(request: &RouteRequest) -> Result<Route, RouteError> {
@@ -268,6 +340,83 @@ pub fn route(request: &RouteRequest) -> Result<Route, RouteError> {
         model: model.clone(),
         user_notice: None,
     })
+}
+
+#[derive(Debug, Error)]
+pub enum OllamaError {
+    #[error("Ollama request failed: {0}")]
+    Request(Box<ureq::Error>),
+    #[error("Ollama response could not be read: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Ollama returned invalid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Ollama failed: {0}")]
+    Service(String),
+    #[error("Could not present streamed model output: {0}")]
+    Consumer(String),
+}
+
+/// Build the Ollama request in the provider layer so the local transport is
+/// testable without a running model server.
+pub fn ollama_chat_payload(
+    model: &str,
+    instruction: &str,
+    text: Option<&str>,
+    num_ctx: usize,
+) -> serde_json::Value {
+    let content = match text {
+        Some(text) => format!("{instruction}\n\nContent:\n{text}"),
+        None => instruction.into(),
+    };
+    serde_json::json!({
+        "model": model,
+        "stream": true,
+        "messages": [{"role": "user", "content": content}],
+        "options": {"num_ctx": num_ctx},
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaStreamEvent {
+    #[serde(default)]
+    message: Option<OllamaStreamMessage>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaStreamMessage {
+    #[serde(default)]
+    content: String,
+}
+
+/// Stream Ollama's `/api/chat` NDJSON response. The explicit endpoint keeps
+/// all automated tests local and network-free.
+pub fn stream_ollama_chat(
+    endpoint: &str,
+    model: &str,
+    instruction: &str,
+    text: Option<&str>,
+    num_ctx: usize,
+    mut on_chunk: impl FnMut(&str) -> Result<(), OllamaError>,
+) -> Result<(), OllamaError> {
+    let response = ureq::post(endpoint)
+        .send_json(ollama_chat_payload(model, instruction, text, num_ctx))
+        .map_err(|error| OllamaError::Request(Box::new(error)))?;
+    for line in BufReader::new(response.into_reader()).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: OllamaStreamEvent = serde_json::from_str(&line)?;
+        if let Some(error) = event.error {
+            return Err(OllamaError::Service(error));
+        }
+        if let Some(message) = event.message.filter(|message| !message.content.is_empty()) {
+            on_chunk(&message.content)?;
+        }
+    }
+    Ok(())
 }
 
 /// Strict structured output for the M6a planning/review flow. Plans are
@@ -493,6 +642,144 @@ pub fn groq_guide_payload(model: &str, instruction: &str, dom_snapshot: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+    };
+
+    fn summary_request(privacy_mode: PrivacyMode, preferences: ModelPreferences) -> RouteRequest {
+        RouteRequest {
+            artifacts: Artifacts {
+                text: Some("selection".into()),
+                ..Default::default()
+            },
+            instruction: "summarize".into(),
+            action: Some(Action::Summarize),
+            privacy_mode,
+            cost_policy: CostPolicy::Cheapest,
+            model_preferences: preferences,
+        }
+    }
+
+    #[test]
+    fn large_cloud_allowed_selection_escalates_to_the_configured_cloud_model() {
+        let request = summary_request(
+            PrivacyMode::CloudAllowed,
+            ModelPreferences {
+                cloud_model: "gpt-5.6-terra".into(),
+                ..Default::default()
+            },
+        );
+        let SelectionSummaryRoute::SingleShot(route) =
+            route_selection_summary(&request, 12_001).unwrap()
+        else {
+            panic!("large cloud-allowed selection should use the cloud lane");
+        };
+        assert_eq!(route.model.id, "gpt-5.6-terra");
+        assert_eq!(
+            route.user_notice.as_deref(),
+            Some("Large selection — routed to gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn local_only_large_selection_chunks_and_heavy_model_stays_single_shot() {
+        let request = summary_request(PrivacyMode::LocalOnly, ModelPreferences::default());
+        assert!(matches!(
+            route_selection_summary(&request, 12_001).unwrap(),
+            SelectionSummaryRoute::Chunked { .. }
+        ));
+
+        let heavy_request = summary_request(
+            PrivacyMode::LocalOnly,
+            ModelPreferences {
+                local_model: "gpt-oss:20b".into(),
+                ..Default::default()
+            },
+        );
+        let SelectionSummaryRoute::SingleShot(route) =
+            route_selection_summary(&heavy_request, 20_000).unwrap()
+        else {
+            panic!("heavy local model should accept this selection in one request");
+        };
+        assert_eq!(route.model.id, "gpt-oss:20b");
+    }
+
+    #[test]
+    fn ollama_http_client_sends_context_budget_and_streams_ndjson() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1_024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4);
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + content_length {
+                    request_tx
+                        .send(request[header_end..header_end + content_length].to_vec())
+                        .unwrap();
+                    break;
+                }
+            }
+            let body = concat!(
+                "{\"message\":{\"content\":\"hello \"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"world\"},\"done\":false}\n",
+                "{\"done\":true}\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut output = String::new();
+        stream_ollama_chat(
+            &endpoint,
+            "gemma3:4b",
+            "Summarize",
+            Some("input"),
+            16_384,
+            |chunk| {
+                output.push_str(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let request: serde_json::Value =
+            serde_json::from_slice(&request_rx.recv().unwrap()).unwrap();
+        assert_eq!(request["model"], "gemma3:4b");
+        assert_eq!(request["options"]["num_ctx"], 16_384);
+        assert_eq!(
+            request["messages"][0]["content"],
+            "Summarize\n\nContent:\ninput"
+        );
+        assert_eq!(output, "hello world");
+    }
+
     #[test]
     fn plain_text_uses_local_in_local_only_mode() {
         let request = RouteRequest {

@@ -221,6 +221,24 @@ captures.
   product subcommand. MICE detects Chrome's extension-origin/framed-stdin
   launch and enters its relay automatically, avoiding a host-exit retry loop.
 
+## M7 — file-scale selection summaries
+
+- Local Ollama streaming uses `POST /api/chat` and NDJSON rather than a spawned
+  terminal process. This avoids terminal-control-sequence leakage and lets MICE
+  send a per-model `num_ctx` setting without putting selected text in process
+  arguments.
+- Local models declare conservative input budgets: `gemma3:4b` 12k tokens,
+  `phi4-mini` 6k, and opt-in `gpt-oss:20b` 24k. Cloud models have no local
+  budget because their provider limits remain provider-owned.
+- Small selections preserve the existing single request. An oversized
+  `local_only` selection is split at structural boundaries, summarized in
+  order, then reduced locally; intermediate text stays off-screen while the
+  overlay reports progress. In `cloud_allowed`, an oversized selection goes to
+  the configured cloud model and MICE tells the user that route changed.
+- Code receives a newcomer-oriented summary prompt and a denser token estimate;
+  prose receives a general key-points summary. Content is transient and is not
+  written to the repository or a runtime history.
+
 ## Linux preparation
 
 - `agent-linux/` is a Rust scaffold that sends the shared IPC initialization

@@ -28,7 +28,7 @@ models, or user configuration belong in this repository.
 | M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. |
 | M11 Guide-me that acts | Complete in the M12 companion flow: native transport, verified actions, and double-enforced sensitive-control blocklist. |
 | M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
-| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; plan in `plan/mice_planv6_product_polish.md`. Phase 1 (interactive overlay) + Phase 2a (word-meaning "Define") done. M7 merge pending a WIP checkpoint. |
+| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; Phase 1 (interactive overlay), Phase 2a (word-meaning "Define"), and M7 file-scale summarization are complete. |
 
 ## Current capabilities
 
@@ -55,6 +55,11 @@ models, or user configuration belong in this repository.
   double-tap** summarizes it and **Control+Option+I** creates an infographic.
   MICE reads AX selected text first; AX-poor apps use a short synthesized Cmd-C
   fallback that restores the previous pasteboard before provider work begins.
+- **M7 file-scale summaries:** local streaming uses Ollama's HTTP `/api/chat`
+  endpoint with each local model's explicit context budget. Oversized local-only
+  selections are structurally chunked and map-reduced with visible progress;
+  oversized `cloud_allowed` selections visibly use the configured cloud model.
+  Small selections remain single-shot.
 - **Goal Guide (M6a):** press **Control+Option+Space**, describe a goal, then
   review, revise, or accept a 3–8 step advisory plan. Plans flag login,
   payment, account-setup, and personal-data steps as user-only. The flow has
@@ -204,8 +209,9 @@ models, or user configuration belong in this repository.
 
 ## Active backlog
 
-0. M7 in `plan/mice_planv3_files_smartcopy_agents.md`; refine Guide follow-on
-   UX and browser highlight presentation from real-world feedback.
+0. M8 smart clipboard observer in `plan/mice_planv3_files_smartcopy_agents.md`;
+   refine Guide follow-on UX and browser highlight presentation from real-world
+   feedback.
 1. Extend the M12 browser-only screenshot path to native-app ScreenCaptureKit
    vision and add multi-viewport spreadsheet reading.
 2. Remove API keys from curl argument lists, preferably by moving provider HTTP

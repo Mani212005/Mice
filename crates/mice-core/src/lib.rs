@@ -449,6 +449,177 @@ pub fn action_instruction(action: Action, instruction: &str) -> String {
     }
 }
 
+pub const LOCAL_SUMMARY_CHUNK_TOKENS: usize = 2_500;
+pub const LOCAL_SUMMARY_REDUCE_TOKENS: usize = 8_000;
+
+/// Estimate tokens cheaply while retaining headroom for model-specific
+/// tokenizers. Source code generally tokenizes more densely than prose.
+pub fn estimate_tokens(text: &str) -> usize {
+    let characters = text.chars().count();
+    if characters == 0 {
+        return 0;
+    }
+    let divisor = if looks_like_code(text) { 3.5 } else { 4.0 };
+    (characters as f64 / divisor).ceil() as usize
+}
+
+/// A deliberately conservative code heuristic. It needs no language parser
+/// and is only used to choose a summary orientation and token headroom.
+pub fn looks_like_code(text: &str) -> bool {
+    let lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() < 3 {
+        return false;
+    }
+    let signals = lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("func ")
+                || trimmed.starts_with("impl ")
+                || trimmed.starts_with("struct ")
+                || trimmed.starts_with("interface ")
+                || trimmed.ends_with('{')
+                || trimmed.ends_with(';')
+                || (line.len() > trimmed.len() && !trimmed.starts_with('-'))
+        })
+        .count();
+    signals * 3 >= lines.len()
+}
+
+pub fn selection_summary_instruction(text: &str) -> &'static str {
+    if looks_like_code(text) {
+        "State what this file or module does, its main components and entry points, and notable dependencies. Give a newcomer's orientation rather than a line-by-line walkthrough."
+    } else {
+        "Summarize the selected content with its key points."
+    }
+}
+
+pub fn chunk_summary_instruction(source_is_code: bool) -> &'static str {
+    if source_is_code {
+        "Summarize this part of a source file compactly. Preserve its purpose, APIs, control flow, and dependencies so a later pass can accurately summarize the whole file."
+    } else {
+        "Summarize this part compactly, retaining facts, structure, and conclusions so a later pass can accurately summarize the complete selection."
+    }
+}
+
+pub fn reduce_summary_instruction(source_is_code: bool) -> &'static str {
+    if source_is_code {
+        "Combine these partial source-file summaries into one newcomer-oriented overview. State the file's purpose, main components and entry points, important data/control flow, and notable dependencies. Do not describe it line by line."
+    } else {
+        "Combine these partial summaries into one complete, concise summary. Preserve the selection's overall structure, key facts, and conclusions."
+    }
+}
+
+/// Split a large selection into complete, ordered text chunks. We prefer blank
+/// lines and common top-level declarations, then split only oversized blocks
+/// at line or character boundaries so no input is silently discarded.
+pub fn structural_summary_chunks(text: &str, target_tokens: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let max_characters = ((target_tokens.max(1) as f64) * 3.5).floor() as usize;
+    let blocks = structural_blocks(text);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for block in blocks {
+        for fragment in split_at_character_limit(&block, max_characters) {
+            if !current.is_empty()
+                && current.chars().count() + fragment.chars().count() > max_characters
+            {
+                chunks.push(std::mem::take(&mut current));
+            }
+            current.push_str(&fragment);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Group partial summaries into bounded reduction requests. Repeated calls
+/// yield a hierarchical reduction for inputs beyond one context window.
+pub fn summary_reduce_batches(summaries: &[String], max_tokens: usize) -> Vec<Vec<String>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0;
+    for summary in summaries {
+        let tokens = estimate_tokens(summary);
+        if !current.is_empty() && current_tokens + tokens > max_tokens {
+            batches.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current_tokens += tokens;
+        current.push(summary.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn structural_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        if !current.is_empty() && is_structural_start(line) {
+            blocks.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        if line.trim().is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
+fn is_structural_start(line: &str) -> bool {
+    let line = line.trim_start();
+    [
+        "fn ",
+        "pub fn ",
+        "def ",
+        "class ",
+        "func ",
+        "impl ",
+        "struct ",
+        "interface ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn split_at_character_limit(value: &str, max_characters: usize) -> Vec<String> {
+    if value.chars().count() <= max_characters {
+        return vec![value.into()];
+    }
+    let mut fragments = Vec::new();
+    let mut remainder = value;
+    while remainder.chars().count() > max_characters {
+        let split_at = remainder
+            .char_indices()
+            .nth(max_characters)
+            .map(|(index, _)| index)
+            .expect("character count was checked above");
+        fragments.push(remainder[..split_at].into());
+        remainder = &remainder[split_at..];
+    }
+    if !remainder.is_empty() {
+        fragments.push(remainder.into());
+    }
+    fragments
+}
+
 fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -630,5 +801,54 @@ mod tests {
             contents.html,
             "<html><body><table><thead><tr><th>Name</th><th>Score</th></tr></thead><tbody><tr><td>Ada</td><td>10</td></tr></tbody></table></body></html>"
         );
+    }
+
+    #[test]
+    fn code_uses_a_smaller_token_divisor_and_code_summary_orientation() {
+        let source = "pub fn run() {\n    let answer = 42;\n    println!(\"{answer}\");\n}\n";
+        assert!(looks_like_code(source));
+        assert!(estimate_tokens(source) > 10);
+        assert!(selection_summary_instruction(source).contains("newcomer"));
+    }
+
+    #[test]
+    fn prose_uses_the_general_summary_orientation() {
+        let prose =
+            "MICE helps people understand what is on screen and complete tasks one step at a time.";
+        assert!(!looks_like_code(prose));
+        assert_eq!(
+            selection_summary_instruction(prose),
+            "Summarize the selected content with its key points."
+        );
+    }
+
+    #[test]
+    fn chunks_prefer_declaration_boundaries_without_losing_text() {
+        let text = "fn first() {}\n\nfn second() {}\n\nfn third() {}\n";
+        let chunks = structural_summary_chunks(text, 5);
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks[0].contains("first"));
+    }
+
+    #[test]
+    fn chunks_split_an_oversized_line_without_truncation() {
+        let text = "😀".repeat(40);
+        let chunks = structural_summary_chunks(&text, 5);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.is_char_boundary(chunk.len()))
+        );
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn reduce_batches_remain_bounded_and_ordered() {
+        let summaries = vec!["one ".repeat(400), "two ".repeat(400), "three ".repeat(400)];
+        let batches = summary_reduce_batches(&summaries, 900);
+        assert!(batches.len() >= 2);
+        assert_eq!(batches.concat(), summaries);
     }
 }

@@ -7,8 +7,7 @@ piece and needs an OpenAI key for vision, so it is **parked** for now
 (`plan/mice_m12_review.md` records its state). The goal of this plan is to make
 MICE a better everyday product:
 
-- Bring in and test **M7** (file-scale summarization, built in a separate
-  workspace the user will merge here), then continue M8–M10.
+- Complete **M7** (file-scale summarization), then continue M8–M10.
 - Replace the weak overlay UI with a proper **interactive panel** (the user
   dislikes the current one: a 6-line non-scrolling label, no buttons, jumps to
   the mouse).
@@ -21,12 +20,12 @@ MICE a better everyday product:
 
 ### Verified current state (exploration, 2026-07-17)
 
-- **Greenfield here:** M7, M8, M9, M10, MCP. No Ollama HTTP (`stream_ollama` is
-  `ollama run` subprocess, `crates/mice-cli/src/main.rs:3154`), no token
-  budget/chunking, no `tidy`/`file` subcommands, no HTTP client, no MCP.
-- **Providers:** 9 `Command::new("curl")` sites in `mice-cli/src/main.rs`
-  (guide/goal/agent-turn blocking calls + `stream_openai` :3303, `stream_groq`
-  :3412, `generate_openai_image` :3362). No `reqwest`/`ureq`.
+- **Greenfield here:** M8, M9, M10, MCP. M7 now uses Ollama HTTP `/api/chat`
+  with explicit per-model context budgets and local structural map-reduce for
+  oversized selections; `tidy`/`file` subcommands and MCP remain absent.
+- **Providers:** 9 `Command::new("curl")` sites remain in `mice-cli/src/main.rs`
+  for cloud work. The local Ollama path alone now uses `ureq`; moving the cloud
+  providers remains follow-on work.
 - **Selection (M5):** gesture → `sendSelectedText` (Swift `main.swift:306`) →
   `selection.text` IPC (`mice-ipc/src/lib.rs:66`, `SelectionAction` = only
   Summarize|Image) → `handle_selection_action` (`main.rs:2259`) → route → stream
@@ -45,10 +44,11 @@ MICE a better everyday product:
 
 ---
 
-## Phase 0 — Merge & test M7 (blocks nothing else; do first)
+## Phase 0 — M7 merge & test (complete 2026-07-17)
 
-User merges the separate M7 workspace into `/Users/manijoshi/mice`. Then
-reconcile against plan v3 M7 (`plan/mice_planv3_files_smartcopy_agents.md`):
+M7 was semantically merged from the separate workspace into `/Users/manijoshi/mice`
+after a WIP checkpoint. It reconciles plan v3 M7
+(`plan/mice_planv3_files_smartcopy_agents.md`):
 Ollama HTTP `/api/chat` with `num_ctx`, per-model `input_budget_tokens`/`num_ctx`
 on `ModelDescriptor` (`mice-providers/src/lib.rs:102`), a token estimator +
 chunked map-reduce and a code-vs-prose heuristic in `mice-core`, and escalation
@@ -58,7 +58,7 @@ to cloud on oversized input (respecting per-local-model budgets).
 summary that covers the end of the file; `local_only` shows chunk progress;
 small selection stays single-shot. Gates: `cargo fmt/clippy/test`, `swift build`.
 
-### M7 merge recipe (2026-07-17)
+### Historical M7 merge recipe (2026-07-17)
 
 M7 lives in `/Users/manijoshi/mice-m7` (branch `feat/m7-file-scale-summarization`,
 one commit `34d1868` on base `3ed8df7`). The current repo has **24 uncommitted

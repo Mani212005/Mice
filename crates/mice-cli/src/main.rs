@@ -20,13 +20,19 @@ use crossterm::{
 };
 use mice_core::{
     AgentAction, AgentDecision, AgentLoop, AgentLoopState, AgentMode, GoalSession, GoalState,
-    action_instruction, clipboard_contents, config_path, load_config, save_config,
+    LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, action_instruction,
+    chunk_summary_instruction, clipboard_contents, config_path, estimate_tokens, load_config,
+    looks_like_code, reduce_summary_instruction, save_config, selection_summary_instruction,
+    structural_summary_chunks, summary_reduce_batches,
 };
 use mice_ipc::{
     AgentCommand, Capabilities, HoverCaptured, InitializeParams, PromptSubmitted, RpcRequest,
     SelectionAction, SelectionText, read_frame, write_frame,
 };
-use mice_providers::{Action, Artifacts, ModelPreferences, RouteRequest, route};
+use mice_providers::{
+    Action, Artifacts, ModelPreferences, OllamaError, RouteRequest, SelectionSummaryRoute, route,
+    route_selection_summary, stream_ollama_chat,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -2364,6 +2370,103 @@ fn stream_selected(
     Ok(response)
 }
 
+/// Summarize an oversized selection entirely through the configured local
+/// model. Intermediate summaries stay off the overlay; the person sees only
+/// progress and the final map-reduce result.
+fn stream_chunked_selection_summary(
+    writer: &mut ChildStdin,
+    model: &mice_providers::ModelDescriptor,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_is_code = looks_like_code(text);
+    let chunks = structural_summary_chunks(text, LOCAL_SUMMARY_CHUNK_TOKENS);
+    if chunks.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut summaries = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        send_command(
+            writer,
+            AgentCommand::OverlayUpdate {
+                text: format!("Summarizing part {} of {}…", index + 1, chunks.len()),
+            },
+        )?;
+        let mut summary = String::new();
+        stream_ollama(
+            model.id,
+            chunk_summary_instruction(source_is_code),
+            Some(chunk),
+            |output| {
+                summary.push_str(output);
+                Ok(())
+            },
+        )?;
+        if summary.trim().is_empty() {
+            return Err("The local model returned an empty summary chunk.".into());
+        }
+        summaries.push(summary);
+    }
+
+    let reduce_budget = model
+        .input_budget_tokens
+        .unwrap_or(LOCAL_SUMMARY_REDUCE_TOKENS)
+        .min(LOCAL_SUMMARY_REDUCE_TOKENS);
+    loop {
+        let batches = summary_reduce_batches(&summaries, reduce_budget);
+        if batches.len() == 1 {
+            send_command(
+                writer,
+                AgentCommand::OverlayUpdate {
+                    text: "Preparing your complete summary…".into(),
+                },
+            )?;
+            let mut response = String::new();
+            stream_ollama(
+                model.id,
+                reduce_summary_instruction(source_is_code),
+                Some(&batches[0].join("\n\n")),
+                |output| {
+                    response.push_str(output);
+                    send_command(
+                        writer,
+                        AgentCommand::OverlayAppendResult {
+                            chunk: output.into(),
+                        },
+                    )
+                },
+            )?;
+            return Ok(response);
+        }
+
+        let total_batches = batches.len();
+        let mut reduced = Vec::with_capacity(total_batches);
+        for (index, batch) in batches.iter().enumerate() {
+            send_command(
+                writer,
+                AgentCommand::OverlayUpdate {
+                    text: format!("Combining summaries {} of {}…", index + 1, total_batches),
+                },
+            )?;
+            let mut summary = String::new();
+            stream_ollama(
+                model.id,
+                reduce_summary_instruction(source_is_code),
+                Some(&batch.join("\n\n")),
+                |output| {
+                    summary.push_str(output);
+                    Ok(())
+                },
+            )?;
+            if summary.trim().is_empty() {
+                return Err("The local model returned an empty reduction.".into());
+            }
+            reduced.push(summary);
+        }
+        summaries = reduced;
+    }
+}
+
 /// Re-run the cached selection with a deeper-explanation prompt, streaming into
 /// the same panel and re-offering the action buttons.
 fn run_go_deeper(
@@ -2470,12 +2573,17 @@ fn handle_selection_action(
         SelectionAction::Summarize => Action::Summarize,
         SelectionAction::Image => Action::Image,
     };
+    let instruction = if action == Action::Summarize {
+        selection_summary_instruction(&selection.text).into()
+    } else {
+        action_instruction(action, "")
+    };
     let request = RouteRequest {
         artifacts: Artifacts {
             text: Some(selection.text.clone()),
             ..Default::default()
         },
-        instruction: action_instruction(action, ""),
+        instruction,
         action: Some(action),
         privacy_mode: config.privacy_mode,
         cost_policy: config.cost_policy,
@@ -2484,19 +2592,24 @@ fn handle_selection_action(
             cloud_model: config.cloud_model.clone(),
         },
     };
-    let selected = route(&request)?.model;
+    let (selected, route_notice, chunked_model) = if action == Action::Summarize {
+        match route_selection_summary(&request, estimate_tokens(&selection.text))? {
+            SelectionSummaryRoute::SingleShot(route) => (route.model, route.user_notice, None),
+            SelectionSummaryRoute::Chunked { model } => (model.clone(), None, Some(model)),
+        }
+    } else {
+        let route = route(&request)?;
+        (route.model, route.user_notice, None)
+    };
     let status = match action {
         Action::Summarize => "Summarizing selection…",
         Action::Define => "Defining…",
         Action::Image => "Creating infographic…",
         _ => unreachable!("selection actions are constrained above"),
     };
-    send_command(
-        writer,
-        AgentCommand::OverlayShow {
-            text: status.into(),
-        },
-    )?;
+    let status =
+        route_notice.map_or_else(|| status.into(), |notice| format!("{notice}\n\n{status}"));
+    send_command(writer, AgentCommand::OverlayShow { text: status })?;
 
     if action == Action::Image {
         let image_prompt = format!(
@@ -2518,7 +2631,12 @@ fn handle_selection_action(
         };
     }
 
-    match stream_selected(writer, &selected, &request.instruction, &selection.text) {
+    let response = if let Some(model) = chunked_model {
+        stream_chunked_selection_summary(writer, &model, &selection.text)
+    } else {
+        stream_selected(writer, &selected, &request.instruction, &selection.text)
+    };
+    match response {
         Ok(response) => {
             if !response.is_empty() {
                 send_command(writer, clipboard_command(&response))?;
@@ -3312,30 +3430,17 @@ fn stream_ollama(
     text: Option<&str>,
     mut on_chunk: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Supplying a large capture as an argv item fails with macOS E2BIG. Ollama
-    // also accepts prompts on standard input, which has no command-line limit.
-    let request = prompt(instruction, text);
-    let mut child = Command::new("ollama")
-        .args(["run", model])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child.stdin.take().ok_or("Ollama stdin was unavailable")?;
-    stdin.write_all(request.as_bytes())?;
-    drop(stdin);
-    let stdout = child.stdout.take().ok_or("Ollama stdout was unavailable")?;
-    let mut ansi_stripper = AnsiStripper::default();
-    for line in BufReader::new(stdout).lines() {
-        let chunk = ansi_stripper.strip(&(line? + "\n"));
-        if !chunk.is_empty() {
-            on_chunk(&chunk)?;
-        }
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!("Ollama failed: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
+    let num_ctx = mice_providers::model_descriptor(model)
+        .and_then(|descriptor| descriptor.num_ctx)
+        .ok_or_else(|| format!("MICE has no local context-window budget for `{model}`"))?;
+    stream_ollama_chat(
+        "http://127.0.0.1:11434/api/chat",
+        model,
+        instruction,
+        text,
+        num_ctx,
+        |chunk| on_chunk(chunk).map_err(|error| OllamaError::Consumer(error.to_string())),
+    )?;
     Ok(())
 }
 
@@ -3357,59 +3462,6 @@ fn hover_control_type(
             "control"
         }
         _ => "interface control",
-    }
-}
-
-#[derive(Default)]
-struct AnsiStripper {
-    state: AnsiState,
-}
-
-#[derive(Default)]
-enum AnsiState {
-    #[default]
-    Text,
-    Escape,
-    Csi,
-    Osc,
-    OscEscape,
-}
-
-impl AnsiStripper {
-    fn strip(&mut self, input: &str) -> String {
-        let mut output = String::with_capacity(input.len());
-        for character in input.chars() {
-            match self.state {
-                AnsiState::Text => match character {
-                    '\u{1b}' => self.state = AnsiState::Escape,
-                    '\r' => {}
-                    _ => output.push(character),
-                },
-                AnsiState::Escape => match character {
-                    '[' => self.state = AnsiState::Csi,
-                    ']' => self.state = AnsiState::Osc,
-                    _ => self.state = AnsiState::Text,
-                },
-                AnsiState::Csi => {
-                    if ('@'..='~').contains(&character) {
-                        self.state = AnsiState::Text;
-                    }
-                }
-                AnsiState::Osc => match character {
-                    '\u{7}' => self.state = AnsiState::Text,
-                    '\u{1b}' => self.state = AnsiState::OscEscape,
-                    _ => {}
-                },
-                AnsiState::OscEscape => {
-                    self.state = if character == '\\' {
-                        AnsiState::Text
-                    } else {
-                        AnsiState::Osc
-                    };
-                }
-            }
-        }
-        output
     }
 }
 
@@ -3649,23 +3701,6 @@ mod hover_tests {
         ));
         assert!(!is_short_phrase("line one\nline two"));
         assert!(!is_short_phrase("   "));
-    }
-
-    #[test]
-    fn ansi_escape_sequences_are_not_forwarded_to_the_overlay() {
-        let mut stripper = AnsiStripper::default();
-        assert_eq!(
-            stripper.strip("hello\u{1b}[3D\u{1b}[K world\r\n"),
-            "hello world\n"
-        );
-    }
-
-    #[test]
-    fn ansi_sequences_split_across_stream_chunks_are_not_leaked() {
-        let mut stripper = AnsiStripper::default();
-        assert_eq!(stripper.strip("hello\u{1b}"), "hello");
-        assert_eq!(stripper.strip("[6D\u{1b}"), "");
-        assert_eq!(stripper.strip("[K world"), " world");
     }
 
     #[test]
