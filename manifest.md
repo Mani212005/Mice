@@ -67,7 +67,7 @@ models, or user configuration belong in this repository.
   after an otherwise successful file-scale summary. `mice stop` sends an
   owner-only shutdown frame to the running daemon's bridge socket.
 - **Concise first summaries:** the normal selected-text summarize action asks
-  for—and enforces—a 500-character maximum. It is a quick recap of the
+  the model for a natural, 500-character-or-less quick recap. It is a recap of the
   selection's purpose and two or three key points; Go Deeper is deliberately
   not capped. After the recap completes, MICE silently prepares one deeper
   answer in the configured provider/privacy lane. It is never shown, copied,

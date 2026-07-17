@@ -495,9 +495,9 @@ pub fn looks_like_code(text: &str) -> bool {
 
 pub fn selection_summary_instruction(text: &str) -> &'static str {
     if looks_like_code(text) {
-        "Give a quick newcomer-oriented recap in no more than 500 characters: state what this file or module is for, then only its two or three most important components, entry points, or dependencies. Skip introductions and line-by-line detail."
+        "Give a quick newcomer-oriented recap in no more than 500 characters. State what this file or module is for, then only its two or three most important components, entry points, or dependencies. End naturally after that; skip introductions and line-by-line detail."
     } else {
-        "Give a quick recap in no more than 500 characters: state the page or selection's main purpose, then only its two or three most important points. Skip introductions, examples, and minor detail."
+        "Give a quick recap in no more than 500 characters. State the page or selection's main purpose, then only its two or three most important points. End naturally after that; skip introductions, examples, and minor detail."
     }
 }
 
@@ -818,7 +818,7 @@ mod tests {
         assert!(!looks_like_code(prose));
         assert_eq!(
             selection_summary_instruction(prose),
-            "Give a quick recap in no more than 500 characters: state the page or selection's main purpose, then only its two or three most important points. Skip introductions, examples, and minor detail."
+            "Give a quick recap in no more than 500 characters. State the page or selection's main purpose, then only its two or three most important points. End naturally after that; skip introductions, examples, and minor detail."
         );
     }
 

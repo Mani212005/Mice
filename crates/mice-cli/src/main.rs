@@ -105,9 +105,6 @@ struct BrowserElement {
 }
 
 const MAX_GUIDE_CANDIDATES: usize = 60;
-/// A first-pass selection summary should be easy to scan. The streaming guard
-/// below enforces this even when a provider ignores the instruction.
-const INITIAL_SUMMARY_MAX_CHARACTERS: usize = 500;
 const MAX_GUIDE_LABEL_CHARS: usize = 120;
 const MAX_GUIDE_ROLE_CHARS: usize = 40;
 const MAX_GUIDE_SELECTOR_CHARS: usize = 256;
@@ -2383,20 +2380,19 @@ fn stream_selected(
     selected: &mice_providers::ModelDescriptor,
     instruction: &str,
     text: &str,
-    max_response_characters: Option<usize>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut response = String::new();
     let result = if selected.locality == mice_providers::Locality::Local {
         stream_ollama(selected.id, instruction, Some(text), |chunk| {
-            append_limited_overlay_chunk(writer, &mut response, chunk, max_response_characters)
+            append_overlay_chunk(writer, &mut response, chunk)
         })
     } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
         stream_groq(selected.id, instruction, Some(text), |chunk| {
-            append_limited_overlay_chunk(writer, &mut response, chunk, max_response_characters)
+            append_overlay_chunk(writer, &mut response, chunk)
         })
     } else {
         stream_openai(selected.id, instruction, Some(text), |chunk| {
-            append_limited_overlay_chunk(writer, &mut response, chunk, max_response_characters)
+            append_overlay_chunk(writer, &mut response, chunk)
         })
     };
     result?;
@@ -2423,7 +2419,6 @@ fn stream_chunked_selection_summary(
             part_verb: "Summarizing",
             combine_verb: "Combining summaries",
             final_status: "Preparing your complete summary…",
-            max_response_characters: Some(INITIAL_SUMMARY_MAX_CHARACTERS),
         },
     )
 }
@@ -2435,7 +2430,6 @@ struct ChunkedTextPlan<'a> {
     part_verb: &'a str,
     combine_verb: &'a str,
     final_status: &'a str,
-    max_response_characters: Option<usize>,
 }
 
 /// Keep a large local text action within its model context. Partial model
@@ -2488,14 +2482,7 @@ fn stream_chunked_local_text(
                 model.id,
                 plan.final_instruction,
                 Some(&batches[0].join("\n\n")),
-                |output| {
-                    append_limited_overlay_chunk(
-                        writer,
-                        &mut response,
-                        output,
-                        plan.max_response_characters,
-                    )
-                },
+                |output| append_overlay_chunk(writer, &mut response, output),
             )?;
             return Ok(response);
         }
@@ -2547,7 +2534,6 @@ fn stream_chunked_go_deeper(
             part_verb: "Going deeper into",
             combine_verb: "Combining context",
             final_status: "Preparing your deeper explanation…",
-            max_response_characters: None,
         },
     )
 }
@@ -2709,7 +2695,7 @@ fn run_go_deeper(
     let response = if let Some(model) = chunked_model {
         stream_chunked_go_deeper(writer, &model, text)?
     } else {
-        stream_selected(writer, &selected, &request.instruction, text, None)?
+        stream_selected(writer, &selected, &request.instruction, text)?
     };
     if !response.is_empty() {
         send_command(writer, clipboard_command(&response))?;
@@ -2903,13 +2889,7 @@ fn handle_selection_action(
     let response = if let Some(model) = chunked_model {
         stream_chunked_selection_summary(writer, &model, &selection.text)
     } else {
-        stream_selected(
-            writer,
-            &selected,
-            &request.instruction,
-            &selection.text,
-            (action == Action::Summarize).then_some(INITIAL_SUMMARY_MAX_CHARACTERS),
-        )
+        stream_selected(writer, &selected, &request.instruction, &selection.text)
     };
     match response {
         Ok(response) => {
@@ -3656,18 +3636,9 @@ fn mcp_local_response(
     instruction: &str,
     text: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    mcp_local_response_limited(config, instruction, text, None)
-}
-
-fn mcp_local_response_limited(
-    config: &mice_core::Config,
-    instruction: &str,
-    text: Option<&str>,
-    maximum_characters: Option<usize>,
-) -> Result<String, Box<dyn std::error::Error>> {
     let mut response = String::new();
     stream_ollama(&config.local_model, instruction, text, |chunk| {
-        response.push_str(&bounded_stream_chunk(&response, chunk, maximum_characters));
+        response.push_str(chunk);
         Ok(())
     })?;
     if response.trim().is_empty() {
@@ -3692,12 +3663,7 @@ fn mcp_summarize(
             .input_budget_tokens
             .unwrap_or(LOCAL_SUMMARY_REDUCE_TOKENS)
     {
-        return mcp_local_response_limited(
-            config,
-            instruction,
-            Some(text),
-            Some(INITIAL_SUMMARY_MAX_CHARACTERS),
-        );
+        return mcp_local_response(config, instruction, Some(text));
     }
 
     let source_is_code = looks_like_code(text);
@@ -3716,11 +3682,10 @@ fn mcp_summarize(
     loop {
         let batches = summary_reduce_batches(&summaries, reduce_budget);
         if batches.len() == 1 {
-            return mcp_local_response_limited(
+            return mcp_local_response(
                 config,
                 reduce_summary_instruction(source_is_code),
                 Some(&batches[0].join("\n\n")),
-                Some(INITIAL_SUMMARY_MAX_CHARACTERS),
             );
         }
         summaries = batches
@@ -4014,30 +3979,18 @@ fn is_generic_hover_label(value: &str) -> bool {
     )
 }
 
-/// Append a streamed chunk without exceeding a user-facing character budget.
-/// `chars` preserves Unicode boundaries, unlike byte slicing.
-fn append_limited_overlay_chunk(
+fn append_overlay_chunk(
     writer: &mut ChildStdin,
     response: &mut String,
     chunk: &str,
-    maximum_characters: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bounded = bounded_stream_chunk(response, chunk, maximum_characters);
-    if bounded.is_empty() {
-        return Ok(());
-    }
-    response.push_str(&bounded);
-    send_command(writer, AgentCommand::OverlayAppendResult { chunk: bounded })
-}
-
-fn bounded_stream_chunk(response: &str, chunk: &str, maximum_characters: Option<usize>) -> String {
-    match maximum_characters {
-        Some(maximum) => chunk
-            .chars()
-            .take(maximum.saturating_sub(response.chars().count()))
-            .collect(),
-        None => chunk.into(),
-    }
+    response.push_str(chunk);
+    send_command(
+        writer,
+        AgentCommand::OverlayAppendResult {
+            chunk: chunk.into(),
+        },
+    )
 }
 
 fn bounded_for_model(value: &str, maximum_characters: usize) -> String {
@@ -4286,13 +4239,6 @@ mod hover_tests {
     fn hover_context_is_bounded_without_splitting_unicode() {
         assert_eq!(bounded_for_model("ab😀cd", 3), "ab😀…");
         assert_eq!(bounded_for_model("Netflix", 20), "Netflix");
-    }
-
-    #[test]
-    fn initial_summary_stream_cap_preserves_unicode_boundaries() {
-        assert_eq!(bounded_stream_chunk("ab", "😀cd", Some(3)), "😀");
-        assert_eq!(bounded_stream_chunk("abc", "more", Some(3)), "");
-        assert_eq!(bounded_stream_chunk("abc", "more", None), "more");
     }
 
     #[test]
