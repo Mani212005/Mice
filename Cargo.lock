@@ -274,6 +274,7 @@ dependencies = [
  "mice-ipc",
  "mice-providers",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
 ]

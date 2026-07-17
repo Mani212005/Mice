@@ -1,32 +1,36 @@
-# MICE Browser Guide extension
+# MICE Browser Companion
 
-Load this directory as an unpacked Manifest V3 extension in a Chromium browser.
-Start the Rust bridge with a runtime-only token:
+Load this directory as an unpacked Manifest V3 extension once, then install
+the native messaging host once after building MICE:
 
 ```sh
-MICE_BROWSER_BRIDGE_TOKEN='choose-a-long-random-token' mice browser-bridge
+cargo run -p mice-cli -- setup-browser
 ```
 
-Open the extension's Options page, enter the same token, then use its popup to
-ask a guide-me question. The token stays in browser extension storage and is
-never written to this repository.
+There is no popup, token, options page, local port, or browser configuration.
+When MICE is running, Chrome launches the native host automatically. The action
+badge is only a connected/disconnected indicator.
 
-It exposes two messages for the local browser bridge:
+For a Goal Guide step hinted as Chrome, Safari, Firefox, Browser, or website,
+the core pushes that one instruction over Chrome native messaging. The
+extension returns a fresh bounded snapshot, the existing candidate-ID flow
+selects a verified target, and the extension highlights it.
 
-- `mice.guide.snapshot` returns visible interactive DOM elements.
-- `mice.guide.highlight` scrolls to and outlines a returned selector.
+Web Autopilot is started from the terminal:
 
-The bridge uses OpenAI `gpt-5.6-sol` with a strict output schema by default. If
-MICE's configured cloud model is a Groq model such as
-`llama-3.3-70b-versatile`, it uses Groq's JSON Object Mode instead. Both paths
-return a candidate ID rather than a free-form CSS selector. The bridge resolves
-that ID to the original supplied selector before asking the extension to scroll
-to and outline it. Snapshot selectors are unique:
-stable IDs and test IDs are used when available, with a structural CSS path as
-the fallback, so repeated controls such as several `button` elements cannot be
-confused. The extension first ranks up to 500 visible interactive elements
-against the guide question (including labels, placeholders, and text-input
-roles), then emits its best 100 with capped labels. The bridge independently
-sanitizes, ranks, deduplicates, and limits the model prompt to its best 80
-candidates. Each request highlights one target. Native global-screen overlay
-boxes use the separate `mice-ipc` screen-coordinate contract.
+```sh
+cargo run -p mice-cli -- start
+# In a second terminal:
+cargo run -p mice-cli -- autopilot "search Canva and open a portrait"
+```
+
+`mice start` is the resident daemon and owns the browser companion socket;
+leave it running while autopilot is in use. After one goal-level confirmation,
+autopilot observes the page again after every
+action and can click, fill non-sensitive fields, open an HTTP(S) URL, or
+scroll—only using verified candidates. It always hands passwords, one-time
+codes, payment data, logins, transfers, purchases, and final submissions back
+to the user. The first successfully completed run asks before each safe action,
+then future runs use goal-level consent. Turn on `careful_mode` in `mice
+settings` to keep per-action confirmation permanently. Press Esc to stop an
+active run.

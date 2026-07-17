@@ -42,7 +42,9 @@ pub enum Action {
     Code,
     Image,
     Guide,
+    GoalPlan,
     Qa,
+    Define,
 }
 
 impl Action {
@@ -59,6 +61,7 @@ impl Action {
                 | Self::ExtractJson
                 | Self::Code
                 | Self::Qa
+                | Self::Define
         )
     }
 }
@@ -267,6 +270,150 @@ pub fn route(request: &RouteRequest) -> Result<Route, RouteError> {
     })
 }
 
+/// Strict structured output for the M6a planning/review flow. Plans are
+/// advisory: the schema only permits textual instructions and a sensitivity
+/// marker, never executable actions or selectors.
+pub fn structured_goal_plan_payload(model: &str, goal: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "input": format!(
+            "Create a practical step-by-step plan for this user goal:\n{goal}\n\nReturn 3 to 8 steps. MICE only guides: never claim to click, type, submit, log in, or handle credentials for the user. Mark any step involving personal data, logins, payments, or account setup as sensitive."
+        ),
+        "text": {"format": {
+            "type": "json_schema",
+            "name": "goal_plan",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["steps"],
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["instruction", "app_hint", "sensitive"],
+                            "properties": {
+                                "instruction": {"type": "string"},
+                                "app_hint": {"type": "string"},
+                                "sensitive": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        }}
+    })
+}
+
+pub fn groq_goal_plan_payload(model: &str, goal: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only JSON: {\"steps\":[{\"instruction\":string,\"app_hint\":string,\"sensitive\":boolean}]}. Give 3-8 practical advisory steps. MICE never clicks, types, submits forms, logs in, or handles credentials. Mark steps involving personal data, logins, payments, or account setup as sensitive."
+            },
+            {"role": "user", "content": format!("Create a plan for: {goal}")}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0
+    })
+}
+
+pub fn agent_loop_payload(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+) -> serde_json::Value {
+    agent_loop_payload_with_image_and_persona(model, goal, observation, history, None, "patient")
+}
+
+/// OpenAI's Responses API accepts image parts alongside the compact DOM
+/// observation. This is used only for sparse/canvas pages; normal turns stay
+/// text-only and small.
+pub fn agent_loop_payload_with_image(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    image_data_url: Option<&str>,
+) -> serde_json::Value {
+    agent_loop_payload_with_image_and_persona(
+        model,
+        goal,
+        observation,
+        history,
+        image_data_url,
+        "patient",
+    )
+}
+
+pub fn agent_loop_payload_with_image_and_persona(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    image_data_url: Option<&str>,
+    persona: &str,
+) -> serde_json::Value {
+    let mut content = vec![serde_json::json!({
+        "type":"input_text",
+        "text":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Goal: {goal}\n\nCurrent page observation:\n{observation}\n\nRecent action history:\n{history}\n\nChoose exactly one next action. Use supplied candidate_id values exactly; never invent selectors. Narrate in plain language. Prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")
+    })];
+    if let Some(image_data_url) = image_data_url {
+        content.push(serde_json::json!({"type":"input_image", "image_url":image_data_url}));
+    }
+    serde_json::json!({
+        "model": model,
+        "input": [{"role":"user", "content":content}],
+        "text": {"format": {"type":"json_schema", "name":"mice_agent_turn", "strict":true, "schema": {
+            "type":"object", "additionalProperties":false,
+            "required":["say_to_user","action","candidate_id","url","value","done_summary","question"],
+            "properties": {
+                "say_to_user":{"type":"string"},
+                "action":{"type":"string","enum":["click","fill","open_url","scroll","done","handoff","ask_user"]},
+                "candidate_id":{"type":["string","null"]}, "url":{"type":["string","null"]},
+                "value":{"type":["string","null"]}, "done_summary":{"type":["string","null"]}, "question":{"type":["string","null"]}
+            }
+        }}}
+    })
+}
+
+/// Groq exposes JSON object mode through Chat Completions rather than the
+/// Responses JSON-schema surface. The CLI still validates every field and
+/// resolves candidate IDs locally before an action can reach the browser.
+pub fn groq_agent_loop_payload(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+) -> serde_json::Value {
+    groq_agent_loop_payload_with_persona(model, goal, observation, history, "patient")
+}
+
+pub fn groq_agent_loop_payload_with_persona(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    persona: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role":"system", "content":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Return only one JSON object with exactly these fields: say_to_user (string), action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id (string or null), url (string or null), value (string or null), done_summary (string or null), question (string or null). Choose exactly one action. Copy candidate_id exactly from the supplied candidates; never invent selectors. Narrate plainly and prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")},
+            {"role":"user", "content":format!("Goal: {goal}\n\nCurrent page observation:\n{observation}\n\nRecent action history:\n{history}")}
+        ],
+        "response_format": {"type":"json_object"},
+        "temperature": 0
+    })
+}
+
 pub fn openai_responses_payload(
     model: &str,
     instruction: &str,
@@ -388,6 +535,42 @@ mod tests {
         assert_eq!(payload["model"], "llama-3.3-70b-versatile");
         assert_eq!(payload["response_format"]["type"], "json_object");
     }
+
+    #[test]
+    fn groq_agent_turn_uses_json_object_mode() {
+        let payload =
+            groq_agent_loop_payload("llama-3.3-70b-versatile", "Open Canva", "{}", "none");
+        assert_eq!(payload["response_format"]["type"], "json_object");
+        assert!(
+            payload["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("candidate_id")
+        );
+    }
+
+    #[test]
+    fn agent_turn_can_attach_a_vision_observation() {
+        let payload = agent_loop_payload_with_image(
+            "gpt-5.6-sol",
+            "Read this",
+            "{}",
+            "none",
+            Some("data:image/jpeg;base64,abc"),
+        );
+        assert_eq!(payload["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn goal_plan_payload_is_strict_and_marks_sensitive_steps() {
+        let payload = structured_goal_plan_payload("gpt-5.6-sol", "Open a bank account");
+        assert_eq!(payload["text"]["format"]["strict"], true);
+        assert_eq!(
+            payload["text"]["format"]["schema"]["properties"]["steps"]["maxItems"],
+            8
+        );
+        assert!(payload["input"].as_str().unwrap().contains("sensitive"));
+    }
     #[test]
     fn local_only_uses_gemma_for_vision() {
         let request = RouteRequest {
@@ -501,5 +684,34 @@ mod tests {
             },
         };
         assert_eq!(route(&request).unwrap().model.id, "llama-3.3-70b-versatile");
+    }
+
+    #[test]
+    fn goal_plans_use_the_configured_cloud_model_when_cloud_is_allowed() {
+        let request = RouteRequest {
+            artifacts: Artifacts {
+                text: Some("Organize my documents".into()),
+                ..Default::default()
+            },
+            instruction: "Create a plan".into(),
+            action: Some(Action::GoalPlan),
+            privacy_mode: PrivacyMode::CloudAllowed,
+            cost_policy: CostPolicy::Cheapest,
+            model_preferences: ModelPreferences {
+                cloud_model: "llama-3.3-70b-versatile".into(),
+                ..Default::default()
+            },
+        };
+        assert_eq!(route(&request).unwrap().model.id, "llama-3.3-70b-versatile");
+    }
+
+    #[test]
+    fn agent_loop_payload_requires_one_structured_action() {
+        let payload = agent_loop_payload("gpt-5.6-sol", "Open Canva", "url: google.com", "");
+        assert_eq!(payload["text"]["format"]["strict"], true);
+        assert_eq!(
+            payload["text"]["format"]["schema"]["properties"]["action"]["enum"][0],
+            "click"
+        );
     }
 }
