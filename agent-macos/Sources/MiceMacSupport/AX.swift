@@ -70,6 +70,38 @@ public enum AXSupport {
         }
     }
 
+    /// Insert plain text at the current Accessibility selection without
+    /// replacing unrelated document text. This is a fallback for paste when
+    /// macOS has not granted Input Monitoring for synthetic Command-V events.
+    /// A whole-value write is permitted only for an empty control.
+    public static func insertAtSelection(_ text: String) throws {
+        let element = try focusedElement()
+        var selectedTextSettable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(
+            element,
+            kAXSelectedTextAttribute as CFString,
+            &selectedTextSettable
+        ) == .success,
+        selectedTextSettable.boolValue,
+        AXUIElementSetAttributeValue(
+            element,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        ) == .success {
+            return
+        }
+
+        guard value(element, kAXValueAttribute)?.isEmpty != false else {
+            throw AXError("Focused text control does not support insertion at the caret.")
+        }
+        var valueSettable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &valueSettable) == .success,
+              valueSettable.boolValue,
+              AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFString) == .success else {
+            throw AXError("Focused element does not support text insertion.")
+        }
+    }
+
     public static func focusedElement() throws -> AXUIElement {
         guard let element = try focusedTarget().element else {
             throw AXError("The focused application did not expose a focused accessibility element.")

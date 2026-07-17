@@ -125,6 +125,14 @@ struct MiceMacAgent {
                     return nil
                 }
                 if type == .keyDown {
+                    if event.getIntegerValueField(.keyboardEventKeycode) == 53 {
+                        Task { @MainActor in
+                            OverlayController.dismissActive()
+                        }
+                        // Escape keeps its normal pass-through behavior for
+                        // the foreground app while dismissing only MICE.
+                        return Unmanaged.passUnretained(event)
+                    }
                     if AutopilotStopGesture.matches(event) {
                         Task { @MainActor in
                             MiceMacAgent.cancelHover()
@@ -411,6 +419,10 @@ struct MiceMacAgent {
         let destination = currentDestination ?? pasteDestination
         destination?.activate(options: [])
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            if let text = NSPasteboard.general.string(forType: .string),
+               (try? AXSupport.insertAtSelection(text)) != nil {
+                return
+            }
             postPasteShortcut()
         }
     }
@@ -541,6 +553,7 @@ struct MiceMacAgent {
 
 @MainActor
 private final class OverlayController: NSObject {
+    private static weak var active: OverlayController?
     private let panel: NSPanel
     private let scrollView: NSScrollView
     private let textView: NSTextView
@@ -595,6 +608,8 @@ private final class OverlayController: NSObject {
         imageView.isHidden = true
 
         super.init()
+
+        OverlayController.active = self
 
         panel.contentView?.addSubview(scrollView)
         panel.contentView?.addSubview(buttonRow)
@@ -690,12 +705,20 @@ private final class OverlayController: NSObject {
         case "clipboard.paste":
             MiceMacAgent.pasteClipboard()
         case "overlay.dismiss":
-            panel.orderOut(nil)
+            dismiss()
         case "agent.stop":
             NSApp.terminate(nil)
         default:
             break
         }
+    }
+
+    func dismiss() {
+        panel.orderOut(nil)
+    }
+
+    static func dismissActive() {
+        active?.dismiss()
     }
 
     /// Show text in the scrolling result panel, resetting from image mode and

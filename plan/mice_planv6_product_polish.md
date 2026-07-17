@@ -60,7 +60,9 @@ offers **Paste into frontmost app**. It reuses the rich text/HTML/RTF clipboard
 already set for the result and synthesizes a normal Command-V; the overlay is
 non-activating, and MICE reactivates the app frontmost at Send to… time before
 pasting, falling back to the app captured when the result opened. A person may
-therefore switch to a destination document first. Richer MCP and Codex
+therefore switch to a destination document first. It first performs a focused
+AX insertion and falls back to Command-V when Input Monitoring is available.
+Escape dismisses the overlay without stopping MICE. Richer MCP and Codex
 destinations remain deferred to Phases 3–4.
 
 Add a `Send to…` action to the result panel (`selection_result_actions` in
