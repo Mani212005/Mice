@@ -97,6 +97,9 @@ struct MiceMacAgent {
     private static var lastHoverFingerprint = ""
     private static var eventTap: CFMachPort?
     private static var lastControlDown: TimeInterval?
+    /// The app the person was using when MICE opened a result. The panel is
+    /// non-activating, but its menu can briefly become the key interaction.
+    private static var pasteDestination: NSRunningApplication?
 
     static func main() {
         let app = NSApplication.shared
@@ -383,11 +386,29 @@ struct MiceMacAgent {
         writeFrame(data)
     }
 
+    static func rememberPasteDestination() {
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              application.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            return
+        }
+        pasteDestination = application
+    }
+
     /// The overlay is a non-activating panel, so the user's document remains
     /// the key destination. The result was already placed on the pasteboard by
     /// the core; synthesize the same Command-V a person would use to preserve
     /// its text/HTML/RTF representations.
     static func pasteClipboard() {
+        // A menu click can temporarily take focus even though the panel itself
+        // is non-activating. Restore the document app first, then wait until
+        // AppKit has completed activation before posting the normal shortcut.
+        pasteDestination?.activate(options: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            postPasteShortcut()
+        }
+    }
+
+    private static func postPasteShortcut() {
         guard let source = CGEventSource(stateID: .combinedSessionState),
               let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else {
@@ -581,6 +602,7 @@ private final class OverlayController: NSObject {
         let params = frame["params"] as? [String: Any] ?? [:]
         switch method {
         case "overlay.show":
+            MiceMacAgent.rememberPasteDestination()
             // Position near the cursor only when opening fresh; while already
             // visible (streaming a result) keep the panel where the user put it.
             showText(params["text"] as? String ?? "Working…", positionAtMouse: !panel.isVisible)

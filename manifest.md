@@ -66,7 +66,8 @@ models, or user configuration belong in this repository.
   owner-only shutdown frame to the running daemon's bridge socket.
 - **Phase 2b Send to…:** completed text results offer a native Send to… menu.
   Its first destination pastes MICE's existing rich clipboard result into the
-  app that remains frontmost behind the non-activating panel.
+  app that was frontmost when the result opened; MICE reactivates it before
+  posting the normal Command-V.
 - **Goal Guide (M6a):** press **Control+Option+Space**, describe a goal, then
   review, revise, or accept a 3–8 step advisory plan. Plans flag login,
   payment, account-setup, and personal-data steps as user-only. The flow has
