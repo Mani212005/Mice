@@ -77,6 +77,32 @@ public enum AXSupport {
         return element
     }
 
+    /// Reads the user's existing selection without synthesizing a mouse event
+    /// or changing the clipboard. Browsers such as Chrome expose selected text
+    /// on their focused web area through this standard AX attribute.
+    public static func selectedText() throws -> String? {
+        let target = try focusedTarget()
+        guard let element = target.element else { return nil }
+        let text = value(element, kAXSelectedTextAttribute)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text?.isEmpty == false) ? text : nil
+    }
+
+    /// Best-effort native target lookup for Goal Guide. It only reads the
+    /// focused application's accessibility tree and returns a rectangle for
+    /// MICE to highlight; it never invokes an action on the element.
+    public static func matchingBounds(for query: String) throws -> CGRect? {
+        let tokens = Set(
+            query.lowercased().split { !$0.isLetter && !$0.isNumber }
+                .map(String.init)
+                .filter { $0.count >= 3 }
+        )
+        guard !tokens.isEmpty else { return nil }
+        let root = try focusedTarget().application
+        var inspected = 0
+        return bestMatchingBounds(of: root, tokens: tokens, inspected: &inspected)?.bounds
+    }
+
     /// Locates the target application even when its focused text element is not exposed.
     /// This permits keyboard-event fallback to remain available for partially accessible apps.
     public static func focusedTarget() throws -> AXFocusedTarget {
@@ -300,6 +326,33 @@ public enum AXSupport {
         guard AXValueGetValue(unsafeDowncast(positionValue, to: AXValue.self), .cgPoint, &position),
               AXValueGetValue(unsafeDowncast(sizeValue, to: AXValue.self), .cgSize, &size) else { return nil }
         return CGRect(origin: position, size: size)
+    }
+
+    private static func bestMatchingBounds(
+        of element: AXUIElement,
+        tokens: Set<String>,
+        inspected: inout Int
+    ) -> (bounds: CGRect, score: Int)? {
+        guard inspected < 2_048 else { return nil }
+        inspected += 1
+        var best: (bounds: CGRect, score: Int)?
+        let description = describe(element)
+        let label = [description.title, description.description, description.value]
+            .compactMap { $0?.lowercased() }
+            .joined(separator: " ")
+        let score = tokens.reduce(into: 0) { total, token in
+            if label.contains(token) { total += 1 }
+        }
+        if score > 0, let bounds = bounds(of: element) {
+            best = (bounds, score)
+        }
+        for child in children(of: element) {
+            if let candidate = bestMatchingBounds(of: child, tokens: tokens, inspected: &inspected),
+               candidate.score > (best?.score ?? 0) {
+                best = candidate
+            }
+        }
+        return best
     }
 
     private static func descendantLabel(of element: AXUIElement, inspectedNodes: Int) -> String? {

@@ -3,10 +3,10 @@
   "name": "MICE Browser Guide",
   "version": "0.1.0",
   "description": "Companion browser surface for MICE guide-me highlights.",
-  "permissions": ["activeTab", "tabs", "storage"],
-  "host_permissions": ["http://127.0.0.1:9417/*"],
-  "action": { "default_popup": "popup.html" },
-  "options_page": "options.html",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqriiT86J66gRBMadr8Kgnsc7KWN5Ej1bdU/IL+h3W2esLRi3445UsoMSRJtQL7ieEwiahhQN4sVV+/vmAkQyMUsM+QVMa71OIHbGwQOXUx+jibI669UhVGE82qhO0vHdukdjVqrYreGhiUOk+FuOyIyG20gBp4aaAS5N9Cbu6ytxCaOR6uVmOTMOBTiuc4wAs1dIl3B7AlN+vnEVWYtQ+91oFdTwHCfmLoDVVGqUO6renjf3BSDIfJa5Jjaopy6ue5oo19USbDjVGJveRu57tVhZjyCCsYLdjMImlm2/eWlgfIBw9ZAQTPg7j5F08wQDAv7+YQOQW2/T/x3TUOxcJwIDAQAB",
+  "permissions": ["activeTab", "tabs", "nativeMessaging"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "action": {},
   "background": { "service_worker": "background.js" },
   "content_scripts": [
     {

@@ -24,8 +24,11 @@ models, or user configuration belong in this repository.
 | M2 actions, clipboard, local lane, settings | Implemented; manual image/paste acceptance deferred. |
 | M3 hover and browser guide-me | Functionally accepted; visual highlight polish deferred. |
 | M4 packaging and Linux preparation | Started; Linux handshake scaffold exists. Apple refinement is the active priority. |
-| M5 selection actions (summarize / infographic gestures) | Planned; see `plan/mice_planv2_selection_and_goals.md`. |
-| M6 Goal Guide (goal popup → plan → step-by-step guidance) | Planned; staged M6a–M6d in the same plan. |
+| M5 selection actions (summarize / infographic gestures) | Implemented; manual acceptance remains. |
+| M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. |
+| M11 Guide-me that acts | Complete in the M12 companion flow: native transport, verified actions, and double-enforced sensitive-control blocklist. |
+| M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
+| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; Phase 1 (interactive overlay), Phase 2a (word-meaning "Define"), and M7 file-scale summarization are complete. |
 
 ## Current capabilities
 
@@ -36,15 +39,60 @@ models, or user configuration belong in this repository.
 - Hover explanation requires **Control + hover** for roughly 650 ms. It uses
   current AX data, hides raw AX roles/tooltips, prefers actionable descendants,
   strips streamed ANSI control sequences, and bounds model context.
-- Browser guide-me uses the `browser-ext` Chrome extension and a localhost,
-  token-protected bridge. It ranks and bounds DOM candidates, uses verified
-  candidate IDs rather than model-generated selectors, and supports OpenAI or
-  configured Groq JSON output.
-- Native app selection remains pass-through. Use the app’s normal selection and
-  Cmd-C/Cmd-V to preserve source text/table/image clipboard formats. A future
-  non-persistent clipboard observer may enrich these native representations.
+- Browser guide-me uses the `browser-ext` Chrome native-messaging companion.
+  It ranks and bounds DOM candidates, uses verified candidate IDs rather than
+  model-generated selectors, and supports OpenAI or configured Groq JSON
+  output for DOM turns.
+- **Web Autopilot (M12):** `mice autopilot "<goal>"` runs a consented,
+  cloud-only observe → decide → act loop. It has a 15-action / 15-minute cap,
+  compact history, exact candidate-ID validation, two-failure handoff, live
+  page-change observation, terminal plus native-overlay narration, and Esc
+  abort. Sparse browser snapshots request a bounded active-tab JPEG and route
+  only that turn to OpenAI vision. Groq remains available for DOM-only turns.
+  Passwords, OTPs, payment data, login/payment/transfer/final-submit actions
+  are refused independently by Rust and the live content script.
+- Native selection remains pass-through. After selecting text, **Control
+  double-tap** summarizes it and **Control+Option+I** creates an infographic.
+  MICE reads AX selected text first; AX-poor apps use a short synthesized Cmd-C
+  fallback that restores the previous pasteboard before provider work begins.
+- **M7 file-scale summaries:** local streaming uses Ollama's HTTP `/api/chat`
+  endpoint with each local model's explicit context budget. Oversized local-only
+  selections are structurally chunked and map-reduced with visible progress;
+  oversized `cloud_allowed` selections visibly use the configured cloud model.
+  Small selections remain single-shot.
+- **Goal Guide (M6a):** press **Control+Option+Space**, describe a goal, then
+  review, revise, or accept a 3–8 step advisory plan. Plans flag login,
+  payment, account-setup, and personal-data steps as user-only. The flow has
+  no automation, screen targeting, or step advancement yet.
+- **Goal Guide (M6b):** accepting a plan opens a manual step dialog with
+  **Next**, **Back**, and **Quit**. Before each step it performs a read-only
+  AX label search in the focused native app and highlights a best-effort match.
+  No match simply leaves the step unhighlighted; MICE never invokes the target.
+- **Goal Guide (M6c):** browser-hinted steps publish only the current guide
+  instruction through the native-messaging companion. The extension captures
+  its active tab, the core validates a candidate-ID choice, and the extension
+  highlights the verified selector—without clicking or typing.
 - `agent-linux` implements the shared handshake only and advertises no Linux
   desktop capabilities yet.
+
+## Product polish — Phase 1 (interactive overlay)
+
+- Rebuilt the overlay result surface (`agent-macos/.../main.swift`
+  `OverlayController`) from a 6-line non-scrolling `NSTextField` into a
+  scrolling `NSTextView` with an action-button row; it no longer jumps to the
+  mouse while already visible and uses dynamic (light/dark) colors.
+- New IPC (`mice-ipc`): `OverlayResult { session_id, actions }` /
+  `overlay.result` declares the buttons; the agent echoes presses back as an
+  `overlay.action { sessionId, actionId }` notification.
+- Selection results now offer **Go Deeper** (re-runs a deeper explanation on the
+  cached selection) and **Copy**; `handle_overlay_action` + `SelectionCache` in
+  `mice-cli` drive them, and `stream_selected` shares the provider streaming.
+- Phase 2a — word meaning: selecting a single word / short phrase (≤3 words,
+  ≤40 chars, one line) and using the summarize gesture now routes to a new
+  `Action::Define` (dictionary-style: meaning, part of speech, example) instead
+  of a summary; longer passages still summarize. Same gesture, intent inferred
+  from length (`is_short_phrase` in `mice-cli`).
+- M12 is parked pending an OpenAI key; the plan is `mice_planv6_product_polish.md`.
 
 ## Recent repairs
 
@@ -59,6 +107,98 @@ models, or user configuration belong in this repository.
 - Forward action-preset instructions to all model streaming paths.
 - Block `Action::Guide` in local-only routing.
 - Prevent `mice ask` from waiting for EOF when stdin is an interactive TTY.
+- Added M5 typed `selection.text` IPC, configurable selection shortcuts, native
+  AX-first selection reading, and pasteboard-restoring Cmd-C fallback. The
+  resulting summary or infographic is intentionally the next clipboard value.
+- Added M6a typed prompt IPC, a portable `GoalSession` review state machine,
+  strict OpenAI/Groq goal-plan schemas, goal shortcut configuration, and a
+  native macOS prompt/review dialog.
+- Added M6b guide-step IPC, manual guide navigation, and bounded read-only
+  native AX target matching/highlighting.
+- Added M6c runtime browser-step directives and extension polling. The existing
+  bounded candidate-ID bridge is reused for verified selector highlights.
+- Added M11a Chrome native messaging through a mode-0600 Unix socket, a
+  `mice native-host` relay, and `mice setup-browser`. The extension now has a
+  deterministic ID, no popup/options/token storage, and receives pushed steps.
+- Added M11b Do it previews: browser steps offer Confirm/Cancel before one
+  verified click; type-oriented steps accept only user-supplied transient text
+  for one verified fill. Results are returned through the native bridge and
+  each confirmed action is written to the terminal audit line.
+- Added M11c defense in depth: Rust rejects credential/OTP/payment fills and
+  authentication/payment/final-submit clicks from verified target metadata;
+  the content script independently rejects the matching live DOM controls.
+- Added M12: portable bounded loop state; strict OpenAI/Groq turn schemas;
+  `mice autopilot`; fresh-page/navigation observation; action acknowledgement
+  recovery; verified click/fill/open/scroll execution; sparse-page tab
+  screenshot vision with Groq-only fallback; native narration and Esc stop;
+  first-run careful-mode action confirmation.
+- Repaired Chrome native-host launch: Chrome can start the executable directly,
+  so MICE now detects the framed native-host invocation and relays it instead
+  of exiting to usage; extension disconnects also acknowledge runtime errors.
+- The resident `mice start` daemon now owns the browser socket. `mice
+  autopilot` is a control client, avoiding socket theft and allowing Chrome's
+  companion to remain connected between goals.
+- Completed the M12 Canva-class stall fixes (2026-07-17): the extension now
+  reports an empty-but-URL-bearing observation on non-injectable tabs
+  (chrome://, New Tab, PDFs) so the loop escapes via `open_url` instead of
+  stalling; candidate collection adds ARIA widget roles and a bounded
+  cursor:pointer sweep so app UIs (Canva tiles) expose their clickable divs;
+  and the vision fallback also triggers after two turns stalled on one URL,
+  not only when the DOM is sparse. Verified via the standard gates and a live
+  native-host connection check against the daemon socket.
+- Fixed the autopilot handoff loop and blind handoff (2026-07-17): an
+  `in_flight` guard collapses bursts of page observations into one turn at a
+  time, terminal states tear the run down so late/duplicate observations cannot
+  re-enter (stray observations are silent no-ops), and a handoff/ask_user with
+  no chosen control now takes a screenshot and retries once so it can point at
+  the control instead of giving up with nothing highlighted. Reloading the
+  Chrome extension is required for the broadened candidate coverage to apply.
+- Made the autopilot loop strictly turn-based (2026-07-17): the in_flight guard
+  is now held from the start of a turn until the dispatched action's result is
+  processed (released in the result handler and the ack-timeout watchdog), and
+  the page-change handler ignores mutations while an action is in flight. This
+  is a general fix for dynamic/SPA sites whose continuous DOM mutations
+  previously caused the model to re-decide the same action repeatedly before it
+  resolved.
+- Consolidated autopilot narration so each turn emits one line (a single handoff
+  no longer prints 2–3×), added a per-turn candidate-count diagnostic, and
+  size-bounded the observation (2026-07-17): labels collapse whitespace and are
+  shorter, the pointer sweep skips large containers, the guide caps are tighter,
+  and a hard 12 KB observation budget keeps the highest-ranked controls that fit
+  — preventing the provider HTTP 413 seen on control-dense pages like Canva.
+- Made autopilot wait for single-page apps to render before snapshotting
+  (2026-07-17): the extension holds a snapshot request until the DOM is briefly
+  quiet or enough controls exist (capped ~2 s), so observations no longer catch
+  a half-painted page (previously only skip-links on Canva). On a handoff MICE
+  now always highlights — the model's chosen control, or the best-ranked
+  candidate as a labelled best guess — so the user is always pointed at a target.
+- Fixed the loop stalling after same-page clicks (2026-07-17): the content
+  script now reports a page change only when the URL actually changes, so
+  in-page panels/menus (e.g. Canva's "Create a design") trigger an immediate
+  re-observation instead of waiting for a navigation event that never fires.
+- Pinned a single working tab per autopilot goal (2026-07-17): the extension
+  tracks one `goalTabId`, navigates it in place on `open_url` instead of
+  spawning tabs, targets all snapshots/actions/highlights/screenshots at it, and
+  filters page-change events to it. Fixes cross-tab confusion when the user has
+  other tabs open (previously it observed the wrong tab and re-opened Canva). A
+  failed browser action now reports back so the loop re-observes rather than
+  stalling on a missing result.
+- Made re-observation after an action unconditional (2026-07-17): a successful
+  action always triggers a fresh observation (relying on the content-script
+  settle wait for timing) instead of only when no navigation was reported, and
+  `open_url` waits for the tab to finish loading before reporting success. Fixes
+  the loop stalling after same-page interactions like Canva's "Create a design".
+- Hardened content-script availability (2026-07-17): the element scan is now
+  defensive so a DOM edge case can no longer abort content.js before it
+  registers its message listener (which had surfaced as "Receiving end does not
+  exist" / 0 controls), and background.js retries snapshot/action messages
+  briefly to ride out the post-navigation injection race.
+- Deduped candidates by visible label (2026-07-17): a control and its nested
+  icon/text that share a label (e.g. a sidebar "Canva AI" button) no longer
+  appear multiple times crowding out distinct controls or misleading the
+  handoff best-guess highlight. Full autopilot pipeline now runs end to end
+  (navigate → observe → act → re-observe → highlight-guided handoff); remaining
+  quality gains are model judgment, best served by enabling the vision path.
 
 ## Verification
 
@@ -69,13 +209,11 @@ models, or user configuration belong in this repository.
 
 ## Active backlog
 
-0. M5 selection actions, then M6 Goal Guide, per
-   `plan/mice_planv2_selection_and_goals.md`. Selection is read only after an
-   explicit keyboard gesture (AX selected-text first, pasteboard-restoring
-   Cmd-C fallback); mouse dragging stays fully pass-through. Triggers are
-   configurable; defaults avoid Spotlight/Finder system shortcuts.
-1. Carry captured PNGs into multimodal provider requests; current capture is
-   OCR-first and does not yet provide real vision analysis.
+0. M8 smart clipboard observer in `plan/mice_planv3_files_smartcopy_agents.md`;
+   refine Guide follow-on UX and browser highlight presentation from real-world
+   feedback.
+1. Extend the M12 browser-only screenshot path to native-app ScreenCaptureKit
+   vision and add multi-viewport spreadsheet reading.
 2. Remove API keys from curl argument lists, preferably by moving provider HTTP
    calls to a Rust client.
 3. Add `mice stop`, input-monitoring status, correct multi-display capture, and
@@ -94,3 +232,17 @@ models, or user configuration belong in this repository.
   and rich-text destinations.
 - M3: test a Control-hover explanation and a browser guide request on an
   unfamiliar control.
+- M5: in Chrome, Notes, and a PDF viewer, select text then double-tap Control;
+  confirm the summary appears and replaces the clipboard only after completion.
+  Select a table and press Control+Option+I; confirm the PNG infographic opens
+  and is on the clipboard. Test the empty-selection hint too.
+- M6a: press Control+Option+Space, enter a harmless goal, revise the generated
+  plan once, then accept it. Confirm no click, keystroke, or browser action is
+  performed by MICE.
+- M6b: after accepting, use Back and Next through the guide. Confirm a familiar
+  native button can receive a cyan best-effort highlight and that Quit ends the
+  guide without acting on the target.
+- M12: run `mice setup-browser`, load `browser-ext` once, then run
+  `mice autopilot "search Canva and open a portrait"`. Approve the goal and,
+  in first-run careful mode, each safe action. Confirm Esc stops immediately,
+  `local_only` refuses, and a login/payment control becomes a handoff.

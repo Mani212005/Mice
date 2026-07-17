@@ -60,11 +60,56 @@ pub struct HoverCaptured {
     pub bounds: Option<ScreenRect>,
 }
 
+/// Text selected with the host application's normal controls. The platform
+/// agent emits this only after a configured MICE action gesture; it never
+/// owns a mouse drag or click.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionText {
+    pub session_id: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    pub source: SelectionSource,
+    pub action: SelectionAction,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    Ax,
+    Clipboard,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionAction {
+    Summarize,
+    Image,
+}
+
+/// Text submitted by a native prompt owned by the platform agent. The core
+/// retains the session state and decides how a submission is interpreted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSubmitted {
+    pub session_id: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HighlightBox {
     pub bounds: ScreenRect,
     pub instruction_text: String,
+}
+
+/// A button shown on the interactive result panel. `id` is echoed back to the
+/// core in an `overlay.action` notification when the button is pressed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverlayAction {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,12 +159,50 @@ impl RpcResponse {
 /// re-declare protocol shapes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentCommand {
-    OverlayShow { text: String },
-    OverlayAppendResult { chunk: String },
-    OverlayFinishResult { text: Option<String> },
-    OverlayShowImage { png_base64: String },
-    OverlayHighlight { boxes: Vec<HighlightBox> },
-    ClipboardSet { contents: ClipboardContents },
+    OverlayShow {
+        text: String,
+    },
+    /// Updates a visible narration panel without moving it to the current
+    /// mouse position. This keeps multi-step guidance visually calm.
+    OverlayUpdate {
+        text: String,
+    },
+    OverlayAppendResult {
+        chunk: String,
+    },
+    OverlayFinishResult {
+        text: Option<String>,
+    },
+    /// Declares which action buttons the result panel should show and the
+    /// session to echo back when one is pressed. Sent after a result finishes.
+    OverlayResult {
+        session_id: String,
+        actions: Vec<OverlayAction>,
+    },
+    OverlayShowImage {
+        png_base64: String,
+    },
+    OverlayHighlight {
+        boxes: Vec<HighlightBox>,
+    },
+    OverlayPromptInput {
+        session_id: String,
+        title: String,
+        placeholder: String,
+        context: Option<String>,
+    },
+    OverlayGuideStep {
+        session_id: String,
+        step_index: usize,
+        total_steps: usize,
+        instruction: String,
+        app_hint: String,
+        sensitive: bool,
+        browser_capable: bool,
+    },
+    ClipboardSet {
+        contents: ClipboardContents,
+    },
     OverlayDismiss,
     AgentStop,
 }
@@ -128,6 +211,7 @@ impl AgentCommand {
     pub fn notification(&self) -> RpcNotification {
         let (method, params) = match self {
             Self::OverlayShow { text } => ("overlay.show", json!({ "text": text })),
+            Self::OverlayUpdate { text } => ("overlay.update", json!({ "text": text })),
             Self::OverlayAppendResult { chunk } => {
                 ("overlay.appendResult", json!({ "chunk": chunk }))
             }
@@ -135,10 +219,51 @@ impl AgentCommand {
                 ("overlay.finishResult", json!({ "text": text }))
             }
             Self::OverlayFinishResult { text: None } => ("overlay.finishResult", json!({})),
+            Self::OverlayResult {
+                session_id,
+                actions,
+            } => (
+                "overlay.result",
+                json!({ "sessionId": session_id, "actions": actions }),
+            ),
             Self::OverlayShowImage { png_base64 } => {
                 ("overlay.showImage", json!({ "pngBase64": png_base64 }))
             }
             Self::OverlayHighlight { boxes } => ("overlay.highlight", json!({ "boxes": boxes })),
+            Self::OverlayPromptInput {
+                session_id,
+                title,
+                placeholder,
+                context,
+            } => (
+                "overlay.promptInput",
+                json!({
+                    "sessionId": session_id,
+                    "title": title,
+                    "placeholder": placeholder,
+                    "context": context,
+                }),
+            ),
+            Self::OverlayGuideStep {
+                session_id,
+                step_index,
+                total_steps,
+                instruction,
+                app_hint,
+                sensitive,
+                browser_capable,
+            } => (
+                "overlay.guideStep",
+                json!({
+                    "sessionId": session_id,
+                    "stepIndex": step_index,
+                    "totalSteps": total_steps,
+                    "instruction": instruction,
+                    "appHint": app_hint,
+                    "sensitive": sensitive,
+                    "browserCapable": browser_capable,
+                }),
+            ),
             Self::ClipboardSet { contents } => (
                 "clipboard.set",
                 json!({
@@ -257,6 +382,28 @@ mod tests {
     }
 
     #[test]
+    fn overlay_result_declares_session_and_action_buttons() {
+        let command = AgentCommand::OverlayResult {
+            session_id: "sel-1".into(),
+            actions: vec![OverlayAction {
+                id: "go_deeper".into(),
+                label: "Go Deeper".into(),
+            }],
+        };
+        assert_eq!(
+            command.notification(),
+            RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: "overlay.result".into(),
+                params: json!({
+                    "sessionId": "sel-1",
+                    "actions": [{"id": "go_deeper", "label": "Go Deeper"}],
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn guide_highlight_uses_shared_screen_coordinates() {
         let command = AgentCommand::OverlayHighlight {
             boxes: vec![HighlightBox {
@@ -275,6 +422,50 @@ mod tests {
                 "bounds": {"x": 10.0, "y": 20.0, "width": 30.0, "height": 40.0},
                 "instructionText": "Open Settings"
             }]})
+        );
+    }
+
+    #[test]
+    fn selected_text_uses_stable_typed_actions() {
+        let selection = SelectionText {
+            session_id: "selection-1".into(),
+            text: "A selected paragraph".into(),
+            html: Some("<p>A selected paragraph</p>".into()),
+            source: SelectionSource::Clipboard,
+            action: SelectionAction::Summarize,
+        };
+        assert_eq!(
+            serde_json::to_value(selection).unwrap(),
+            json!({
+                "sessionId": "selection-1",
+                "text": "A selected paragraph",
+                "html": "<p>A selected paragraph</p>",
+                "source": "clipboard",
+                "action": "summarize"
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_input_uses_a_shared_session_id() {
+        let command = AgentCommand::OverlayPromptInput {
+            session_id: "goal-1".into(),
+            title: "What is your goal today?".into(),
+            placeholder: "Describe a goal".into(),
+            context: Some("MICE only guides.".into()),
+        };
+        assert_eq!(
+            command.notification(),
+            RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: "overlay.promptInput".into(),
+                params: json!({
+                    "sessionId": "goal-1",
+                    "title": "What is your goal today?",
+                    "placeholder": "Describe a goal",
+                    "context": "MICE only guides.",
+                }),
+            }
         );
     }
 }

@@ -1,11 +1,16 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::{
@@ -13,12 +18,21 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use mice_core::{action_instruction, clipboard_contents, config_path, load_config, save_config};
-use mice_ipc::{
-    AgentCommand, Capabilities, HoverCaptured, InitializeParams, RpcRequest, read_frame,
-    write_frame,
+use mice_core::{
+    AgentAction, AgentDecision, AgentLoop, AgentLoopState, AgentMode, GoalSession, GoalState,
+    LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, action_instruction,
+    chunk_summary_instruction, clipboard_contents, config_path, estimate_tokens, load_config,
+    looks_like_code, reduce_summary_instruction, save_config, selection_summary_instruction,
+    structural_summary_chunks, summary_reduce_batches,
 };
-use mice_providers::{Action, Artifacts, ModelPreferences, RouteRequest, route};
+use mice_ipc::{
+    AgentCommand, Capabilities, HoverCaptured, InitializeParams, PromptSubmitted, RpcRequest,
+    SelectionAction, SelectionText, read_frame, write_frame,
+};
+use mice_providers::{
+    Action, Artifacts, ModelPreferences, OllamaError, RouteRequest, SelectionSummaryRoute, route,
+    route_selection_summary, stream_ollama_chat,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -30,15 +44,27 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 
 fn main() {
-    let result = match env::args().nth(1).as_deref() {
+    let command = env::args().nth(1);
+    // Chrome starts a native-messaging host directly and does not pass our
+    // `native-host` subcommand. It may pass the extension origin as argv[1],
+    // but stdin is always a framing pipe, so recognise both launch forms.
+    let chrome_native_host = command
+        .as_deref()
+        .is_some_and(|argument| argument.starts_with("chrome-extension://"))
+        || (command.is_none() && !std::io::stdin().is_terminal());
+    let result = match command.as_deref() {
         Some("status") => status(),
         Some("doctor") => doctor(),
         Some("settings") => settings(),
         Some("actions") => actions(),
         Some("browser-bridge") => browser_bridge(),
+        Some("native-host") => native_host(),
+        Some("setup-browser") => setup_browser(),
+        Some("autopilot") => autopilot(),
         Some("start") => start(),
         Some("route") => route_preview(),
         Some("ask") => ask(),
+        _ if chrome_native_host => native_host(),
         _ => usage(),
     };
     if let Err(error) = result {
@@ -48,12 +74,15 @@ fn main() {
 }
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Usage: mice <start|stop|status|doctor|settings|actions|browser-bridge|route|ask>");
+    println!(
+        "Usage: mice <start|stop|status|doctor|settings|actions|browser-bridge|setup-browser|autopilot|route|ask>"
+    );
     println!("       mice ask [--action <preset>] <instruction>");
+    println!("       mice autopilot <goal>");
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserElement {
     selector: String,
@@ -67,12 +96,16 @@ struct BrowserElement {
     candidate_id: Option<String>,
 }
 
-const MAX_GUIDE_CANDIDATES: usize = 80;
-const MAX_GUIDE_LABEL_CHARS: usize = 180;
-const MAX_GUIDE_ROLE_CHARS: usize = 80;
-const MAX_GUIDE_SELECTOR_CHARS: usize = 1_024;
+const MAX_GUIDE_CANDIDATES: usize = 60;
+const MAX_GUIDE_LABEL_CHARS: usize = 120;
+const MAX_GUIDE_ROLE_CHARS: usize = 40;
+const MAX_GUIDE_SELECTOR_CHARS: usize = 256;
+/// Hard ceiling on the serialized observation sent to a provider. Control-dense
+/// pages (e.g. a Canva dashboard with long card labels) would otherwise exceed
+/// the provider request-size limit — Groq returns HTTP 413.
+const MAX_OBSERVATION_CHARS: usize = 12_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserGuideRequest {
     instruction: String,
@@ -91,12 +124,1043 @@ struct GuideModelResult {
 struct BrowserGuideResponse {
     selector: String,
     instruction_text: String,
+    label: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GoalPlanResult {
+    steps: Vec<GoalPlanStep>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GoalPlanStep {
+    instruction: String,
+    app_hint: String,
+    sensitive: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveGuide {
+    steps: Vec<GoalPlanStep>,
+    current_step: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserGoalDirective {
+    session_id: String,
+    instruction: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserGoalHighlightRequest {
+    session_id: String,
+    instruction: String,
+    url: String,
+    elements: Vec<BrowserElement>,
+}
+
+#[derive(Default)]
+struct NativeBridgeState {
+    directive: Option<BrowserGoalDirective>,
+    client: Option<Arc<Mutex<UnixStream>>>,
+    targets: HashMap<String, BrowserTarget>,
+    autopilot: Option<AutopilotRun>,
+    control_client: Option<Arc<Mutex<UnixStream>>>,
+    overlay_writer: Option<Arc<Mutex<ChildStdin>>>,
+    overlay_shown: bool,
+}
+
+#[derive(Clone)]
+struct BrowserTarget {
+    selector: String,
+    label: String,
+    role: String,
+}
+
+struct AutopilotRun {
+    session_id: String,
+    loop_state: AgentLoop,
+    started_at: Instant,
+    awaiting_page_change: bool,
+    pending_snapshot: Option<BrowserGoalHighlightRequest>,
+    action_deadline: Option<Instant>,
+    // Progress signal for the vision fallback: how many consecutive turns have
+    // observed the same URL without navigating, and the last URL we saw. When a
+    // page-rich site (e.g. Canva) keeps the agent on one URL, this rises and we
+    // escalate to a screenshot so the model can see controls the DOM omits.
+    stuck_turns: usize,
+    last_observed_url: Option<String>,
+    // True while a model turn is being computed. A page-heavy SPA (or a churning
+    // MV3 service worker) can deliver a burst of observations; without this the
+    // loop would run several model turns in parallel and narrate/handoff
+    // repeatedly. Duplicate observations that arrive mid-turn are dropped.
+    in_flight: bool,
+}
+
+const AUTOPILOT_ACTION_BUDGET: usize = 15;
+const AUTOPILOT_WALL_CLOCK_CAP: Duration = Duration::from_secs(15 * 60);
+const AUTOPILOT_ACTION_ACK_TIMEOUT: Duration = Duration::from_secs(12);
+
+type NativeBridge = Arc<Mutex<NativeBridgeState>>;
+const NATIVE_HOST_NAME: &str = "com.mice.bridge";
+const EXTENSION_ID: &str = "pmbogcpjmddjpgcilhiplppdhnboeofc";
+
+fn bridge_socket_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    config_path()
+        .and_then(|path| path.parent().map(|parent| parent.join("bridge.sock")))
+        .ok_or_else(|| "HOME is not set".into())
+}
+
+fn start_native_bridge(
+    config: mice_core::Config,
+    bridge: NativeBridge,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = bridge_socket_path()?;
+    if path.exists() {
+        if UnixStream::connect(&path).is_ok() {
+            return Err("MICE is already running; use the existing daemon.".into());
+        }
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::create_dir_all(path.parent().ok_or("bridge socket has no parent")?)?;
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let state = Arc::clone(&bridge);
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let _ = handle_native_bridge(stream, &config, state);
+            });
+        }
+    });
+    Ok(())
+}
+
+fn native_bridge_send(bridge: &NativeBridge, value: &serde_json::Value) {
+    let client = bridge.lock().ok().and_then(|state| state.client.clone());
+    if let Some(client) = client
+        && let Ok(mut stream) = client.lock()
+    {
+        let _ = write_frame(&mut *stream, value);
+    }
+}
+
+fn autopilot_status(bridge: &NativeBridge, text: impl Into<String>, done: bool) {
+    let client = bridge
+        .lock()
+        .ok()
+        .and_then(|state| state.control_client.clone());
+    if let Some(client) = client
+        && let Ok(mut stream) = client.lock()
+    {
+        let _ = write_frame(
+            &mut *stream,
+            &serde_json::json!({"type":"autopilot.status", "text":text.into(), "done":done}),
+        );
+    }
+}
+
+fn native_overlay(bridge: &NativeBridge, text: impl Into<String>) {
+    autopilot_narrate(bridge, text, false);
+}
+
+/// Paint one line of narration to the native overlay and forward it to the CLI
+/// control client exactly once, with the terminal `done` flag. Callers must not
+/// separately call `autopilot_status` for the same message, or it prints twice.
+fn autopilot_narrate(bridge: &NativeBridge, text: impl Into<String>, done: bool) {
+    let text = text.into();
+    let (writer, update) = bridge.lock().ok().map_or((None, false), |mut state| {
+        let update = state.overlay_shown;
+        state.overlay_shown = true;
+        (state.overlay_writer.clone(), update)
+    });
+    if let Some(writer) = writer
+        && let Ok(mut writer) = writer.lock()
+    {
+        let command = if update {
+            AgentCommand::OverlayUpdate { text: text.clone() }
+        } else {
+            AgentCommand::OverlayShow { text: text.clone() }
+        };
+        let _ = send_command(&mut writer, command);
+    }
+    autopilot_status(bridge, text, done);
+}
+
+fn handle_native_bridge(
+    mut stream: UnixStream,
+    config: &mice_core::Config,
+    bridge: NativeBridge,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let message: serde_json::Value = read_frame(&mut stream)?;
+        match message["type"].as_str() {
+            Some("autopilot.start") => {
+                let goal = message["goal"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if goal.is_empty() {
+                    write_frame(
+                        &mut stream,
+                        &serde_json::json!({"type":"autopilot.status", "text":"Enter a goal before starting autopilot.", "done":true}),
+                    )?;
+                    continue;
+                }
+                if config.privacy_mode == mice_providers::PrivacyMode::LocalOnly {
+                    write_frame(
+                        &mut stream,
+                        &serde_json::json!({"type":"autopilot.status", "text":"Autopilot requires cloud access. Change privacy mode first.", "done":true}),
+                    )?;
+                    continue;
+                }
+                let session_id = format!(
+                    "autopilot-{}",
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+                );
+                let writer = Arc::new(Mutex::new(stream.try_clone()?));
+                let directive = BrowserGoalDirective {
+                    session_id: session_id.clone(),
+                    instruction: goal.clone(),
+                };
+                let chrome_connected = if let Ok(mut state) = bridge.lock() {
+                    state.control_client = Some(writer);
+                    state.directive = Some(directive.clone());
+                    state.autopilot = Some(AutopilotRun {
+                        session_id,
+                        loop_state: AgentLoop::new(
+                            goal,
+                            AgentMode::Autopilot,
+                            AUTOPILOT_ACTION_BUDGET,
+                        ),
+                        started_at: Instant::now(),
+                        awaiting_page_change: false,
+                        pending_snapshot: None,
+                        action_deadline: None,
+                        stuck_turns: 0,
+                        last_observed_url: None,
+                        in_flight: false,
+                    });
+                    state.client.is_some()
+                } else {
+                    false
+                };
+                // The goal.step below reaches the browser only if the Chrome
+                // extension is connected to this daemon. If it is not, say so
+                // clearly instead of pretending to observe — the pending
+                // directive is replayed automatically when the extension
+                // connects (see the bridge.hello handler).
+                if chrome_connected {
+                    autopilot_status(
+                        &bridge,
+                        "Autopilot started. Observing the current page.",
+                        false,
+                    );
+                    native_bridge_send(
+                        &bridge,
+                        &serde_json::json!({"type":"goal.step", "directive":directive}),
+                    );
+                } else {
+                    autopilot_status(
+                        &bridge,
+                        "Autopilot is ready, but Chrome is not connected yet. Keep `mice start` running with the MICE extension loaded and Chrome open — I will begin automatically when it connects.",
+                        false,
+                    );
+                }
+            }
+            Some("autopilot.stop") => stop_autopilot(&bridge, "Autopilot stopped."),
+            Some("bridge.hello") => {
+                let writer = Arc::new(Mutex::new(stream.try_clone()?));
+                let directive = {
+                    let mut state = bridge.lock().map_err(|_| "native bridge lock failed")?;
+                    state.client = Some(writer);
+                    state.directive.clone()
+                };
+                native_bridge_send(
+                    &bridge,
+                    &serde_json::json!({"type":"goal.step", "directive": directive}),
+                );
+            }
+            Some("goal.snapshot") => {
+                let request: BrowserGoalHighlightRequest = serde_json::from_value(message)?;
+                let is_autopilot = bridge.lock().ok().is_some_and(|state| {
+                    state
+                        .autopilot
+                        .as_ref()
+                        .is_some_and(|run| run.session_id == request.session_id)
+                });
+                if is_autopilot {
+                    if let Err(error) = advance_autopilot(config, &bridge, request, None) {
+                        eprintln!("[MICE autopilot] {error}");
+                        stop_autopilot(&bridge, "I ran into a problem, so I have stopped safely.");
+                    }
+                    continue;
+                }
+                let directive = bridge.lock().ok().and_then(|state| state.directive.clone());
+                if let Some(directive) = directive.filter(|item| {
+                    item.session_id == request.session_id && item.instruction == request.instruction
+                }) && let Ok(response) = guide_browser_request(
+                    config,
+                    BrowserGuideRequest {
+                        instruction: directive.instruction,
+                        url: request.url,
+                        elements: request.elements,
+                    },
+                ) {
+                    if let Ok(mut state) = bridge.lock() {
+                        state.targets.insert(
+                            request.session_id.clone(),
+                            BrowserTarget {
+                                selector: response.selector.clone(),
+                                label: response.label.clone(),
+                                role: response.role.clone(),
+                            },
+                        );
+                    }
+                    native_bridge_send(
+                        &bridge,
+                        &serde_json::json!({"type":"browser.highlight", "sessionId": request.session_id, "selector": response.selector, "instructionText": response.instruction_text}),
+                    );
+                }
+            }
+            Some("browser.actResult") => {
+                handle_autopilot_result(&bridge, &message);
+                eprintln!(
+                    "[MICE act] session {}: {}",
+                    message["sessionId"].as_str().unwrap_or("unknown"),
+                    if message["ok"].as_bool().unwrap_or(false) {
+                        "completed"
+                    } else {
+                        message["error"].as_str().unwrap_or("failed")
+                    }
+                );
+            }
+            Some("browser.screenshot") => {
+                let session_id = message["sessionId"].as_str().unwrap_or_default();
+                let data_url = message["dataUrl"].as_str().unwrap_or_default();
+                let snapshot = bridge.lock().ok().and_then(|mut state| {
+                    state.autopilot.as_mut().and_then(|run| {
+                        (run.session_id == session_id)
+                            .then(|| run.pending_snapshot.take())
+                            .flatten()
+                    })
+                });
+                if let Some(snapshot) = snapshot {
+                    let image = if data_url.len() <= 900_000 {
+                        data_url
+                    } else {
+                        ""
+                    };
+                    if let Err(error) = advance_autopilot(config, &bridge, snapshot, Some(image)) {
+                        eprintln!("[MICE autopilot] {error}");
+                        stop_autopilot(
+                            &bridge,
+                            "I could not inspect that page safely, so I stopped.",
+                        );
+                    }
+                }
+            }
+            Some("browser.pageChanged") => {
+                let directive = if let Ok(mut state) = bridge.lock() {
+                    state.targets.clear();
+                    if let Some(run) = state.autopilot.as_mut()
+                        && run.awaiting_page_change
+                        // Do not consume the awaited page change while an action
+                        // is still in flight; a busy SPA fires many mutations
+                        // before the action's result arrives, and consuming one
+                        // here would skip the real post-action re-observation.
+                        && !run.in_flight
+                        && matches!(run.loop_state.state, AgentLoopState::Running)
+                    {
+                        run.awaiting_page_change = false;
+                        run.action_deadline = None;
+                        state.directive.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                eprintln!(
+                    "[MICE observe] page changed: {}",
+                    message["url"].as_str().unwrap_or("unknown page")
+                );
+                if let Some(directive) = directive {
+                    native_bridge_send(
+                        &bridge,
+                        &serde_json::json!({"type":"goal.step", "directive": directive}),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Decide and perform one browser turn. The model only sees the locally
+/// bounded candidate list; it can name a candidate ID but never a selector.
+fn advance_autopilot(
+    config: &mice_core::Config,
+    bridge: &NativeBridge,
+    request: BrowserGoalHighlightRequest,
+    screenshot: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (goal, history, ranking_instruction, stuck_turns) = {
+        let mut state = bridge.lock().map_err(|_| "native bridge lock failed")?;
+        // A finished run is torn down; a stray late observation is a no-op.
+        let Some(run) = state.autopilot.as_mut() else {
+            return Ok(());
+        };
+        if run.session_id != request.session_id {
+            return Ok(());
+        }
+        if run.started_at.elapsed() > AUTOPILOT_WALL_CLOCK_CAP {
+            drop(state);
+            stop_autopilot(bridge, "The time limit was reached. I have stopped safely.");
+            return Ok(());
+        }
+        if !matches!(run.loop_state.state, AgentLoopState::Running) {
+            return Ok(());
+        }
+        // Collapse a burst of observations into one turn. The screenshot
+        // re-entry (screenshot.is_some()) is the continuation of the current
+        // turn, so it is never dropped and never re-marks in_flight.
+        if screenshot.is_none() {
+            if run.in_flight {
+                return Ok(());
+            }
+            run.in_flight = true;
+            // Count progress on the first observation of a turn only.
+            if run.last_observed_url.as_deref() == Some(request.url.as_str()) {
+                run.stuck_turns += 1;
+            } else {
+                run.stuck_turns = 0;
+                run.last_observed_url = Some(request.url.clone());
+            }
+        }
+        let ranking_instruction = run.loop_state.history.last().map_or_else(
+            || run.loop_state.goal.clone(),
+            |turn| format!("{}\nCurrent progress: {}", run.loop_state.goal, turn.result),
+        );
+        (
+            run.loop_state.goal.clone(),
+            render_agent_history(&run.loop_state),
+            ranking_instruction,
+            run.stuck_turns,
+        )
+    };
+
+    let mut candidates = rank_guide_candidates(&ranking_instruction, request.elements.clone());
+    // Bound the observation so a control-dense page cannot exceed the provider's
+    // request-size limit. Keep the highest-ranked controls that fit the budget.
+    {
+        let mut budget = request.url.len() + 128;
+        let mut kept = 0;
+        for candidate in &candidates {
+            let cost = candidate.selector.len() + candidate.label.len() + candidate.role.len() + 48;
+            if kept > 0 && budget + cost > MAX_OBSERVATION_CHARS {
+                break;
+            }
+            budget += cost;
+            kept += 1;
+        }
+        candidates.truncate(kept);
+    }
+    // Diagnostic: how many controls the page exposed and the top few labels.
+    // A near-empty list here on a rich page means the extension is running an
+    // old content.js (reload it) rather than a model problem.
+    if screenshot.is_none() {
+        let preview = candidates
+            .iter()
+            .take(6)
+            .map(|candidate| candidate.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!(
+            "[MICE observe] {} controls on {} | top: {preview}",
+            candidates.len(),
+            request.url
+        );
+    }
+    // Escalate to a screenshot when the DOM is sparse OR the agent has stalled
+    // on one page for two turns (common on canvas/app UIs like Canva where
+    // clickable tiles are divs the DOM snapshot cannot expose). Only worth doing
+    // when vision is actually reachable.
+    let vision_possible = env::var_os("OPENAI_API_KEY").is_some();
+    let needs_screenshot = screenshot.is_none()
+        && vision_possible
+        && (candidates.len() <= 3 || stuck_turns >= 2)
+        && bridge.lock().ok().is_some_and(|mut state| {
+            state.autopilot.as_mut().is_some_and(|run| {
+                if run.session_id == request.session_id {
+                    run.pending_snapshot = Some(request.clone());
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+    if needs_screenshot && stuck_turns >= 2 {
+        eprintln!(
+            "[MICE autopilot] Stalled on this page; taking a screenshot to look for controls the page markup does not expose."
+        );
+    }
+    if needs_screenshot {
+        native_bridge_send(
+            bridge,
+            &serde_json::json!({"type":"browser.screenshot", "sessionId":request.session_id}),
+        );
+        return Ok(());
+    }
+    let observation = serde_json::to_string(&serde_json::json!({
+        "url": request.url,
+        "interactive_elements": candidates,
+    }))?;
+    let usable_screenshot = screenshot.filter(|image| image.starts_with("data:image/"));
+    let vision_unavailable = usable_screenshot.is_some() && env::var_os("OPENAI_API_KEY").is_none();
+    if vision_unavailable {
+        let notice = "I cannot use the visual view because OpenAI is not configured. I will continue from the page controls I can read.";
+        eprintln!("[MICE autopilot] {notice}");
+        native_overlay(bridge, notice);
+    }
+    let output = if usable_screenshot.is_some() && !vision_unavailable {
+        call_openai_agent_turn(
+            "gpt-5.6-sol",
+            &goal,
+            &observation,
+            &history,
+            usable_screenshot,
+            &config.autopilot.persona,
+        )?
+    } else if is_groq_model(&config.cloud_model) {
+        call_groq_agent_turn(
+            &config.cloud_model,
+            &goal,
+            &observation,
+            &history,
+            &config.autopilot.persona,
+        )?
+    } else {
+        call_openai_agent_turn(
+            &config.cloud_model,
+            &goal,
+            &observation,
+            &history,
+            None,
+            &config.autopilot.persona,
+        )?
+    };
+    let mut decision: AgentDecision = serde_json::from_str(&output).map_err(|error| {
+        eprintln!(
+            "[MICE autopilot] Could not decode model decision: {error}; output: {}",
+            bounded_for_model(&output, 1_000)
+        );
+        "The cloud model returned an invalid autopilot decision."
+    })?;
+    validate_agent_decision(&decision)?;
+
+    // If the model is about to give up or ask for help without pointing at any
+    // control, let it look at the page first — a screenshot often reveals the
+    // button the DOM did not expose. Retry once (only when vision was not used
+    // this turn); in_flight stays set so the screenshot re-entry continues.
+    if screenshot.is_none()
+        && vision_possible
+        && decision.candidate_id.is_none()
+        && matches!(decision.action, AgentAction::Handoff | AgentAction::AskUser)
+    {
+        let stored = bridge.lock().ok().is_some_and(|mut state| {
+            state.autopilot.as_mut().is_some_and(|run| {
+                if run.session_id == request.session_id {
+                    run.pending_snapshot = Some(request.clone());
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+        if stored {
+            eprintln!(
+                "[MICE autopilot] The model found no control to use; taking a screenshot before it hands off."
+            );
+            native_bridge_send(
+                bridge,
+                &serde_json::json!({"type":"browser.screenshot", "sessionId":request.session_id}),
+            );
+            return Ok(());
+        }
+    }
+
+    let selected = decision.candidate_id.as_deref().and_then(|candidate_id| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id.as_deref() == Some(candidate_id))
+    });
+    if matches!(decision.action, AgentAction::Click | AgentAction::Fill) && selected.is_none() {
+        decision = handoff_decision(
+            "I could not verify that control on this page. Please do that step yourself, then I can continue.",
+        );
+    }
+    if let Some(selected) = selected {
+        let target = BrowserTarget {
+            selector: selected.selector.clone(),
+            label: selected.label.clone(),
+            role: selected.role.clone(),
+        };
+        let kind = match decision.action {
+            AgentAction::Click => Some("click"),
+            AgentAction::Fill => Some("fill"),
+            _ => None,
+        };
+        if let Some(kind) = kind
+            && let Some(reason) = blocked_browser_action(kind, &target, &goal)
+        {
+            decision = handoff_decision(&format!(
+                "This is a protected step ({reason}). I have highlighted it; please do it yourself."
+            ));
+        }
+    }
+
+    let mut action_to_send = None;
+    let mut action_preview = None;
+    let mut highlight_to_send = None;
+    let mut terminal_message = None;
+    {
+        let mut state = bridge.lock().map_err(|_| "native bridge lock failed")?;
+        let Some(run) = state.autopilot.as_mut() else {
+            return Ok(());
+        };
+        if run.session_id != request.session_id
+            || !matches!(run.loop_state.state, AgentLoopState::Running)
+        {
+            return Ok(());
+        }
+        run.loop_state.apply_decision(&decision)?;
+        match &run.loop_state.state {
+            AgentLoopState::BudgetExhausted => {
+                terminal_message =
+                    Some("I reached the 15-action limit, so I have stopped safely.".into());
+            }
+            AgentLoopState::Done(summary) => terminal_message = Some(format!("Done: {summary}")),
+            AgentLoopState::Paused(question) => {
+                terminal_message = Some(format!("I need your help: {question}"))
+            }
+            AgentLoopState::HandedOff(message) => {
+                terminal_message = Some(message.clone());
+                // Always point somewhere on a handoff so the user is guided.
+                // Prefer the control the model chose; otherwise highlight the
+                // best-ranked candidate as a clearly-labelled best guess.
+                if let Some(selected) = selected {
+                    highlight_to_send =
+                        Some((selected.selector.clone(), decision.say_to_user.clone()));
+                } else if let Some(guess) = candidates.first() {
+                    highlight_to_send = Some((
+                        guess.selector.clone(),
+                        format!(
+                            "Best guess — you may need to use \u{201c}{}\u{201d}.",
+                            guess.label
+                        ),
+                    ));
+                }
+            }
+            AgentLoopState::Stopped | AgentLoopState::Running => {}
+        }
+        if matches!(run.loop_state.state, AgentLoopState::Running) {
+            match decision.action {
+                AgentAction::Click | AgentAction::Fill => {
+                    let selected = selected.ok_or("missing verified action candidate")?;
+                    // Candidate IDs are regenerated on every snapshot; use
+                    // the verified selector for failure correlation instead.
+                    run.loop_state.last_action_target = Some(selected.selector.clone());
+                    run.awaiting_page_change = true;
+                    run.loop_state.record(
+                        format!("{:?}", decision.action).to_ascii_lowercase(),
+                        format!("sent to {}", selected.label),
+                    );
+                    action_to_send = Some(serde_json::json!({
+                        "type":"browser.act", "sessionId":request.session_id,
+                        "action": if matches!(decision.action, AgentAction::Click) { "click" } else { "fill" },
+                        "selector":selected.selector, "value":decision.value,
+                    }));
+                    action_preview = Some(format!(
+                        "{} {}",
+                        if matches!(decision.action, AgentAction::Click) {
+                            "click"
+                        } else {
+                            "type into"
+                        },
+                        selected.label
+                    ));
+                }
+                AgentAction::OpenUrl => {
+                    let url = decision.url.clone().ok_or("open_url needs a URL")?;
+                    if !valid_browser_url(&url) {
+                        return Err("MICE only opens http or https URLs.".into());
+                    }
+                    run.loop_state.last_action_target = None;
+                    run.awaiting_page_change = true;
+                    run.loop_state.record("open_url", format!("opened {url}"));
+                    action_to_send = Some(serde_json::json!({
+                        "type":"browser.act", "sessionId":request.session_id,
+                        "action":"open_url", "url":url,
+                    }));
+                    action_preview = Some(format!("open {url}"));
+                }
+                AgentAction::Scroll => {
+                    run.loop_state.last_action_target = None;
+                    run.awaiting_page_change = false;
+                    run.loop_state.record("scroll", "sent");
+                    action_to_send = Some(serde_json::json!({
+                        "type":"browser.act", "sessionId":request.session_id,
+                        "action":"scroll",
+                    }));
+                    action_preview = Some("scroll the page".into());
+                }
+                AgentAction::Done | AgentAction::Handoff | AgentAction::AskUser => {}
+            }
+        }
+    }
+    if let Some((selector, instruction_text)) = highlight_to_send {
+        native_bridge_send(
+            bridge,
+            &serde_json::json!({"type":"browser.highlight", "sessionId":request.session_id, "selector":selector, "instructionText":instruction_text}),
+        );
+    }
+    if let Some(message) = &terminal_message {
+        let done = bridge.lock().ok().is_some_and(|state| {
+            state
+                .autopilot
+                .as_ref()
+                .is_some_and(|run| !matches!(run.loop_state.state, AgentLoopState::Running))
+        });
+        // Narrate the outcome exactly once (overlay + client, with the done flag).
+        println!("[MICE autopilot] {message}");
+        autopilot_narrate(bridge, message, done);
+        if !message.starts_with("Done:") && !message.starts_with("I need your help:") {
+            clear_browser_goal_directive(bridge);
+        }
+        // Tear the run down on any terminal state so a late or duplicated
+        // observation from the page cannot re-enter the loop and repeat the
+        // narration/handoff.
+        if done && let Ok(mut state) = bridge.lock() {
+            state.autopilot = None;
+        }
+    } else {
+        // Non-terminal action turn: narrate the model's plan for this step once.
+        println!("[MICE autopilot] {}", decision.say_to_user.trim());
+        native_overlay(bridge, decision.say_to_user.trim());
+    }
+    if (config.autopilot.careful_mode || config.autopilot.first_run)
+        && let Some(preview) = action_preview
+    {
+        native_overlay(bridge, format!("Next I will {preview}."));
+    }
+    if let Some(message) = action_to_send {
+        // Keep the turn guard held: the next observation must wait until this
+        // action's result (or its ack timeout) arrives, so a page that mutates
+        // constantly cannot start overlapping turns.
+        arm_autopilot_action_timeout(bridge, &request.session_id);
+        native_bridge_send(bridge, &message);
+    } else {
+        // No action dispatched this turn (terminal or no-op): release the guard
+        // so a later observation can proceed. Terminal states have already torn
+        // the run down, making this a harmless no-op then.
+        if let Ok(mut state) = bridge.lock()
+            && let Some(run) = state.autopilot.as_mut()
+            && run.session_id == request.session_id
+        {
+            run.in_flight = false;
+        }
+    }
+    Ok(())
+}
+
+fn arm_autopilot_action_timeout(bridge: &NativeBridge, session_id: &str) {
+    if let Ok(mut state) = bridge.lock()
+        && let Some(run) = state.autopilot.as_mut()
+        && run.session_id == session_id
+        && matches!(run.loop_state.state, AgentLoopState::Running)
+    {
+        run.action_deadline = Some(Instant::now() + AUTOPILOT_ACTION_ACK_TIMEOUT);
+    }
+}
+
+fn handle_autopilot_result(bridge: &NativeBridge, message: &serde_json::Value) {
+    let session_id = message["sessionId"].as_str().unwrap_or_default();
+    let ok = message["ok"].as_bool().unwrap_or(false);
+    let page_changed = message["pageChanged"].as_bool().unwrap_or(false);
+    let directive = if let Ok(mut state) = bridge.lock() {
+        let Some(run) = state.autopilot.as_mut() else {
+            return;
+        };
+        if run.session_id != session_id || !matches!(run.loop_state.state, AgentLoopState::Running)
+        {
+            return;
+        }
+        // The dispatched action has resolved; release the turn guard so the
+        // deliberate re-observation below (or a page-change event) can proceed.
+        run.in_flight = false;
+        if ok {
+            run.action_deadline = None;
+            run.loop_state.record_action_result(
+                run.loop_state.last_action_target.clone(),
+                true,
+                "completed",
+            );
+            // Always re-observe after a successful action. The content script
+            // waits for the page to settle before answering, so this works for
+            // both same-page interactions and navigations; relying on a separate
+            // page-change event could miss it and stall the loop.
+            run.awaiting_page_change = false;
+            state.directive.clone()
+        } else {
+            run.action_deadline = None;
+            let error = message["error"].as_str().unwrap_or("browser action failed");
+            run.loop_state.record_action_result(
+                run.loop_state.last_action_target.clone(),
+                false,
+                error,
+            );
+            if matches!(run.loop_state.state, AgentLoopState::HandedOff(_)) {
+                None
+            } else {
+                run.awaiting_page_change = false;
+                state.directive.clone()
+            }
+        }
+    } else {
+        None
+    };
+    eprintln!(
+        "[MICE act-result] ok={ok} pageChanged={page_changed} reobserve={}",
+        directive.is_some()
+    );
+    if let Some(directive) = directive {
+        native_bridge_send(
+            bridge,
+            &serde_json::json!({"type":"goal.step", "directive":directive}),
+        );
+    }
+}
+
+/// The extension service worker may be reclaimed between dispatch and its
+/// acknowledgement. Re-observe rather than replaying an uncertain action.
+fn recover_autopilot_timeouts(bridge: &NativeBridge) {
+    let (directive, message): (Option<BrowserGoalDirective>, Option<String>) =
+        if let Ok(mut state) = bridge.lock() {
+            let Some(run) = state.autopilot.as_mut() else {
+                return;
+            };
+            if !matches!(run.loop_state.state, AgentLoopState::Running) {
+                return;
+            }
+            if run.started_at.elapsed() >= AUTOPILOT_WALL_CLOCK_CAP {
+                run.loop_state.stop();
+                state.directive = None;
+                (
+                    None,
+                    Some("The 15-minute time limit was reached. I have stopped safely.".into()),
+                )
+            } else if run
+                .action_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                run.action_deadline = None;
+                run.in_flight = false;
+                run.awaiting_page_change = false;
+                run.loop_state.record_action_result(
+                    run.loop_state.last_action_target.clone(),
+                    false,
+                    "No browser acknowledgement arrived; rechecking the page.",
+                );
+                if matches!(run.loop_state.state, AgentLoopState::Running) {
+                    (
+                        state.directive.clone(),
+                        Some("I am rechecking the page after a delayed browser response.".into()),
+                    )
+                } else {
+                    state.directive = None;
+                    (
+                        None,
+                        Some(
+                            "That control did not respond twice, so I have handed it back to you."
+                                .into(),
+                        ),
+                    )
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+    if let Some(message) = message {
+        eprintln!("[MICE autopilot] {message}");
+        native_overlay(bridge, message);
+    }
+    if let Some(directive) = directive {
+        native_bridge_send(
+            bridge,
+            &serde_json::json!({"type":"goal.step", "directive":directive}),
+        );
+    }
+}
+
+fn render_agent_history(loop_state: &AgentLoop) -> String {
+    if loop_state.history.is_empty() {
+        "No prior actions.".into()
+    } else {
+        loop_state
+            .history
+            .iter()
+            .map(|turn| {
+                format!(
+                    "{}: {}",
+                    turn.action,
+                    bounded_for_model(&turn.result, MAX_GUIDE_LABEL_CHARS)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn validate_agent_decision(decision: &AgentDecision) -> Result<(), Box<dyn std::error::Error>> {
+    if decision.say_to_user.trim().is_empty() || decision.say_to_user.chars().count() > 500 {
+        return Err("The autopilot decision did not include a safe narration.".into());
+    }
+    if matches!(decision.action, AgentAction::Fill)
+        && decision.value.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err("The autopilot asked to fill without text.".into());
+    }
+    if matches!(decision.action, AgentAction::OpenUrl)
+        && decision.url.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err("The autopilot asked to open an empty URL.".into());
+    }
+    Ok(())
+}
+
+fn handoff_decision(message: &str) -> AgentDecision {
+    AgentDecision {
+        say_to_user: message.into(),
+        action: AgentAction::Handoff,
+        candidate_id: None,
+        url: None,
+        value: None,
+        done_summary: None,
+        question: None,
+    }
+}
+
+fn valid_browser_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+fn stop_autopilot(bridge: &NativeBridge, message: &str) {
+    if let Ok(mut state) = bridge.lock()
+        && let Some(run) = state.autopilot.as_mut()
+    {
+        run.loop_state.stop();
+    }
+    clear_browser_goal_directive(bridge);
+    native_overlay(bridge, message);
+    autopilot_status(bridge, message, true);
+    eprintln!("[MICE autopilot] {message}");
+}
+
+fn native_host() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(bridge_socket_path()?)?;
+    let mut to_core = stream.try_clone()?;
+    std::thread::spawn(move || {
+        let mut input = std::io::stdin();
+        while let Ok(message) = read_frame::<serde_json::Value>(&mut input) {
+            if write_frame(&mut to_core, &message).is_err() {
+                break;
+            }
+        }
+    });
+    let mut from_core = stream;
+    let mut output = std::io::stdout();
+    while let Ok(message) = read_frame::<serde_json::Value>(&mut from_core) {
+        write_frame(&mut output, &message)?;
+    }
+    Ok(())
+}
+
+fn setup_browser() -> Result<(), Box<dyn std::error::Error>> {
+    let home = env::var_os("HOME").ok_or("HOME is not set")?;
+    let directory =
+        PathBuf::from(home).join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
+    std::fs::create_dir_all(&directory)?;
+    let manifest = serde_json::json!({"name": NATIVE_HOST_NAME, "description": "MICE browser companion", "path": env::current_exe()?, "type": "stdio", "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")]});
+    std::fs::write(
+        directory.join(format!("{NATIVE_HOST_NAME}.json")),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    println!("Installed native browser host for extension {EXTENSION_ID}.");
+    Ok(())
+}
+
+fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
+    let goal = env::args().skip(2).collect::<Vec<_>>().join(" ");
+    if goal.trim().is_empty() {
+        return Err(
+            "Provide a goal, for example: mice autopilot \"search Canva and open a portrait\""
+                .into(),
+        );
+    }
+    println!(
+        "MICE will use the configured cloud model to click and type for this goal. It never enters passwords, one-time codes, payment data, or final submissions."
+    );
+    println!("Goal: {goal}");
+    print!("Start autopilot? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut consent = String::new();
+    std::io::stdin().read_line(&mut consent)?;
+    if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Autopilot was not started.");
+        return Ok(());
+    }
+
+    let mut stream = UnixStream::connect(bridge_socket_path()?)
+        .map_err(|_| "Start the MICE daemon first: `cargo run -p mice-cli -- start`.")?;
+    write_frame(
+        &mut stream,
+        &serde_json::json!({"type":"autopilot.start", "goal":goal}),
+    )?;
+    while let Ok(status) = read_frame::<serde_json::Value>(&mut stream) {
+        if status["type"] != "autopilot.status" {
+            continue;
+        }
+        if let Some(text) = status["text"].as_str() {
+            println!("[MICE autopilot] {text}");
+        }
+        if status["done"].as_bool().unwrap_or(false) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn browser_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let token = env::var("MICE_BROWSER_BRIDGE_TOKEN")
         .map_err(|_| "MICE_BROWSER_BRIDGE_TOKEN must be set before starting the browser bridge")?;
     let config = config()?;
+    run_browser_bridge(config, token, None)
+}
+
+fn run_browser_bridge(
+    config: mice_core::Config,
+    token: String,
+    goal_directive: Option<Arc<Mutex<Option<BrowserGoalDirective>>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:9417")?;
     println!("MICE browser bridge listening on http://127.0.0.1:9417");
     println!(
@@ -105,7 +1169,9 @@ fn browser_bridge() -> Result<(), Box<dyn std::error::Error>> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_browser_connection(stream, &token, &config) {
+                if let Err(error) =
+                    handle_browser_connection(stream, &token, &config, goal_directive.as_ref())
+                {
                     eprintln!("MICE browser bridge request failed: {error}");
                 }
             }
@@ -119,6 +1185,7 @@ fn handle_browser_connection(
     mut stream: TcpStream,
     token: &str,
     config: &mice_core::Config,
+    goal_directive: Option<&Arc<Mutex<Option<BrowserGoalDirective>>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = read_http_request(&mut stream)?;
     let header_end = request
@@ -134,20 +1201,75 @@ fn handle_browser_connection(
                 .or_else(|| line.strip_prefix("x-mice-token: "))
         })
         .unwrap_or_default();
-    if request_line != "POST /guide HTTP/1.1" || supplied_token != token {
+    if supplied_token != token {
         return write_http_json(
             &mut stream,
             401,
             &serde_json::json!({"error": "Unauthorized."}),
         );
     }
-    let guide_request: BrowserGuideRequest = serde_json::from_slice(&request[header_end + 4..])?;
-    match guide_browser_request(config, guide_request) {
-        Ok(response) => write_http_json(&mut stream, 200, &response),
-        Err(error) => write_http_json(
+    let body = &request[header_end + 4..];
+    match request_line {
+        "POST /guide HTTP/1.1" => {
+            let guide_request: BrowserGuideRequest = serde_json::from_slice(body)?;
+            match guide_browser_request(config, guide_request) {
+                Ok(response) => write_http_json(&mut stream, 200, &response),
+                Err(error) => write_http_json(
+                    &mut stream,
+                    422,
+                    &serde_json::json!({"error": error.to_string()}),
+                ),
+            }
+        }
+        "POST /goal-step HTTP/1.1" => {
+            let directive =
+                goal_directive.and_then(|value| value.lock().ok().and_then(|value| value.clone()));
+            write_http_json(
+                &mut stream,
+                200,
+                &serde_json::json!({"directive": directive}),
+            )
+        }
+        "POST /goal-highlight HTTP/1.1" => {
+            let Some(directive) =
+                goal_directive.and_then(|value| value.lock().ok().and_then(|value| value.clone()))
+            else {
+                return write_http_json(
+                    &mut stream,
+                    422,
+                    &serde_json::json!({"error": "No browser guide step is active."}),
+                );
+            };
+            let request: BrowserGoalHighlightRequest = serde_json::from_slice(body)?;
+            if request.session_id != directive.session_id
+                || request.instruction != directive.instruction
+            {
+                return write_http_json(
+                    &mut stream,
+                    422,
+                    &serde_json::json!({"error": "The browser guide step is no longer active."}),
+                );
+            }
+            match guide_browser_request(
+                config,
+                BrowserGuideRequest {
+                    instruction: directive.instruction,
+                    url: request.url,
+                    elements: request.elements,
+                },
+            ) {
+                Ok(response) => write_http_json(&mut stream, 200, &response),
+                Err(error) => write_http_json(
+                    &mut stream,
+                    422,
+                    &serde_json::json!({"error": error.to_string()}),
+                ),
+            }
+        }
+        _ => write_http_json(
             &mut stream,
             422,
-            &serde_json::json!({"error": error.to_string()}),
+            &serde_json::json!({"error": "Unknown browser bridge request."}),
         ),
     }
 }
@@ -233,6 +1355,8 @@ fn guide_browser_request(
     Ok(BrowserGuideResponse {
         selector: selected.selector.clone(),
         instruction_text: result.instruction_text,
+        label: selected.label.clone(),
+        role: selected.role.clone(),
     })
 }
 
@@ -246,6 +1370,7 @@ fn rank_guide_candidates(instruction: &str, elements: Vec<BrowserElement>) -> Ve
         .filter(|term| term.len() > 1)
         .collect::<Vec<_>>();
     let mut seen_selectors = HashSet::new();
+    let mut seen_labels = HashSet::new();
     let mut ranked = Vec::new();
 
     for (index, element) in elements.into_iter().enumerate() {
@@ -259,6 +1384,12 @@ fn rank_guide_candidates(instruction: &str, elements: Vec<BrowserElement>) -> Ve
         let label = bounded_for_model(element.label.trim(), MAX_GUIDE_LABEL_CHARS);
         let role = bounded_for_model(element.role.trim(), MAX_GUIDE_ROLE_CHARS);
         let searchable_label = label.to_ascii_lowercase();
+        // Collapse repeated controls with the same visible label (e.g. a
+        // sidebar button and its nested icon/text all read "Canva AI"), which
+        // otherwise crowd out distinct controls and mislead the best guess.
+        if !searchable_label.is_empty() && !seen_labels.insert(searchable_label.clone()) {
+            continue;
+        }
         let searchable_role = role.to_ascii_lowercase();
         let score = terms.iter().fold(0_u16, |score, term| {
             score
@@ -372,6 +1503,178 @@ fn call_groq_guide(
         .ok_or_else(|| "Groq guide response did not contain JSON output".into())
 }
 
+fn call_openai_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key =
+        env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for Goal Guide")?;
+    let payload = mice_providers::structured_goal_plan_payload(model, goal).to_string();
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--request",
+            "POST",
+            "https://api.openai.com/v1/responses",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+            &format!("Authorization: Bearer {api_key}"),
+            "--data",
+            &payload,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "OpenAI Goal Guide API failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    response["output"]
+        .as_array()
+        .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
+        .and_then(|content| content.iter().find_map(|part| part["text"].as_str()))
+        .map(str::to_owned)
+        .ok_or_else(|| "OpenAI Goal Guide response did not contain a structured plan".into())
+}
+
+fn call_groq_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = env::var("GROQ_API_KEY")
+        .map_err(|_| "GROQ_API_KEY is required when Groq is selected for Goal Guide")?;
+    let payload = mice_providers::groq_goal_plan_payload(model, goal).to_string();
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--request",
+            "POST",
+            "https://api.groq.com/openai/v1/chat/completions",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+            &format!("Authorization: Bearer {api_key}"),
+            "--data",
+            &payload,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Groq Goal Guide API failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    response["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice["message"]["content"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "Groq Goal Guide response did not contain JSON output".into())
+}
+
+fn call_openai_agent_turn(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    image_data_url: Option<&str>,
+    persona: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key =
+        env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for autopilot")?;
+    let payload = mice_providers::agent_loop_payload_with_image_and_persona(
+        model,
+        goal,
+        observation,
+        history,
+        image_data_url,
+        persona,
+    )
+    .to_string();
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--request",
+            "POST",
+            "https://api.openai.com/v1/responses",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+            &format!("Authorization: Bearer {api_key}"),
+            "--data",
+            &payload,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "OpenAI autopilot API failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    response["output"]
+        .as_array()
+        .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
+        .and_then(|content| content.iter().find_map(|part| part["text"].as_str()))
+        .map(str::to_owned)
+        .ok_or_else(|| "OpenAI autopilot response did not contain structured output.".into())
+}
+
+fn call_groq_agent_turn(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    persona: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = env::var("GROQ_API_KEY")
+        .map_err(|_| "GROQ_API_KEY is required when Groq is selected for autopilot")?;
+    let payload = mice_providers::groq_agent_loop_payload_with_persona(
+        model,
+        goal,
+        observation,
+        history,
+        persona,
+    )
+    .to_string();
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--request",
+            "POST",
+            "https://api.groq.com/openai/v1/chat/completions",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+            &format!("Authorization: Bearer {api_key}"),
+            "--data",
+            &payload,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Groq autopilot API failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    response["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice["message"]["content"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "Groq autopilot response did not contain JSON output.".into())
+}
+
 fn actions() -> Result<(), Box<dyn std::error::Error>> {
     println!("Available action presets:");
     println!("  explain, summarize, rewrite, translate, extract-json, code, image, guide, qa");
@@ -390,7 +1693,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     println!("  cloud model: {}", config.cloud_model);
     println!("  local model: {}", config.local_model);
     println!("  privacy mode: {:?}", config.privacy_mode);
-    match start_agent(&config.gesture.trigger) {
+    match start_agent(&config.gesture) {
         Ok(mut agent) => {
             println!("  agent: connected (capability probe)");
             println!("  platform: {}", agent.platform);
@@ -503,8 +1806,8 @@ fn settings_event_loop(
             continue;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.checked_sub(1).unwrap_or(4),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % 5,
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.checked_sub(1).unwrap_or(9),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % 10,
             KeyCode::Left | KeyCode::Char('h') => adjust_setting(config, selected, false),
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                 adjust_setting(config, selected, true)
@@ -534,6 +1837,24 @@ fn draw_settings(frame: &mut ratatui::Frame, config: &mice_core::Config, selecte
         format!("Cloud model        {}", config.cloud_model),
         format!("Local model        {}", config.local_model),
         format!("Gesture trigger    {}", config.gesture.trigger),
+        format!(
+            "Selection summary  {}",
+            config.gesture.summarize_selection_trigger
+        ),
+        format!(
+            "Selection image    {}",
+            config.gesture.infographic_selection_trigger
+        ),
+        format!("Goal Guide        {}", config.gesture.goal_trigger),
+        format!("Autopilot persona  {}", config.autopilot.persona),
+        format!(
+            "Always confirm actions {}",
+            if config.autopilot.careful_mode {
+                "on"
+            } else {
+                "off"
+            }
+        ),
     ];
     let lines = rows.into_iter().enumerate().map(|(index, row)| {
         let marker = if index == selected { "› " } else { "  " };
@@ -605,6 +1926,27 @@ fn adjust_setting(config: &mut mice_core::Config, selected: usize, forward: bool
             &["ctrl+shift+space", "ctrl+alt+space", "cmd+shift+space"],
             forward,
         ),
+        5 => cycle_value(
+            &mut config.gesture.summarize_selection_trigger,
+            &["ctrl-double-tap", "ctrl+alt+s"],
+            forward,
+        ),
+        6 => cycle_value(
+            &mut config.gesture.infographic_selection_trigger,
+            &["ctrl+alt+i", "ctrl+alt+m"],
+            forward,
+        ),
+        7 => cycle_value(
+            &mut config.gesture.goal_trigger,
+            &["ctrl+alt+space"],
+            forward,
+        ),
+        8 => cycle_value(
+            &mut config.autopilot.persona,
+            &["patient", "concise", "playful"],
+            forward,
+        ),
+        9 => config.autopilot.careful_mode = !config.autopilot.careful_mode,
         _ => {}
     }
 }
@@ -640,18 +1982,142 @@ fn cost_policy_name(policy: mice_providers::CostPolicy) -> &'static str {
 
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
-    let mut agent = start_agent(&config.gesture.trigger)?;
+    let browser_goal_directive: NativeBridge = Arc::new(Mutex::new(NativeBridgeState::default()));
+    start_native_bridge(config.clone(), Arc::clone(&browser_goal_directive))?;
+    let watchdog_bridge = Arc::clone(&browser_goal_directive);
+    std::thread::spawn(move || {
+        loop {
+            recover_autopilot_timeouts(&watchdog_bridge);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let mut agent = start_agent(&config.gesture)?;
     println!(
         "MICE is running with {} agent (overlay={}). Press Ctrl-C to stop.",
         agent.platform, agent.capabilities.overlay
     );
     println!("=== MICE Keyboard Gesture Loop ===");
     println!(
-        "Press Control + Shift + Space to capture a region, or hold Control while hovering to explain a control."
+        "Capture: Ctrl+Shift+Space. Hover: hold Control. Select text, then Ctrl double-tap to summarize or Ctrl+Option+I for an infographic."
     );
 
+    let mut goal_sessions = HashMap::<String, GoalSession>::new();
+    let mut goal_plans = HashMap::<String, GoalPlanResult>::new();
+    let mut active_guides = HashMap::<String, ActiveGuide>::new();
+    let mut selection_cache: Option<SelectionCache> = None;
     while let Ok(msg) = read_frame::<mice_ipc::RpcNotification>(&mut agent.reader) {
-        if msg.method == "selection.captured" {
+        if msg.method == "goal.request" {
+            let Some(session_id) = msg.params["sessionId"].as_str() else {
+                eprintln!("MICE received a goal request without a session ID");
+                continue;
+            };
+            goal_sessions.insert(session_id.into(), GoalSession::new());
+            send_command(
+                &mut agent.stdin,
+                AgentCommand::OverlayPromptInput {
+                    session_id: session_id.into(),
+                    title: "What is your goal today?".into(),
+                    placeholder: "For example: organize my tax documents".into(),
+                    context: Some(
+                        "MICE will make an advisory plan. You stay in control of every click, form, login, and payment."
+                            .into(),
+                    ),
+                },
+            )?;
+        } else if msg.method == "prompt.submitted" {
+            let submission: PromptSubmitted = match serde_json::from_value(msg.params) {
+                Ok(submission) => submission,
+                Err(error) => {
+                    eprintln!("MICE received invalid prompt text: {error}");
+                    continue;
+                }
+            };
+            let Some(session) = goal_sessions.get_mut(&submission.session_id) else {
+                eprintln!("MICE received a prompt submission for an unknown session");
+                continue;
+            };
+            if let Err(error) = handle_goal_submission(
+                &mut agent.stdin,
+                &config,
+                session,
+                &mut goal_plans,
+                &mut active_guides,
+                &browser_goal_directive,
+                submission,
+            ) {
+                eprintln!("MICE goal planning failed: {error}");
+            }
+        } else if msg.method == "prompt.cancelled" {
+            if let Some(session_id) = msg.params["sessionId"].as_str() {
+                goal_sessions.remove(session_id);
+                goal_plans.remove(session_id);
+                active_guides.remove(session_id);
+                clear_browser_goal_directive(&browser_goal_directive);
+            }
+            let _ = send_command(
+                &mut agent.stdin,
+                AgentCommand::OverlayFinishResult {
+                    text: Some("Goal planning cancelled.".into()),
+                },
+            );
+        } else if msg.method == "guide.control" {
+            let Some(session_id) = msg.params["sessionId"].as_str() else {
+                continue;
+            };
+            let Some(action) = msg.params["action"].as_str() else {
+                continue;
+            };
+            let value = msg.params["value"].as_str();
+            if let Err(error) = handle_guide_control(
+                &mut agent.stdin,
+                &mut active_guides,
+                &browser_goal_directive,
+                session_id,
+                action,
+                value,
+            ) {
+                eprintln!("MICE guide control failed: {error}");
+            }
+        } else if msg.method == "selection.text" {
+            let selection: SelectionText = match serde_json::from_value(msg.params) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    eprintln!("MICE received invalid selected text: {error}");
+                    continue;
+                }
+            };
+            let session_id = selection.session_id.clone();
+            let text = selection.text.clone();
+            match handle_selection_action(&mut agent.stdin, &config, selection) {
+                Ok(Some(response)) => {
+                    selection_cache = Some(SelectionCache {
+                        session_id,
+                        text,
+                        response,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("MICE selection action failed: {error}"),
+            }
+        } else if msg.method == "overlay.action" {
+            let session_id = msg.params["sessionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let action_id = msg.params["actionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if let Err(error) = handle_overlay_action(
+                &mut agent.stdin,
+                &config,
+                &mut selection_cache,
+                &session_id,
+                &action_id,
+            ) {
+                eprintln!("MICE overlay action failed: {error}");
+            }
+        } else if msg.method == "selection.captured" {
             let params = msg.params;
             let text = params["text"].as_str().map(|s| s.to_string());
             let has_pixels = params["pixels"].as_str().is_some();
@@ -825,6 +2291,725 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Remembers the most recent selection result so overlay buttons (Go Deeper,
+/// Copy) can act on it without recapturing the selection.
+struct SelectionCache {
+    session_id: String,
+    text: String,
+    response: String,
+}
+
+/// A single word or very short phrase is treated as "define this" rather than a
+/// summary, so selecting one word and using the summarize gesture gives a
+/// dictionary-style answer.
+fn is_short_phrase(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('\n')
+        && trimmed.chars().count() <= 40
+        && trimmed.split_whitespace().count() <= 3
+}
+
+const GO_DEEPER_INSTRUCTION: &str = "Explain the selected content in greater depth: define the key terms, give background and context, why it matters, and any important nuance or implications. Be clear and thorough.";
+
+/// The action buttons shown on a finished text result.
+fn selection_result_actions() -> Vec<mice_ipc::OverlayAction> {
+    vec![
+        mice_ipc::OverlayAction {
+            id: "go_deeper".into(),
+            label: "Go Deeper".into(),
+        },
+        mice_ipc::OverlayAction {
+            id: "copy".into(),
+            label: "Copy".into(),
+        },
+    ]
+}
+
+/// Stream a text action to the overlay through the appropriate provider lane and
+/// return the full response. Shared by the summarize and go-deeper paths.
+fn stream_selected(
+    writer: &mut ChildStdin,
+    selected: &mice_providers::ModelDescriptor,
+    instruction: &str,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut response = String::new();
+    let result = if selected.locality == mice_providers::Locality::Local {
+        stream_ollama(selected.id, instruction, Some(text), |chunk| {
+            response.push_str(chunk);
+            send_command(
+                writer,
+                AgentCommand::OverlayAppendResult {
+                    chunk: chunk.into(),
+                },
+            )
+        })
+    } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
+        stream_groq(selected.id, instruction, Some(text), |chunk| {
+            response.push_str(chunk);
+            send_command(
+                writer,
+                AgentCommand::OverlayAppendResult {
+                    chunk: chunk.into(),
+                },
+            )
+        })
+    } else {
+        stream_openai(selected.id, instruction, Some(text), |chunk| {
+            response.push_str(chunk);
+            send_command(
+                writer,
+                AgentCommand::OverlayAppendResult {
+                    chunk: chunk.into(),
+                },
+            )
+        })
+    };
+    result?;
+    Ok(response)
+}
+
+/// Summarize an oversized selection entirely through the configured local
+/// model. Intermediate summaries stay off the overlay; the person sees only
+/// progress and the final map-reduce result.
+fn stream_chunked_selection_summary(
+    writer: &mut ChildStdin,
+    model: &mice_providers::ModelDescriptor,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source_is_code = looks_like_code(text);
+    let chunks = structural_summary_chunks(text, LOCAL_SUMMARY_CHUNK_TOKENS);
+    if chunks.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut summaries = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        send_command(
+            writer,
+            AgentCommand::OverlayUpdate {
+                text: format!("Summarizing part {} of {}…", index + 1, chunks.len()),
+            },
+        )?;
+        let mut summary = String::new();
+        stream_ollama(
+            model.id,
+            chunk_summary_instruction(source_is_code),
+            Some(chunk),
+            |output| {
+                summary.push_str(output);
+                Ok(())
+            },
+        )?;
+        if summary.trim().is_empty() {
+            return Err("The local model returned an empty summary chunk.".into());
+        }
+        summaries.push(summary);
+    }
+
+    let reduce_budget = model
+        .input_budget_tokens
+        .unwrap_or(LOCAL_SUMMARY_REDUCE_TOKENS)
+        .min(LOCAL_SUMMARY_REDUCE_TOKENS);
+    loop {
+        let batches = summary_reduce_batches(&summaries, reduce_budget);
+        if batches.len() == 1 {
+            send_command(
+                writer,
+                AgentCommand::OverlayUpdate {
+                    text: "Preparing your complete summary…".into(),
+                },
+            )?;
+            let mut response = String::new();
+            stream_ollama(
+                model.id,
+                reduce_summary_instruction(source_is_code),
+                Some(&batches[0].join("\n\n")),
+                |output| {
+                    response.push_str(output);
+                    send_command(
+                        writer,
+                        AgentCommand::OverlayAppendResult {
+                            chunk: output.into(),
+                        },
+                    )
+                },
+            )?;
+            return Ok(response);
+        }
+
+        let total_batches = batches.len();
+        let mut reduced = Vec::with_capacity(total_batches);
+        for (index, batch) in batches.iter().enumerate() {
+            send_command(
+                writer,
+                AgentCommand::OverlayUpdate {
+                    text: format!("Combining summaries {} of {}…", index + 1, total_batches),
+                },
+            )?;
+            let mut summary = String::new();
+            stream_ollama(
+                model.id,
+                reduce_summary_instruction(source_is_code),
+                Some(&batch.join("\n\n")),
+                |output| {
+                    summary.push_str(output);
+                    Ok(())
+                },
+            )?;
+            if summary.trim().is_empty() {
+                return Err("The local model returned an empty reduction.".into());
+            }
+            reduced.push(summary);
+        }
+        summaries = reduced;
+    }
+}
+
+/// Re-run the cached selection with a deeper-explanation prompt, streaming into
+/// the same panel and re-offering the action buttons.
+fn run_go_deeper(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    session_id: &str,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let request = RouteRequest {
+        artifacts: Artifacts {
+            text: Some(text.to_owned()),
+            ..Default::default()
+        },
+        instruction: GO_DEEPER_INSTRUCTION.to_owned(),
+        action: Some(Action::Explain),
+        privacy_mode: config.privacy_mode,
+        cost_policy: config.cost_policy,
+        model_preferences: ModelPreferences {
+            local_model: config.local_model.clone(),
+            cloud_model: config.cloud_model.clone(),
+        },
+    };
+    let selected = route(&request)?.model;
+    send_command(
+        writer,
+        AgentCommand::OverlayShow {
+            text: "Going deeper…".into(),
+        },
+    )?;
+    let response = stream_selected(writer, &selected, &request.instruction, text)?;
+    if !response.is_empty() {
+        send_command(writer, clipboard_command(&response))?;
+    }
+    send_command(writer, AgentCommand::OverlayFinishResult { text: None })?;
+    send_command(
+        writer,
+        AgentCommand::OverlayResult {
+            session_id: session_id.to_owned(),
+            actions: selection_result_actions(),
+        },
+    )?;
+    Ok(response)
+}
+
+/// Handle a button press from the interactive result panel.
+fn handle_overlay_action(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    cache: &mut Option<SelectionCache>,
+    session_id: &str,
+    action_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(text) = cache
+        .as_ref()
+        .filter(|entry| entry.session_id == session_id)
+        .map(|entry| entry.text.clone())
+    else {
+        return Ok(());
+    };
+    match action_id {
+        "copy" => {
+            if let Some(entry) = cache.as_ref() {
+                send_command(writer, clipboard_command(&entry.response))?;
+            }
+            send_command(
+                writer,
+                AgentCommand::OverlayResult {
+                    session_id: session_id.to_owned(),
+                    actions: selection_result_actions(),
+                },
+            )?;
+        }
+        "go_deeper" => {
+            let response = run_go_deeper(writer, config, session_id, &text)?;
+            if let Some(entry) = cache.as_mut() {
+                entry.response = response;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_selection_action(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    selection: SelectionText,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if selection.text.trim().is_empty() {
+        send_command(
+            writer,
+            AgentCommand::OverlayShow {
+                text: "Select some text first, then use the MICE shortcut.".into(),
+            },
+        )?;
+        send_command(writer, AgentCommand::OverlayFinishResult { text: None })?;
+        return Ok(None);
+    }
+
+    let action = match selection.action {
+        // A single word / short phrase is a "define this" request; a longer
+        // passage is a summary. Same gesture, intent inferred from length.
+        SelectionAction::Summarize if is_short_phrase(&selection.text) => Action::Define,
+        SelectionAction::Summarize => Action::Summarize,
+        SelectionAction::Image => Action::Image,
+    };
+    let instruction = if action == Action::Summarize {
+        selection_summary_instruction(&selection.text).into()
+    } else {
+        action_instruction(action, "")
+    };
+    let request = RouteRequest {
+        artifacts: Artifacts {
+            text: Some(selection.text.clone()),
+            ..Default::default()
+        },
+        instruction,
+        action: Some(action),
+        privacy_mode: config.privacy_mode,
+        cost_policy: config.cost_policy,
+        model_preferences: ModelPreferences {
+            local_model: config.local_model.clone(),
+            cloud_model: config.cloud_model.clone(),
+        },
+    };
+    let (selected, route_notice, chunked_model) = if action == Action::Summarize {
+        match route_selection_summary(&request, estimate_tokens(&selection.text))? {
+            SelectionSummaryRoute::SingleShot(route) => (route.model, route.user_notice, None),
+            SelectionSummaryRoute::Chunked { model } => (model.clone(), None, Some(model)),
+        }
+    } else {
+        let route = route(&request)?;
+        (route.model, route.user_notice, None)
+    };
+    let status = match action {
+        Action::Summarize => "Summarizing selection…",
+        Action::Define => "Defining…",
+        Action::Image => "Creating infographic…",
+        _ => unreachable!("selection actions are constrained above"),
+    };
+    let status =
+        route_notice.map_or_else(|| status.into(), |notice| format!("{notice}\n\n{status}"));
+    send_command(writer, AgentCommand::OverlayShow { text: status })?;
+
+    if action == Action::Image {
+        let image_prompt = format!(
+            "{}\n\nSelected content:\n{}",
+            request.instruction,
+            bounded_for_model(&selection.text, 6_000)
+        );
+        return match generate_and_present_image(writer, &image_prompt) {
+            Ok(()) => Ok(None),
+            Err(error) => {
+                let _ = send_command(
+                    writer,
+                    AgentCommand::OverlayFinishResult {
+                        text: Some(format!("Image generation error: {error}")),
+                    },
+                );
+                Err(error)
+            }
+        };
+    }
+
+    let response = if let Some(model) = chunked_model {
+        stream_chunked_selection_summary(writer, &model, &selection.text)
+    } else {
+        stream_selected(writer, &selected, &request.instruction, &selection.text)
+    };
+    match response {
+        Ok(response) => {
+            if !response.is_empty() {
+                send_command(writer, clipboard_command(&response))?;
+            }
+            send_command(writer, AgentCommand::OverlayFinishResult { text: None })?;
+            send_command(
+                writer,
+                AgentCommand::OverlayResult {
+                    session_id: selection.session_id.clone(),
+                    actions: selection_result_actions(),
+                },
+            )?;
+            Ok(Some(response))
+        }
+        Err(error) => {
+            let _ = send_command(
+                writer,
+                AgentCommand::OverlayFinishResult {
+                    text: Some(format!("Selection action error: {error}")),
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+fn handle_goal_submission(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    session: &mut GoalSession,
+    goal_plans: &mut HashMap<String, GoalPlanResult>,
+    active_guides: &mut HashMap<String, ActiveGuide>,
+    browser_goal_directive: &NativeBridge,
+    submission: PromptSubmitted,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let planning_input = match session.state() {
+        GoalState::AwaitingGoal => {
+            session.submit_goal(submission.text.clone())?;
+            submission.text
+        }
+        GoalState::Reviewing { .. } if submission.text.trim().is_empty() => {
+            session.accept()?;
+            let plan = goal_plans
+                .get(&submission.session_id)
+                .ok_or("MICE lost the reviewed plan; please start again.")?;
+            active_guides.insert(
+                submission.session_id.clone(),
+                ActiveGuide {
+                    steps: plan.steps.clone(),
+                    current_step: 0,
+                },
+            );
+            return show_active_guide_step(
+                writer,
+                active_guides,
+                browser_goal_directive,
+                &submission.session_id,
+            );
+        }
+        GoalState::Reviewing { .. } => session.begin_revision(submission.text)?,
+        GoalState::Planning { .. } => return Err("MICE is already generating this plan.".into()),
+        GoalState::Accepted { .. } | GoalState::Cancelled => {
+            return Err("This goal session is already finished.".into());
+        }
+    };
+
+    send_command(
+        writer,
+        AgentCommand::OverlayShow {
+            text: "Planning your goal…".into(),
+        },
+    )?;
+    let plan = generate_goal_plan(config, &planning_input)?;
+    let rendered = render_goal_plan(&plan);
+    session.review(rendered.clone())?;
+    goal_plans.insert(submission.session_id.clone(), plan);
+    send_command(
+        writer,
+        AgentCommand::OverlayShow {
+            text: rendered.clone(),
+        },
+    )?;
+    send_command(
+        writer,
+        AgentCommand::OverlayPromptInput {
+            session_id: submission.session_id,
+            title: "Review your plan".into(),
+            placeholder: "Optional revision; leave blank to accept".into(),
+            context: Some(rendered),
+        },
+    )?;
+    Ok(())
+}
+
+fn generate_goal_plan(
+    config: &mice_core::Config,
+    planning_input: &str,
+) -> Result<GoalPlanResult, Box<dyn std::error::Error>> {
+    let request = RouteRequest {
+        artifacts: Artifacts {
+            text: Some(planning_input.into()),
+            ..Default::default()
+        },
+        instruction: "Create an advisory, structured plan for this goal.".into(),
+        action: Some(Action::GoalPlan),
+        privacy_mode: config.privacy_mode,
+        cost_policy: config.cost_policy,
+        model_preferences: ModelPreferences {
+            local_model: config.local_model.clone(),
+            cloud_model: config.cloud_model.clone(),
+        },
+    };
+    let selected = route(&request)?.model;
+    let raw = if selected.locality == mice_providers::Locality::Local {
+        let mut response = String::new();
+        stream_ollama(
+            selected.id,
+            "Return only JSON with 3-8 advisory steps. Each step needs instruction, app_hint, and sensitive boolean.",
+            Some(planning_input),
+            |chunk| {
+                response.push_str(chunk);
+                Ok(())
+            },
+        )?;
+        response
+    } else if is_groq_model(selected.id) {
+        call_groq_goal_plan(selected.id, planning_input)?
+    } else {
+        call_openai_goal_plan(selected.id, planning_input)?
+    };
+    let plan: GoalPlanResult = serde_json::from_str(&raw)
+        .map_err(|_| "The planning model returned an invalid plan; please try again.")?;
+    validate_goal_plan(&plan)?;
+    Ok(plan)
+}
+
+fn show_active_guide_step(
+    writer: &mut ChildStdin,
+    guides: &HashMap<String, ActiveGuide>,
+    browser_goal_directive: &NativeBridge,
+    session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let guide = guides
+        .get(session_id)
+        .ok_or("No active guide was found for this session.")?;
+    let step = guide
+        .steps
+        .get(guide.current_step)
+        .ok_or("The active guide has no current step.")?;
+    if is_browser_step(step) {
+        set_browser_goal_directive(
+            browser_goal_directive,
+            Some(BrowserGoalDirective {
+                session_id: session_id.into(),
+                instruction: format!("{}\nApp hint: {}", step.instruction, step.app_hint),
+            }),
+        );
+    } else {
+        clear_browser_goal_directive(browser_goal_directive);
+    }
+    send_command(
+        writer,
+        AgentCommand::OverlayGuideStep {
+            session_id: session_id.into(),
+            step_index: guide.current_step,
+            total_steps: guide.steps.len(),
+            instruction: step.instruction.clone(),
+            app_hint: step.app_hint.clone(),
+            sensitive: step.sensitive,
+            browser_capable: is_browser_step(step) && !step.sensitive,
+        },
+    )
+}
+
+fn handle_guide_control(
+    writer: &mut ChildStdin,
+    guides: &mut HashMap<String, ActiveGuide>,
+    browser_goal_directive: &NativeBridge,
+    session_id: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if action == "do-it" || action == "do-it-fill" {
+        let guide = guides
+            .get(session_id)
+            .ok_or("No active guide was found for this session.")?;
+        let step = guide
+            .steps
+            .get(guide.current_step)
+            .ok_or("The active guide has no current step.")?;
+        if step.sensitive || !is_browser_step(step) {
+            return send_command(
+                writer,
+                AgentCommand::OverlayFinishResult {
+                    text: Some("This one's yours — MICE will only highlight this step.".into()),
+                },
+            );
+        }
+        let target = browser_goal_directive
+            .lock()
+            .ok()
+            .and_then(|state| state.targets.get(session_id).cloned());
+        let Some(target) = target else {
+            return send_command(writer, AgentCommand::OverlayFinishResult { text: Some("No verified target is available. Reopen this step to highlight the current page first.".into()) });
+        };
+        let kind = if action == "do-it-fill" {
+            "fill"
+        } else {
+            "click"
+        };
+        if kind == "fill" && value.unwrap_or_default().is_empty() {
+            return send_command(
+                writer,
+                AgentCommand::OverlayFinishResult {
+                    text: Some("Enter text before confirming a type action.".into()),
+                },
+            );
+        }
+        if let Some(reason) = blocked_browser_action(kind, &target, &step.instruction) {
+            return send_command(
+                writer,
+                AgentCommand::OverlayFinishResult {
+                    text: Some(format!(
+                        "This one's yours — MICE highlights it but won't act: {reason}"
+                    )),
+                },
+            );
+        }
+        native_bridge_send(
+            browser_goal_directive,
+            &serde_json::json!({"type":"browser.act", "sessionId":session_id, "action":kind, "selector":target.selector, "value":value}),
+        );
+        println!("[MICE act] confirmed {kind} on '{}'", target.label);
+        return send_command(
+            writer,
+            AgentCommand::OverlayFinishResult {
+                text: Some(format!(
+                    "Action sent: {kind} {}. Check the page, then choose Next when ready.",
+                    target.label
+                )),
+            },
+        );
+    }
+    if action == "quit" {
+        guides.remove(session_id);
+        clear_browser_goal_directive(browser_goal_directive);
+        return send_command(
+            writer,
+            AgentCommand::OverlayFinishResult {
+                text: Some("Goal Guide ended. You can start another goal at any time.".into()),
+            },
+        );
+    }
+    let guide = guides
+        .get_mut(session_id)
+        .ok_or("No active guide was found for this session.")?;
+    match action {
+        "next" if guide.current_step + 1 == guide.steps.len() => {
+            guides.remove(session_id);
+            clear_browser_goal_directive(browser_goal_directive);
+            return send_command(
+                writer,
+                AgentCommand::OverlayFinishResult {
+                    text: Some("Goal Guide complete. Great work!".into()),
+                },
+            );
+        }
+        "next" => guide.current_step += 1,
+        "back" => guide.current_step = guide.current_step.saturating_sub(1),
+        "stay" => {}
+        _ => return Err("Unknown guide control.".into()),
+    }
+    show_active_guide_step(writer, guides, browser_goal_directive, session_id)
+}
+
+fn is_browser_step(step: &GoalPlanStep) -> bool {
+    let hint = step.app_hint.to_ascii_lowercase();
+    [
+        "browser", "chrome", "safari", "firefox", "website", "web page",
+    ]
+    .iter()
+    .any(|term| hint.contains(term))
+}
+
+fn blocked_browser_action(
+    kind: &str,
+    target: &BrowserTarget,
+    instruction: &str,
+) -> Option<&'static str> {
+    let context = format!("{} {} {}", target.label, target.role, instruction).to_ascii_lowercase();
+    let fill_terms = [
+        "password",
+        "passcode",
+        "one-time",
+        "otp",
+        "verification code",
+        "cvv",
+        "cvc",
+        "card number",
+        "credit card",
+        "debit card",
+        "routing number",
+        "account number",
+    ];
+    let click_terms = [
+        "pay",
+        "purchase",
+        "place order",
+        "confirm payment",
+        "file return",
+        "submit return",
+        "transfer",
+        "sign in",
+        "log in",
+        "login",
+    ];
+    if kind == "fill" && fill_terms.iter().any(|term| context.contains(term)) {
+        Some("it may contain credentials, a one-time code, or payment data")
+    } else if kind == "click" && click_terms.iter().any(|term| context.contains(term)) {
+        Some("it appears to submit, authenticate, pay, file, or transfer")
+    } else {
+        None
+    }
+}
+
+fn set_browser_goal_directive(shared: &NativeBridge, directive: Option<BrowserGoalDirective>) {
+    if let Ok(mut state) = shared.lock() {
+        state.directive = directive.clone();
+    }
+    native_bridge_send(
+        shared,
+        &serde_json::json!({"type":"goal.step", "directive": directive}),
+    );
+}
+
+fn clear_browser_goal_directive(shared: &NativeBridge) {
+    set_browser_goal_directive(shared, None);
+}
+
+fn validate_goal_plan(plan: &GoalPlanResult) -> Result<(), Box<dyn std::error::Error>> {
+    if !(3..=8).contains(&plan.steps.len()) {
+        return Err("The plan must contain between 3 and 8 steps.".into());
+    }
+    if plan.steps.iter().any(|step| {
+        step.instruction.trim().is_empty()
+            || step.app_hint.trim().is_empty()
+            || step.instruction.chars().count() > 360
+            || step.app_hint.chars().count() > 120
+    }) {
+        return Err("The plan contained an invalid step; please try again.".into());
+    }
+    Ok(())
+}
+
+fn render_goal_plan(plan: &GoalPlanResult) -> String {
+    let mut rendered = String::from("Your plan (you do each action):\n");
+    for (index, step) in plan.steps.iter().enumerate() {
+        let sensitive = if step.sensitive {
+            " [Do this yourself—personal data/login/payment]"
+        } else {
+            ""
+        };
+        rendered.push_str(&format!(
+            "\n{}. {} ({}){}",
+            index + 1,
+            step.instruction.trim(),
+            step.app_hint.trim(),
+            sensitive
+        ));
+    }
+    rendered
+}
+
 fn explain_hover(
     writer: &mut ChildStdin,
     config: &mice_core::Config,
@@ -930,7 +3115,16 @@ struct AgentSession {
     capabilities: Capabilities,
 }
 
-fn start_agent(gesture_trigger: &str) -> Result<AgentSession, Box<dyn std::error::Error>> {
+fn start_agent(
+    gesture: &mice_core::GestureConfig,
+) -> Result<AgentSession, Box<dyn std::error::Error>> {
+    start_agent_with_mode(gesture, false)
+}
+
+fn start_agent_with_mode(
+    gesture: &mice_core::GestureConfig,
+    autopilot_active: bool,
+) -> Result<AgentSession, Box<dyn std::error::Error>> {
     let agent = agent_path()?;
     if !agent.exists() {
         return Err(format!(
@@ -940,7 +3134,20 @@ fn start_agent(gesture_trigger: &str) -> Result<AgentSession, Box<dyn std::error
         .into());
     }
     let mut child = Command::new(agent)
-        .env("MICE_GESTURE_TRIGGER", gesture_trigger)
+        .env("MICE_GESTURE_TRIGGER", &gesture.trigger)
+        .env(
+            "MICE_SUMMARIZE_SELECTION_TRIGGER",
+            &gesture.summarize_selection_trigger,
+        )
+        .env(
+            "MICE_INFOGRAPHIC_SELECTION_TRIGGER",
+            &gesture.infographic_selection_trigger,
+        )
+        .env("MICE_GOAL_TRIGGER", &gesture.goal_trigger)
+        .env(
+            "MICE_AUTOPILOT_ACTIVE",
+            if autopilot_active { "1" } else { "0" },
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Agent stdout is reserved for length-prefixed JSON-RPC. AppKit may log
@@ -1051,7 +3258,7 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let selected = route(&request)?.model;
-    let mut agent = start_agent(&config.gesture.trigger)?;
+    let mut agent = start_agent(&config.gesture)?;
     send_command(
         &mut agent.stdin,
         AgentCommand::OverlayShow {
@@ -1223,30 +3430,17 @@ fn stream_ollama(
     text: Option<&str>,
     mut on_chunk: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Supplying a large capture as an argv item fails with macOS E2BIG. Ollama
-    // also accepts prompts on standard input, which has no command-line limit.
-    let request = prompt(instruction, text);
-    let mut child = Command::new("ollama")
-        .args(["run", model])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child.stdin.take().ok_or("Ollama stdin was unavailable")?;
-    stdin.write_all(request.as_bytes())?;
-    drop(stdin);
-    let stdout = child.stdout.take().ok_or("Ollama stdout was unavailable")?;
-    let mut ansi_stripper = AnsiStripper::default();
-    for line in BufReader::new(stdout).lines() {
-        let chunk = ansi_stripper.strip(&(line? + "\n"));
-        if !chunk.is_empty() {
-            on_chunk(&chunk)?;
-        }
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!("Ollama failed: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
+    let num_ctx = mice_providers::model_descriptor(model)
+        .and_then(|descriptor| descriptor.num_ctx)
+        .ok_or_else(|| format!("MICE has no local context-window budget for `{model}`"))?;
+    stream_ollama_chat(
+        "http://127.0.0.1:11434/api/chat",
+        model,
+        instruction,
+        text,
+        num_ctx,
+        |chunk| on_chunk(chunk).map_err(|error| OllamaError::Consumer(error.to_string())),
+    )?;
     Ok(())
 }
 
@@ -1268,59 +3462,6 @@ fn hover_control_type(
             "control"
         }
         _ => "interface control",
-    }
-}
-
-#[derive(Default)]
-struct AnsiStripper {
-    state: AnsiState,
-}
-
-#[derive(Default)]
-enum AnsiState {
-    #[default]
-    Text,
-    Escape,
-    Csi,
-    Osc,
-    OscEscape,
-}
-
-impl AnsiStripper {
-    fn strip(&mut self, input: &str) -> String {
-        let mut output = String::with_capacity(input.len());
-        for character in input.chars() {
-            match self.state {
-                AnsiState::Text => match character {
-                    '\u{1b}' => self.state = AnsiState::Escape,
-                    '\r' => {}
-                    _ => output.push(character),
-                },
-                AnsiState::Escape => match character {
-                    '[' => self.state = AnsiState::Csi,
-                    ']' => self.state = AnsiState::Osc,
-                    _ => self.state = AnsiState::Text,
-                },
-                AnsiState::Csi => {
-                    if ('@'..='~').contains(&character) {
-                        self.state = AnsiState::Text;
-                    }
-                }
-                AnsiState::Osc => match character {
-                    '\u{7}' => self.state = AnsiState::Text,
-                    '\u{1b}' => self.state = AnsiState::OscEscape,
-                    _ => {}
-                },
-                AnsiState::OscEscape => {
-                    self.state = if character == '\\' {
-                        AnsiState::Text
-                    } else {
-                        AnsiState::Osc
-                    };
-                }
-            }
-        }
-        output
     }
 }
 
@@ -1552,20 +3693,14 @@ mod hover_tests {
     use super::*;
 
     #[test]
-    fn ansi_escape_sequences_are_not_forwarded_to_the_overlay() {
-        let mut stripper = AnsiStripper::default();
-        assert_eq!(
-            stripper.strip("hello\u{1b}[3D\u{1b}[K world\r\n"),
-            "hello world\n"
-        );
-    }
-
-    #[test]
-    fn ansi_sequences_split_across_stream_chunks_are_not_leaked() {
-        let mut stripper = AnsiStripper::default();
-        assert_eq!(stripper.strip("hello\u{1b}"), "hello");
-        assert_eq!(stripper.strip("[6D\u{1b}"), "");
-        assert_eq!(stripper.strip("[K world"), " world");
+    fn short_selections_are_treated_as_definitions() {
+        assert!(is_short_phrase("serendipity"));
+        assert!(is_short_phrase("machine learning"));
+        assert!(!is_short_phrase(
+            "This is a longer sentence that should be summarized instead of defined."
+        ));
+        assert!(!is_short_phrase("line one\nline two"));
+        assert!(!is_short_phrase("   "));
     }
 
     #[test]
@@ -1608,9 +3743,11 @@ mod hover_tests {
     fn guide_candidates_are_ranked_and_bounded_before_model_invocation() {
         let mut elements = (0..100)
             .map(|index| BrowserElement {
+                // Unique labels so bounding (not label-dedup) is what limits the
+                // list; the long suffix also exercises label truncation.
                 selector: format!("#control-{index}"),
                 role: "button".into(),
-                label: "x".repeat(300),
+                label: format!("control {index} {}", "x".repeat(300)),
                 candidate_id: None,
             })
             .collect::<Vec<_>>();
@@ -1626,5 +3763,61 @@ mod hover_tests {
                 .iter()
                 .all(|candidate| candidate.label.chars().count() <= MAX_GUIDE_LABEL_CHARS + 1)
         );
+    }
+
+    #[test]
+    fn guide_candidates_collapse_repeated_labels() {
+        let elements = vec![
+            BrowserElement {
+                selector: "#a".into(),
+                role: "button".into(),
+                label: "Canva AI".into(),
+                candidate_id: None,
+            },
+            BrowserElement {
+                selector: "#b".into(),
+                role: "link".into(),
+                label: "Canva AI".into(),
+                candidate_id: None,
+            },
+            BrowserElement {
+                selector: "#c".into(),
+                role: "button".into(),
+                label: "Custom size".into(),
+                candidate_id: None,
+            },
+        ];
+        let candidates = rank_guide_candidates("make a portrait", elements);
+        let labels = candidates
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels.iter().filter(|label| **label == "Canva AI").count(),
+            1
+        );
+        assert!(labels.contains(&"Custom size"));
+    }
+
+    #[test]
+    fn safety_blocklist_refuses_sensitive_browser_actions() {
+        let password = BrowserTarget {
+            selector: "#password".into(),
+            label: "Password".into(),
+            role: "textbox".into(),
+        };
+        let payment = BrowserTarget {
+            selector: "#pay".into(),
+            label: "Confirm payment".into(),
+            role: "button".into(),
+        };
+        let normal = BrowserTarget {
+            selector: "#continue".into(),
+            label: "Continue".into(),
+            role: "button".into(),
+        };
+        assert!(blocked_browser_action("fill", &password, "Enter password").is_some());
+        assert!(blocked_browser_action("click", &payment, "Continue checkout").is_some());
+        assert!(blocked_browser_action("click", &normal, "Continue to profile").is_none());
     }
 }
