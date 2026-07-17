@@ -356,6 +356,25 @@ pub enum OllamaError {
     Consumer(String),
 }
 
+fn ollama_request_error(error: ureq::Error) -> OllamaError {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_owned))
+                .unwrap_or(body);
+            let detail = detail.trim();
+            if detail.is_empty() {
+                OllamaError::Service(format!("Ollama returned HTTP {status}"))
+            } else {
+                OllamaError::Service(format!("Ollama returned HTTP {status}: {detail}"))
+            }
+        }
+        error => OllamaError::Request(Box::new(error)),
+    }
+}
+
 /// Build the Ollama request in the provider layer so the local transport is
 /// testable without a running model server.
 pub fn ollama_chat_payload(
@@ -402,7 +421,7 @@ pub fn stream_ollama_chat(
 ) -> Result<(), OllamaError> {
     let response = ureq::post(endpoint)
         .send_json(ollama_chat_payload(model, instruction, text, num_ctx))
-        .map_err(|error| OllamaError::Request(Box::new(error)))?;
+        .map_err(ollama_request_error)?;
     for line in BufReader::new(response.into_reader()).lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -789,6 +808,61 @@ mod tests {
             "Summarize\n\nContent:\ninput"
         );
         assert_eq!(output, "hello world");
+    }
+
+    #[test]
+    fn ollama_http_errors_include_the_server_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1_024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4);
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            let body = r#"{"error":"model 'gemma3:4b' not found"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let error = stream_ollama_chat(
+            &endpoint,
+            "gemma3:4b",
+            "Summarize",
+            Some("input"),
+            16_384,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Ollama failed: Ollama returned HTTP 404: model 'gemma3:4b' not found"
+        );
     }
 
     #[test]

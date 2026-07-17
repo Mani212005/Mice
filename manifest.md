@@ -59,7 +59,9 @@ models, or user configuration belong in this repository.
   endpoint with each local model's explicit context budget. Oversized local-only
   selections are structurally chunked and map-reduced with visible progress;
   oversized `cloud_allowed` selections visibly use the configured cloud model.
-  Small selections remain single-shot.
+  Small selections remain single-shot. Ollama HTTP failures include the server
+  error body, so a missing local model is reported clearly instead of as a bare
+  404.
 - **M7 follow-on fixes:** Go Deeper applies the same bounded routing and local
   map-reduce path as a large selection, so it does not overflow a local model
   after an otherwise successful file-scale summary. `mice stop` sends an
