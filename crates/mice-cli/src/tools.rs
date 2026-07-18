@@ -11,6 +11,7 @@ use std::{
 
 use mice_core::estimate_tokens;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_RETURN_TOKENS: usize = 300;
 
@@ -27,12 +28,21 @@ pub enum DistillPolicy {
     Always,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Result changes only with the current repository fingerprint.
+    Repository,
+    /// Live/capture/remote data must not enter the persistent artifact cache.
+    Never,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub kind: ToolKind,
     pub distill: DistillPolicy,
+    pub cache: CachePolicy,
     pub program: &'static str,
     pub availability_program: &'static str,
 }
@@ -48,7 +58,6 @@ pub struct ToolContext {
     pub working_dir: PathBuf,
     pub session_name: String,
     pub output_budget_tokens: usize,
-    pub careful_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +129,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read the current repository status.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Repository,
             program: "git",
             availability_program: "git",
         },
@@ -128,6 +138,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read recent commits in the current repository.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Repository,
             program: "git",
             availability_program: "git",
         },
@@ -136,6 +147,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read the current uncommitted diff.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Repository,
             program: "git",
             availability_program: "git",
         },
@@ -144,6 +156,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read current branches.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Repository,
             program: "git",
             availability_program: "git",
         },
@@ -152,6 +165,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Search repository text with a fixed pattern.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Repository,
             program: "rg",
             availability_program: "rg",
         },
@@ -160,6 +174,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "List pull requests through gh-axi or gh.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Never,
             program: "gh-axi",
             availability_program: "npx",
         },
@@ -168,6 +183,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read a pull request through gh-axi or gh.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Never,
             program: "gh-axi",
             availability_program: "npx",
         },
@@ -176,6 +192,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read pull-request CI checks through gh-axi or gh.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Never,
             program: "gh-axi",
             availability_program: "npx",
         },
@@ -184,6 +201,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "List GitHub issues through gh-axi or gh.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Never,
             program: "gh-axi",
             availability_program: "npx",
         },
@@ -192,6 +210,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Open a URL in the isolated Chrome AXI session.",
             kind: ToolKind::Mutating,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -200,6 +219,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Capture the current Chrome AXI accessibility snapshot.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -208,6 +228,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Click a verified Chrome AXI uid.",
             kind: ToolKind::Mutating,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -216,6 +237,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Fill a verified Chrome AXI uid.",
             kind: ToolKind::Mutating,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -224,6 +246,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Press a key in the Chrome AXI session.",
             kind: ToolKind::Mutating,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -232,6 +255,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Scroll the Chrome AXI session.",
             kind: ToolKind::Mutating,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -240,6 +264,7 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "Read locally available editor quota windows.",
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::Never,
+            cache: CachePolicy::Never,
             program: "npx",
             availability_program: "npx",
         },
@@ -249,6 +274,7 @@ pub fn specs() -> &'static [ToolSpec] {
 pub fn tool_schema() -> Vec<Value> {
     specs()
         .iter()
+        .filter(|spec| spec.kind == ToolKind::ReadOnly)
         .map(|spec| {
             json!({
                 "name": spec.name,
@@ -283,17 +309,11 @@ pub fn run(
         .iter()
         .find(|spec| spec.name == call.name)
         .ok_or_else(|| ToolError(format!("Unknown tool `{}`", call.name)))?;
-    if spec.kind == ToolKind::Mutating && context.careful_mode {
+    if spec.kind == ToolKind::Mutating {
         return Err(ToolError(format!(
-            "`{}` needs confirmation because careful mode is enabled.",
+            "`{}` is unavailable through raw registry calls. MICE requires a fresh, trusted snapshot and explicit per-action confirmation before browser or other mutations.",
             call.name
         )));
-    }
-    if is_sensitive_browser_call(call) {
-        return Err(ToolError(
-            "MICE will not fill credentials, one-time codes, or payment data through a browser tool. Please do this step yourself."
-                .into(),
-        ));
     }
     let (mut program, mut args) = command_for(spec, &call.args)?;
     if program == "gh-axi" && !runner.available("gh-axi") {
@@ -319,30 +339,6 @@ pub fn run(
         needs_distillation: spec.distill == DistillPolicy::Always
             || (spec.distill == DistillPolicy::IfLarge && truncated),
     })
-}
-
-fn is_sensitive_browser_call(call: &ToolCall) -> bool {
-    if call.name != "browser.fill" {
-        return false;
-    }
-    ["uid", "text"]
-        .into_iter()
-        .filter_map(|key| call.args.get(key).and_then(Value::as_str))
-        .any(|value| {
-            let value = value.to_ascii_lowercase();
-            [
-                "password",
-                "passcode",
-                "otp",
-                "one-time",
-                "credit card",
-                "card number",
-                "cvv",
-                "ssn",
-            ]
-            .iter()
-            .any(|needle| value.contains(needle))
-        })
 }
 
 fn command_for(spec: &ToolSpec, args: &Value) -> Result<(String, Vec<String>), ToolError> {
@@ -461,16 +457,37 @@ pub fn bound_output(raw: &str, budget_tokens: usize) -> (String, bool) {
 pub fn stable_tool_prompt() -> String {
     let mut descriptions = specs()
         .iter()
+        .filter(|spec| spec.kind == ToolKind::ReadOnly)
         .map(|spec| format!("{}: {}", spec.name, spec.description))
         .collect::<Vec<_>>();
     descriptions.sort();
     descriptions.join("\n")
 }
 
+pub fn cache_policy(name: &str) -> Option<CachePolicy> {
+    specs()
+        .iter()
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.cache)
+}
+
+pub fn is_read_only(name: &str) -> bool {
+    specs()
+        .iter()
+        .any(|spec| spec.name == name && spec.kind == ToolKind::ReadOnly)
+}
+
 pub fn call_fingerprint(call: &ToolCall, state: &str) -> String {
-    // A stable, non-secret cache key; JSON object keys are normalized first.
+    // Fixed-size, non-secret cryptographic cache key; JSON object keys are
+    // normalized first so equivalent argument objects share an entry.
     let canonical = canonical_json(&call.args);
-    format!("{}:{}:{state}", call.name, canonical)
+    let mut digest = Sha256::new();
+    digest.update(call.name.as_bytes());
+    digest.update(b"\0");
+    digest.update(canonical.as_bytes());
+    digest.update(b"\0");
+    digest.update(state.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -554,7 +571,6 @@ mod tests {
                 working_dir: PathBuf::from("."),
                 session_name: "s".into(),
                 output_budget_tokens: 300,
-                careful_mode: true,
             },
         )
         .unwrap();
@@ -562,23 +578,51 @@ mod tests {
     }
 
     #[test]
-    fn browser_sensitive_fills_are_never_sent_to_a_runner() {
+    fn opaque_browser_secret_fills_are_never_sent_to_a_runner() {
         let result = run(
             &MockRunner {
                 output: "should not run".into(),
             },
             &ToolCall {
                 name: "browser.fill".into(),
-                args: json!({"uid":"password-field", "text":"secret"}),
+                args: json!({"uid":"g7:input2", "text":"Tr0ub4dor&3"}),
             },
             &ToolContext {
                 working_dir: PathBuf::from("."),
                 session_name: "s".into(),
                 output_budget_tokens: 300,
-                careful_mode: false,
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn raw_browser_click_and_enter_are_never_sent_to_a_runner() {
+        for call in [
+            ToolCall {
+                name: "browser.click".into(),
+                args: json!({"uid":"g1:button9"}),
+            },
+            ToolCall {
+                name: "browser.press".into(),
+                args: json!({"key":"Enter"}),
+            },
+        ] {
+            assert!(
+                run(
+                    &MockRunner {
+                        output: "should not run".into()
+                    },
+                    &call,
+                    &ToolContext {
+                        working_dir: PathBuf::from("."),
+                        session_name: "s".into(),
+                        output_budget_tokens: 300,
+                    }
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -610,10 +654,29 @@ mod tests {
                 working_dir: PathBuf::from("."),
                 session_name: "s".into(),
                 output_budget_tokens: 300,
-                careful_mode: false,
             },
         )
         .unwrap();
         assert_eq!(output.text, "[]");
+    }
+
+    #[test]
+    fn live_browser_and_quota_results_are_never_persistently_cached() {
+        assert_eq!(cache_policy("browser.snapshot"), Some(CachePolicy::Never));
+        assert_eq!(cache_policy("quota.status"), Some(CachePolicy::Never));
+        assert_eq!(cache_policy("github.pr_list"), Some(CachePolicy::Never));
+        assert_eq!(cache_policy("git.status"), Some(CachePolicy::Repository));
+    }
+
+    #[test]
+    fn mcp_schema_excludes_raw_mutating_tools() {
+        let schema = tool_schema();
+        let names = schema
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"browser.snapshot"));
+        assert!(!names.contains(&"browser.click"));
+        assert!(!names.contains(&"browser.fill"));
     }
 }

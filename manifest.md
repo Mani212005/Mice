@@ -90,6 +90,17 @@ models, or user configuration belong in this repository.
   memory store records bi-temporal events, derived facts/digests, artifacts,
   macro workflows, overlap warnings, and the `mice savings` ledger. Tool
   subprocesses receive a scrubbed environment without provider API keys.
+- **M13 safety/cache repair (2026-07-18):** raw browser mutations are no
+  longer exposed to MCP or the local tool loop; they fail closed until a
+  fresh-snapshot, target-validation, per-action-confirmation executor is
+  available. Browser snapshots, quota, and remote GitHub results are never
+  persisted in the artifact cache; only repository-fingerprinted read-only
+  results can cache, and those artifacts retain only bounded distilled text
+  and token metadata—not raw captures or output. Artifact/macro names use
+  SHA-256 keys with key verification; append-only memory writes now use an
+  inter-process lock, single-buffer JSONL appends, and atomic derived-file
+  publication. Workflow macros accept/replay read-only calls only, and local
+  loop budgets are hard-limited to 1–12 actions.
 - **Phase 2b Send to…:** completed text results offer a native Send to… menu.
   Its first destination pastes MICE's existing rich clipboard result into the
   app that is frontmost when Send to… is chosen (or the original app as a

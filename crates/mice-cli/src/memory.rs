@@ -8,10 +8,12 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEvent {
@@ -28,13 +30,20 @@ pub struct MemoryEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedArtifact {
+    pub key: String,
     pub tool: String,
     pub args: String,
     pub fingerprint: String,
     pub distilled: String,
-    pub raw: String,
+    pub raw_output_tokens_est: usize,
     pub truncated: bool,
     pub created_ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowMacro {
+    key: String,
+    calls: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,8 +85,12 @@ impl SharedMemory {
     }
 
     pub fn append(&self, event: &MemoryEvent) -> Result<(), std::io::Error> {
+        let _lock = self.lock()?;
         self.append_to("shared.jsonl", event)?;
-        self.append_to(&format!("agent-{}.jsonl", safe_name(&event.session)), event)?;
+        self.append_to(
+            &format!("agent-{}.jsonl", digest_name(&event.session)),
+            event,
+        )?;
         self.rebuild_derived()?;
         Ok(())
     }
@@ -87,8 +100,9 @@ impl SharedMemory {
             .create(true)
             .append(true)
             .open(self.root.join("events").join(file))?;
-        serde_json::to_writer(&mut writer, event).map_err(std::io::Error::other)?;
-        writer.write_all(b"\n")
+        let mut line = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        writer.write_all(&line)
     }
 
     pub fn events(&self) -> Result<Vec<MemoryEvent>, std::io::Error> {
@@ -96,47 +110,65 @@ impl SharedMemory {
     }
 
     pub fn put_artifact(&self, key: &str, artifact: &CachedArtifact) -> Result<(), std::io::Error> {
-        fs::write(
-            self.root
+        validate_storage_key(key)?;
+        let _lock = self.lock()?;
+        atomic_write(
+            &self
+                .root
                 .join("artifacts")
-                .join(format!("{}.json", safe_name(key))),
-            serde_json::to_vec_pretty(artifact).map_err(std::io::Error::other)?,
+                .join(format!("{}.json", digest_name(key))),
+            &serde_json::to_vec_pretty(artifact).map_err(std::io::Error::other)?,
         )
     }
 
     pub fn artifact(&self, key: &str) -> Result<Option<CachedArtifact>, std::io::Error> {
+        validate_storage_key(key)?;
         let path = self
             .root
             .join("artifacts")
-            .join(format!("{}.json", safe_name(key)));
+            .join(format!("{}.json", digest_name(key)));
         if !path.exists() {
             return Ok(None);
         }
-        serde_json::from_slice(&fs::read(path)?)
-            .map(Some)
-            .map_err(std::io::Error::other)
+        let artifact: CachedArtifact =
+            serde_json::from_slice(&fs::read(path)?).map_err(std::io::Error::other)?;
+        if artifact.key != key {
+            return Ok(None);
+        }
+        Ok(Some(artifact))
     }
 
     pub fn put_macro(&self, key: &str, calls: &serde_json::Value) -> Result<(), std::io::Error> {
-        fs::write(
-            self.root
+        validate_storage_key(key)?;
+        let _lock = self.lock()?;
+        let stored = WorkflowMacro {
+            key: key.into(),
+            calls: calls.clone(),
+        };
+        atomic_write(
+            &self
+                .root
                 .join("macros")
-                .join(format!("{}.json", safe_name(key))),
-            serde_json::to_vec_pretty(calls).map_err(std::io::Error::other)?,
+                .join(format!("{}.json", digest_name(key))),
+            &serde_json::to_vec_pretty(&stored).map_err(std::io::Error::other)?,
         )
     }
 
     pub fn macro_for(&self, key: &str) -> Result<Option<serde_json::Value>, std::io::Error> {
+        validate_storage_key(key)?;
         let path = self
             .root
             .join("macros")
-            .join(format!("{}.json", safe_name(key)));
+            .join(format!("{}.json", digest_name(key)));
         if !path.exists() {
             return Ok(None);
         }
-        serde_json::from_slice(&fs::read(path)?)
-            .map(Some)
-            .map_err(std::io::Error::other)
+        let stored: WorkflowMacro = match serde_json::from_slice(&fs::read(path)?) {
+            Ok(stored) => stored,
+            // Old, unverified macro format is intentionally not replayed.
+            Err(_) => return Ok(None),
+        };
+        Ok((stored.key == key).then_some(stored.calls))
     }
 
     pub fn query(&self, question: &str) -> Result<String, std::io::Error> {
@@ -270,18 +302,21 @@ impl SharedMemory {
                 decisions.push(format!("- {} — {}", event.session, event.text));
             }
         }
-        fs::write(
-            self.root.join("facts/agents.json"),
-            serde_json::to_vec_pretty(&agents).map_err(std::io::Error::other)?,
+        atomic_write(
+            &self.root.join("facts/agents.json"),
+            &serde_json::to_vec_pretty(&agents).map_err(std::io::Error::other)?,
         )?;
-        fs::write(
-            self.root.join("facts/touched.json"),
-            serde_json::to_vec_pretty(&touched).map_err(std::io::Error::other)?,
+        atomic_write(
+            &self.root.join("facts/touched.json"),
+            &serde_json::to_vec_pretty(&touched).map_err(std::io::Error::other)?,
         )?;
-        fs::write(self.root.join("facts/decisions.md"), decisions.join("\n"))?;
-        fs::write(
-            self.root.join("digests/team.md"),
-            self.team_status_from(&events),
+        atomic_write(
+            &self.root.join("facts/decisions.md"),
+            decisions.join("\n").as_bytes(),
+        )?;
+        atomic_write(
+            &self.root.join("digests/team.md"),
+            self.team_status_from(&events).as_bytes(),
         )
     }
 
@@ -293,6 +328,33 @@ impl SharedMemory {
             .map(|event| format!("- [{}] {}", event.session, event.text))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+struct MemoryLock(PathBuf);
+
+impl Drop for MemoryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl SharedMemory {
+    fn lock(&self) -> Result<MemoryLock, std::io::Error> {
+        let path = self.root.join(".write.lock");
+        for _ in 0..2_000 {
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
+                Ok(_) => return Ok(MemoryLock(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Timed out waiting for MICE shared-memory writer lock.",
+        ))
     }
 }
 
@@ -315,17 +377,26 @@ fn read_jsonl<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<Vec<T>, std::io
         .collect()
 }
 
-fn safe_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn digest_name(value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(value.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn validate_storage_key(key: &str) -> Result<(), std::io::Error> {
+    if key.is_empty() || key.len() > 4_096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "MICE storage key is empty or too large.",
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    let temporary = path.with_extension(format!("{}.tmp", now()));
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, path)
 }
 
 #[cfg(test)]
@@ -363,11 +434,12 @@ mod tests {
             .put_artifact(
                 "git.status:key",
                 &CachedArtifact {
+                    key: "git.status:key".into(),
                     tool: "git.status".into(),
                     args: "{}".into(),
                     fingerprint: "head".into(),
                     distilled: "M main.rs".into(),
-                    raw: "M main.rs".into(),
+                    raw_output_tokens_est: 3,
                     truncated: false,
                     created_ts: now(),
                 },
@@ -377,6 +449,43 @@ mod tests {
             store.artifact("git.status:key").unwrap().unwrap().distilled,
             "M main.rs"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cryptographic_names_prevent_collisions_and_bound_long_keys() {
+        assert_ne!(digest_name("a/b"), digest_name("a?b"));
+        assert_eq!(digest_name(&"dirty-file/".repeat(10_000)).len(), 64);
+    }
+
+    #[test]
+    fn concurrent_writers_leave_valid_complete_events() {
+        let root =
+            std::env::temp_dir().join(format!("mice-lock-test-{}-{}", now(), std::process::id()));
+        let store = SharedMemory::at(root.clone()).unwrap();
+        let workers = (0..8)
+            .map(|index| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .append(&MemoryEvent {
+                            event_ts: now(),
+                            recorded_ts: now(),
+                            session: format!("s{index}"),
+                            agent: "agent".into(),
+                            branch: "main".into(),
+                            kind: "tool".into(),
+                            text: "completed".into(),
+                            files: Vec::new(),
+                        })
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(store.events().unwrap().len(), 8);
         let _ = fs::remove_dir_all(root);
     }
 }

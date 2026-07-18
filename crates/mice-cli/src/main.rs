@@ -1202,25 +1202,8 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
 /// Chrome extension/native-host chain is involved. The same bounded local tool
 /// loop supplies observe → act → verify turns through browser.snapshot/actions.
 fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = config()?;
-    println!(
-        "MICE AXI autopilot runs browser commands through chrome-devtools-axi. It never fills credentials, OTPs, or payment data."
-    );
-    println!("Goal: {goal}");
-    print!("Start AXI autopilot? [y/N] ");
-    std::io::stdout().flush()?;
-    let mut consent = String::new();
-    std::io::stdin().read_line(&mut consent)?;
-    if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        println!("Autopilot was not started.");
-        return Ok(());
-    }
-    let session = McpSession {
-        id: format!("axi-{}", std::process::id()),
-        agent: "autopilot".into(),
-    };
-    println!("{}", delegate_task(&config, &session, goal, 12)?);
-    Ok(())
+    let _ = goal;
+    Err("AXI autopilot is paused: generic browser mutation is disabled until MICE has a trusted current snapshot plus explicit per-action confirmation. Read-only `browser.snapshot` remains available through MICE tools.".into())
 }
 
 /// Ask the running daemon to stop over its owner-only bridge socket. This is
@@ -1853,7 +1836,7 @@ fn current_branch(cwd: &std::path::Path) -> String {
 }
 
 fn run_registered_tool(
-    config: &mice_core::Config,
+    _config: &mice_core::Config,
     session: &str,
     call: ToolCall,
 ) -> Result<ToolOutput, Box<dyn std::error::Error>> {
@@ -1861,10 +1844,7 @@ fn run_registered_tool(
     let state = repo_state_fingerprint(&cwd);
     let key = tools::call_fingerprint(&call, &state);
     let store = shared_memory()?;
-    let cacheable = tools::specs()
-        .iter()
-        .find(|spec| spec.name == call.name)
-        .is_some_and(|spec| spec.kind == tools::ToolKind::ReadOnly);
+    let cacheable = tools::cache_policy(&call.name) == Some(tools::CachePolicy::Repository);
     if cacheable && let Some(cached) = store.artifact(&key)? {
         store.record_ledger(
             session,
@@ -1872,18 +1852,19 @@ fn run_registered_tool(
                 task: call.name.clone(),
                 lane: "deterministic".into(),
                 wall_ms: 0,
-                raw_output_tokens_est: estimate_tokens(&cached.raw),
+                raw_output_tokens_est: cached.raw_output_tokens_est,
                 returned_tokens_est: estimate_tokens(&cached.distilled),
-                frontier_tokens_avoided_est: estimate_tokens(&cached.raw)
+                frontier_tokens_avoided_est: cached
+                    .raw_output_tokens_est
                     .saturating_sub(estimate_tokens(&cached.distilled)),
                 outcome: "cache_hit".into(),
             },
         )?;
         return Ok(ToolOutput {
             text: cached.distilled,
-            raw: cached.raw,
+            raw: String::new(),
             truncated: cached.truncated,
-            full_output_ref: Some(format!("artifact:{key}")),
+            full_output_ref: None,
             needs_distillation: false,
         });
     }
@@ -1895,15 +1876,15 @@ fn run_registered_tool(
             working_dir: cwd.clone(),
             session_name: session.into(),
             output_budget_tokens: tools::DEFAULT_RETURN_TOKENS,
-            careful_mode: config.autopilot.careful_mode,
         },
     )?;
     let artifact = memory::CachedArtifact {
+        key: key.clone(),
         tool: call.name.clone(),
-        args: call.args.to_string(),
+        args: call.args.to_string().chars().take(2_048).collect(),
         fingerprint: state,
         distilled: output.text.clone(),
-        raw: output.raw.clone(),
+        raw_output_tokens_est: estimate_tokens(&output.raw),
         truncated: output.truncated,
         created_ts: memory::now(),
     };
@@ -1945,7 +1926,7 @@ fn run_registered_tool(
         },
     )?;
     Ok(ToolOutput {
-        full_output_ref: cacheable.then(|| format!("artifact:{key}")),
+        full_output_ref: None,
         ..output
     })
 }
@@ -1953,16 +1934,16 @@ fn run_registered_tool(
 fn list_tools() -> Result<(), Box<dyn std::error::Error>> {
     let runner = SystemRunner;
     println!("MICE deterministic tool registry:");
-    for (name, available) in tools::availability(&runner) {
-        println!(
-            "  {:<22} {}",
-            name,
-            if available {
-                "available"
-            } else {
-                "unavailable"
-            }
-        );
+    for spec in tools::specs() {
+        let available = runner.available(spec.availability_program);
+        let state = if spec.kind == tools::ToolKind::Mutating {
+            "blocked pending verified confirmation"
+        } else if available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        println!("  {:<22} {}", spec.name, state);
     }
     println!(
         "GitHub uses gh-axi when present, otherwise gh. Browser tools use chrome-devtools-axi through npx."
@@ -2076,6 +2057,7 @@ fn do_goal() -> Result<(), Box<dyn std::error::Error>> {
     if goal.trim().is_empty() {
         return Err("Usage: mice do <goal>".into());
     }
+    validate_tool_action_budget(max_actions)?;
     if route_execution_lane(config.machine_profile, &config.routing, false, true, None)
         != ExecutionLane::Local
     {
@@ -2111,7 +2093,7 @@ fn do_goal() -> Result<(), Box<dyn std::error::Error>> {
         }
         if decision.done {
             println!("MICE: {}", decision.say_to_user);
-            shared_memory()?.put_macro(&goal, &Value::Array(calls))?;
+            persist_safe_macro(&shared_memory()?, &goal, calls)?;
             return Ok(());
         }
         let call = ToolCall {
@@ -2126,12 +2108,43 @@ fn do_goal() -> Result<(), Box<dyn std::error::Error>> {
     Err("MICE tool loop reached its action budget; ask a narrower follow-up.".into())
 }
 
+const MIN_TOOL_ACTIONS: usize = 1;
+const MAX_TOOL_ACTIONS: usize = 12;
+
+fn validate_tool_action_budget(value: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if !(MIN_TOOL_ACTIONS..=MAX_TOOL_ACTIONS).contains(&value) {
+        return Err(format!(
+            "Tool action budget must be between {MIN_TOOL_ACTIONS} and {MAX_TOOL_ACTIONS}."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn persist_safe_macro(
+    store: &memory::SharedMemory,
+    goal: &str,
+    calls: Vec<Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !calls.is_empty()
+        && calls.iter().all(|call| {
+            call.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(tools::is_read_only)
+        })
+    {
+        store.put_macro(goal, &Value::Array(calls))?;
+    }
+    Ok(())
+}
+
 fn delegate_task(
     config: &mice_core::Config,
     session: &McpSession,
     goal: &str,
     max_actions: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    validate_tool_action_budget(max_actions)?;
     if route_execution_lane(config.machine_profile, &config.routing, false, true, None)
         != ExecutionLane::Local
     {
@@ -2141,6 +2154,11 @@ fn delegate_task(
     if let Some(macro_calls) = store.macro_for(goal)?
         && let Some(calls) = macro_calls.as_array()
         && !calls.is_empty()
+        && calls.iter().all(|call| {
+            call.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(tools::is_read_only)
+        })
     {
         let mut replay = Vec::new();
         for call in calls {
@@ -2204,7 +2222,7 @@ fn delegate_task(
             return Ok(format!("MICE needs your input: {question}"));
         }
         if decision.done {
-            store.put_macro(goal, &Value::Array(calls))?;
+            persist_safe_macro(&store, goal, calls)?;
             return Ok(if decision.say_to_user.is_empty() {
                 "Delegated task completed.".into()
             } else {
@@ -4248,15 +4266,21 @@ fn mcp_call_tool(
         }
         "memory_query" => Ok(shared_memory()?.query(string_argument("question")?)?),
         "team_status" => Ok(shared_memory()?.team_status()?),
-        "delegate_task" => delegate_task(
-            config,
-            session,
-            string_argument("instruction")?,
-            arguments
+        "delegate_task" => {
+            let max_actions = arguments
                 .get("max_actions")
                 .and_then(Value::as_u64)
-                .unwrap_or(6) as usize,
-        ),
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| "max_actions is too large for this machine")?
+                .unwrap_or(6);
+            delegate_task(
+                config,
+                session,
+                string_argument("instruction")?,
+                max_actions,
+            )
+        }
         name if tools::specs().iter().any(|spec| spec.name == name) => {
             Ok(format_tool_output(run_registered_tool(
                 config,
@@ -4273,7 +4297,7 @@ fn mcp_call_tool(
 
 fn format_tool_output(output: ToolOutput) -> String {
     let marker = if output.truncated {
-        "\n[truncated: request full_output_ref for the complete artifact]"
+        "\n[truncated: full raw output is intentionally not persisted]"
     } else {
         ""
     };
@@ -4865,6 +4889,14 @@ mod hover_tests {
             .map(|action| action.id)
             .collect::<Vec<_>>();
         assert_eq!(action_ids, ["go_deeper", "copy", "send_to"]);
+    }
+
+    #[test]
+    fn tool_action_budget_has_strict_bounds() {
+        assert!(validate_tool_action_budget(MIN_TOOL_ACTIONS).is_ok());
+        assert!(validate_tool_action_budget(MAX_TOOL_ACTIONS).is_ok());
+        assert!(validate_tool_action_budget(0).is_err());
+        assert!(validate_tool_action_budget(MAX_TOOL_ACTIONS + 1).is_err());
     }
 
     #[test]
