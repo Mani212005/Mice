@@ -161,7 +161,7 @@ pub fn specs() -> &'static [ToolSpec] {
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
             program: "gh-axi",
-            availability_program: "gh",
+            availability_program: "npx",
         },
         ToolSpec {
             name: "github.pr_view",
@@ -169,7 +169,7 @@ pub fn specs() -> &'static [ToolSpec] {
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
             program: "gh-axi",
-            availability_program: "gh",
+            availability_program: "npx",
         },
         ToolSpec {
             name: "github.pr_checks",
@@ -177,7 +177,7 @@ pub fn specs() -> &'static [ToolSpec] {
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
             program: "gh-axi",
-            availability_program: "gh",
+            availability_program: "npx",
         },
         ToolSpec {
             name: "github.issue_list",
@@ -185,7 +185,7 @@ pub fn specs() -> &'static [ToolSpec] {
             kind: ToolKind::ReadOnly,
             distill: DistillPolicy::IfLarge,
             program: "gh-axi",
-            availability_program: "gh",
+            availability_program: "npx",
         },
         ToolSpec {
             name: "browser.open",
@@ -295,9 +295,14 @@ pub fn run(
                 .into(),
         ));
     }
-    let (mut program, args) = command_for(spec, &call.args)?;
+    let (mut program, mut args) = command_for(spec, &call.args)?;
     if program == "gh-axi" && !runner.available("gh-axi") {
-        program = "gh".into();
+        if runner.available("npx") {
+            args.splice(0..0, ["-y".into(), "gh-axi".into()]);
+            program = "npx".into();
+        } else {
+            program = "gh".into();
+        }
     }
     let raw = runner.run(
         &program,
@@ -574,5 +579,41 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn github_prefers_npx_axi_before_plain_gh() {
+        struct NpxOnly;
+        impl CommandRunner for NpxOnly {
+            fn run(
+                &self,
+                program: &str,
+                args: &[String],
+                _: &Path,
+                _: &[(String, String)],
+            ) -> Result<String, ToolError> {
+                assert_eq!(program, "npx");
+                assert_eq!(&args[..2], ["-y", "gh-axi"]);
+                Ok("[]".into())
+            }
+            fn available(&self, program: &str) -> bool {
+                program == "npx"
+            }
+        }
+        let output = run(
+            &NpxOnly,
+            &ToolCall {
+                name: "github.pr_list".into(),
+                args: json!({}),
+            },
+            &ToolContext {
+                working_dir: PathBuf::from("."),
+                session_name: "s".into(),
+                output_budget_tokens: 300,
+                careful_mode: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(output.text, "[]");
     }
 }
