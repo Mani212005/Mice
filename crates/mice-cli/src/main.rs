@@ -1,3 +1,6 @@
+mod memory;
+mod tools;
+
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -23,11 +26,12 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use mice_core::{
-    AgentAction, AgentDecision, AgentLoop, AgentLoopState, AgentMode, GoalSession, GoalState,
-    LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, action_instruction,
-    chunk_summary_instruction, clipboard_contents, config_path, estimate_tokens, load_config,
-    looks_like_code, reduce_summary_instruction, save_config, selection_summary_instruction,
-    structural_summary_chunks, summary_reduce_batches,
+    AgentAction, AgentDecision, AgentLoop, AgentLoopState, AgentMode, ExecutionLane, GoalSession,
+    GoalState, LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, MachineProfile,
+    ToolDecision, action_instruction, chunk_summary_instruction, clipboard_contents, config_path,
+    estimate_tokens, load_config, looks_like_code, reduce_summary_instruction,
+    route_execution_lane, save_config, selection_summary_instruction, structural_summary_chunks,
+    summary_reduce_batches,
 };
 use mice_ipc::{
     AgentCommand, Capabilities, HoverCaptured, InitializeParams, PromptSubmitted, RpcRequest,
@@ -47,6 +51,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tools::{CommandRunner, SystemRunner, ToolCall, ToolContext, ToolOutput};
 
 fn main() {
     let command = env::args().nth(1);
@@ -62,6 +67,11 @@ fn main() {
         Some("doctor") => doctor(),
         Some("settings") => settings(),
         Some("actions") => actions(),
+        Some("tools") => list_tools(),
+        Some("do") => do_goal(),
+        Some("bench-tools") => bench_tools(),
+        Some("savings") => savings(),
+        Some("advertise") => advertise(),
         Some("browser-bridge") => browser_bridge(),
         Some("native-host") => native_host(),
         Some("setup-browser") => setup_browser(),
@@ -82,11 +92,12 @@ fn main() {
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Usage: mice <start|stop|status|doctor|settings|actions|browser-bridge|setup-browser|autopilot|route|ask|mcp-server>"
+        "Usage: mice <start|stop|status|doctor|settings|actions|tools|do|bench-tools|savings|advertise|browser-bridge|setup-browser|autopilot|route|ask|mcp-server>"
     );
     println!("       mice ask [--action <preset>] <instruction>");
     println!("       mice autopilot <goal>");
     println!("       mice mcp-server");
+    println!("       mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>");
     Ok(())
 }
 
@@ -1127,12 +1138,32 @@ fn setup_browser() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
-    let goal = env::args().skip(2).collect::<Vec<_>>().join(" ");
+    let mut arguments = env::args().skip(2).collect::<Vec<_>>();
+    let engine = if arguments
+        .first()
+        .is_some_and(|argument| argument == "--engine")
+    {
+        if arguments.len() < 2 {
+            return Err("Usage: mice autopilot [--engine axi|extension] <goal>".into());
+        }
+        let engine = arguments[1].clone();
+        arguments.drain(0..2);
+        engine
+    } else {
+        "axi".into()
+    };
+    let goal = arguments.join(" ");
     if goal.trim().is_empty() {
         return Err(
             "Provide a goal, for example: mice autopilot \"search Canva and open a portrait\""
                 .into(),
         );
+    }
+    if engine == "axi" {
+        return autopilot_axi(&goal);
+    }
+    if engine != "extension" {
+        return Err("Autopilot engine must be `axi` or `extension`.".into());
     }
     println!(
         "MICE will use the configured cloud model to click and type for this goal. It never enters passwords, one-time codes, payment data, or final submissions."
@@ -1164,6 +1195,31 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
     }
+    Ok(())
+}
+
+/// Browser autopilot v2: the registry shells out to chrome-devtools-axi, so no
+/// Chrome extension/native-host chain is involved. The same bounded local tool
+/// loop supplies observe → act → verify turns through browser.snapshot/actions.
+fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    println!(
+        "MICE AXI autopilot runs browser commands through chrome-devtools-axi. It never fills credentials, OTPs, or payment data."
+    );
+    println!("Goal: {goal}");
+    print!("Start AXI autopilot? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut consent = String::new();
+    std::io::stdin().read_line(&mut consent)?;
+    if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Autopilot was not started.");
+        return Ok(());
+    }
+    let session = McpSession {
+        id: format!("axi-{}", std::process::id()),
+        agent: "autopilot".into(),
+    };
+    println!("{}", delegate_task(&config, &session, goal, 12)?);
     Ok(())
 }
 
@@ -1755,7 +1811,428 @@ fn enabled(value: bool) -> &'static str {
     if value { "available" } else { "unavailable" }
 }
 
+fn shared_memory() -> Result<memory::SharedMemory, Box<dyn std::error::Error>> {
+    let path = memory::SharedMemory::default_path().ok_or("HOME is not set")?;
+    Ok(memory::SharedMemory::at(path)?)
+}
+
+fn tool_session_name() -> String {
+    env::var("MICE_SESSION_ID").unwrap_or_else(|_| format!("mice-{}", std::process::id()))
+}
+
+fn repo_state_fingerprint(cwd: &std::path::Path) -> String {
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "no-git".into());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    format!("{head}:{dirty}")
+}
+
+fn current_branch(cwd: &std::path::Path) -> String {
+    Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn run_registered_tool(
+    config: &mice_core::Config,
+    session: &str,
+    call: ToolCall,
+) -> Result<ToolOutput, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let state = repo_state_fingerprint(&cwd);
+    let key = tools::call_fingerprint(&call, &state);
+    let store = shared_memory()?;
+    let cacheable = tools::specs()
+        .iter()
+        .find(|spec| spec.name == call.name)
+        .is_some_and(|spec| spec.kind == tools::ToolKind::ReadOnly);
+    if cacheable && let Some(cached) = store.artifact(&key)? {
+        store.record_ledger(
+            session,
+            &memory::LedgerRecord {
+                task: call.name.clone(),
+                lane: "deterministic".into(),
+                wall_ms: 0,
+                raw_output_tokens_est: estimate_tokens(&cached.raw),
+                returned_tokens_est: estimate_tokens(&cached.distilled),
+                frontier_tokens_avoided_est: estimate_tokens(&cached.raw)
+                    .saturating_sub(estimate_tokens(&cached.distilled)),
+                outcome: "cache_hit".into(),
+            },
+        )?;
+        return Ok(ToolOutput {
+            text: cached.distilled,
+            raw: cached.raw,
+            truncated: cached.truncated,
+            full_output_ref: Some(format!("artifact:{key}")),
+            needs_distillation: false,
+        });
+    }
+    let started = Instant::now();
+    let output = tools::run(
+        &SystemRunner,
+        &call,
+        &ToolContext {
+            working_dir: cwd.clone(),
+            session_name: session.into(),
+            output_budget_tokens: tools::DEFAULT_RETURN_TOKENS,
+            careful_mode: config.autopilot.careful_mode,
+        },
+    )?;
+    let artifact = memory::CachedArtifact {
+        tool: call.name.clone(),
+        args: call.args.to_string(),
+        fingerprint: state,
+        distilled: output.text.clone(),
+        raw: output.raw.clone(),
+        truncated: output.truncated,
+        created_ts: memory::now(),
+    };
+    if cacheable {
+        store.put_artifact(&key, &artifact)?;
+    }
+    let files = if call.name.starts_with("git.") {
+        output
+            .raw
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .filter(|value| value.contains('/'))
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    store.append(&memory::MemoryEvent {
+        event_ts: memory::now(),
+        recorded_ts: memory::now(),
+        session: session.into(),
+        agent: session.into(),
+        branch: current_branch(&cwd),
+        kind: "tool".into(),
+        text: format!("{} completed", call.name),
+        files,
+    })?;
+    store.record_ledger(
+        session,
+        &memory::LedgerRecord {
+            task: call.name,
+            lane: "deterministic".into(),
+            wall_ms: started.elapsed().as_millis(),
+            raw_output_tokens_est: estimate_tokens(&output.raw),
+            returned_tokens_est: estimate_tokens(&output.text),
+            frontier_tokens_avoided_est: estimate_tokens(&output.raw)
+                .saturating_sub(estimate_tokens(&output.text)),
+            outcome: "success".into(),
+        },
+    )?;
+    Ok(ToolOutput {
+        full_output_ref: cacheable.then(|| format!("artifact:{key}")),
+        ..output
+    })
+}
+
+fn list_tools() -> Result<(), Box<dyn std::error::Error>> {
+    let runner = SystemRunner;
+    println!("MICE deterministic tool registry:");
+    for (name, available) in tools::availability(&runner) {
+        println!(
+            "  {:<22} {}",
+            name,
+            if available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+    println!(
+        "GitHub uses gh-axi when present, otherwise gh. Browser tools use chrome-devtools-axi through npx."
+    );
+    Ok(())
+}
+
+fn bench_tools() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    let runner = SystemRunner;
+    let tool_model_available = runner.available("ollama")
+        && mice_providers::model_descriptor(&config.tool_model).is_some();
+    let trusted_loop_lane = match config.machine_profile {
+        MachineProfile::Light => false,
+        MachineProfile::Standard | MachineProfile::Heavy => tool_model_available,
+    };
+    println!("MICE tool benchmark (network-free schema validation)");
+    println!("  profile: {:?}", config.machine_profile);
+    println!(
+        "  tool model: {} ({})",
+        config.tool_model,
+        if tool_model_available {
+            "installed candidate"
+        } else {
+            "unavailable/unknown"
+        }
+    );
+    println!("  JSON tool-decision parser: passed");
+    println!(
+        "  loop-driver trusted: {}",
+        if trusted_loop_lane {
+            "yes"
+        } else {
+            "no; deterministic tools only"
+        }
+    );
+    Ok(())
+}
+
+fn savings() -> Result<(), Box<dyn std::error::Error>> {
+    let report = shared_memory()?.savings()?;
+    println!("MICE savings");
+    println!("  delegations: {}", report.delegations);
+    println!(
+        "  frontier tokens avoided (estimated): {}",
+        report.frontier_tokens_avoided
+    );
+    println!("  cache hits: {}", report.cache_hits);
+    println!("  macro replays: {}", report.macro_replays);
+    for (lane, count) in report.by_lane {
+        println!("  {lane}: {count}");
+    }
+    Ok(())
+}
+
+fn advertise() -> Result<(), Box<dyn std::error::Error>> {
+    let text = format!(
+        "You are paired with MICE, a local execution manager. Delegate mechanical, repetitive, or token-heavy steps through run_tool or delegate_task; MICE first uses deterministic local CLIs and returns bounded results. Check team_status before editing shared files and record durable choices with memory_note.\n\nAvailable deterministic tools:\n{}",
+        tools::stable_tool_prompt()
+    );
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--into")
+    {
+        let path = arguments
+            .get(1)
+            .ok_or("Usage: mice advertise [--into <file>]")?;
+        std::fs::write(path, &text)?;
+        println!("Wrote MICE manager instructions to {path}.");
+    } else if !arguments.is_empty() {
+        return Err("Usage: mice advertise [--into <file>]".into());
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+fn do_goal() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    let mut arguments = env::args().skip(2).collect::<Vec<_>>();
+    let mut session = tool_session_name();
+    let mut max_actions = 6usize;
+    let mut model = config.tool_model.clone();
+    while arguments
+        .first()
+        .is_some_and(|argument| argument.starts_with("--"))
+    {
+        match arguments.first().map(String::as_str) {
+            Some("--session") if arguments.len() >= 2 => {
+                session = arguments[1].clone();
+                arguments.drain(0..2);
+            }
+            Some("--model") if arguments.len() >= 2 => {
+                model = arguments[1].clone();
+                arguments.drain(0..2);
+            }
+            Some("--max-actions") if arguments.len() >= 2 => {
+                max_actions = arguments[1]
+                    .parse()
+                    .map_err(|_| "--max-actions needs a number")?;
+                arguments.drain(0..2);
+            }
+            _ => return Err(
+                "Usage: mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>"
+                    .into(),
+            ),
+        }
+    }
+    let goal = arguments.join(" ");
+    if goal.trim().is_empty() {
+        return Err("Usage: mice do <goal>".into());
+    }
+    if route_execution_lane(config.machine_profile, &config.routing, false, true, None)
+        != ExecutionLane::Local
+    {
+        return Err("This light machine profile keeps SLM tool loops disabled. Use `mice tools` / MCP `run_tool`, or change the profile only after `mice bench-tools` trusts a capable model.".into());
+    }
+    if mice_providers::model_descriptor(&model).is_none() {
+        return Err(format!("Unknown MICE tool model `{model}`.").into());
+    }
+    let mut history = Vec::<String>::new();
+    let mut calls = Vec::<Value>::new();
+    for _ in 0..max_actions {
+        let prompt = format!(
+            "Goal: {goal}\n\nTools:\n{}\n\nPrior results:\n{}\n\nReturn exactly one JSON object with snake_case keys: {{\"tool\": string|null, \"args\": object, \"say_to_user\": string, \"done\": bool, \"ask_user\": string|null}}. Choose one listed tool, or set done=true only when the goal is complete.",
+            tools::stable_tool_prompt(),
+            history.join("\n")
+        );
+        let mut raw = String::new();
+        stream_ollama(
+            &model,
+            "You are a careful local tool manager. Never invent tool results.",
+            Some(&prompt),
+            |chunk| {
+                raw.push_str(chunk);
+                Ok(())
+            },
+        )?;
+        let decision: ToolDecision = serde_json::from_str(extract_json_object(&raw))
+            .map_err(|error| format!("Tool model returned invalid JSON: {error}; output: {raw}"))?;
+        decision.validate()?;
+        if let Some(question) = decision.ask_user {
+            println!("MICE needs your input: {question}");
+            return Ok(());
+        }
+        if decision.done {
+            println!("MICE: {}", decision.say_to_user);
+            shared_memory()?.put_macro(&goal, &Value::Array(calls))?;
+            return Ok(());
+        }
+        let call = ToolCall {
+            name: decision.tool.unwrap_or_default(),
+            args: decision.args,
+        };
+        let output = run_registered_tool(&config, &session, call.clone())?;
+        println!("{}: {}", call.name, output.text);
+        calls.push(json!({"name": call.name, "args": call.args}));
+        history.push(format!("{} => {}", call.name, output.text));
+    }
+    Err("MICE tool loop reached its action budget; ask a narrower follow-up.".into())
+}
+
+fn delegate_task(
+    config: &mice_core::Config,
+    session: &McpSession,
+    goal: &str,
+    max_actions: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if route_execution_lane(config.machine_profile, &config.routing, false, true, None)
+        != ExecutionLane::Local
+    {
+        return Err("This light machine profile disables local SLM loops. Use run_tool for deterministic delegation.".into());
+    }
+    let store = shared_memory()?;
+    if let Some(macro_calls) = store.macro_for(goal)?
+        && let Some(calls) = macro_calls.as_array()
+        && !calls.is_empty()
+    {
+        let mut replay = Vec::new();
+        for call in calls {
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("Invalid stored workflow macro")?;
+            let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            replay.push(format!(
+                "{name}: {}",
+                run_registered_tool(
+                    config,
+                    &session.id,
+                    ToolCall {
+                        name: name.into(),
+                        args
+                    }
+                )?
+                .text
+            ));
+        }
+        store.record_ledger(
+            &session.id,
+            &memory::LedgerRecord {
+                task: goal.into(),
+                lane: "deterministic".into(),
+                wall_ms: 0,
+                raw_output_tokens_est: 0,
+                returned_tokens_est: estimate_tokens(&replay.join("\n")),
+                frontier_tokens_avoided_est: 0,
+                outcome: "macro_replay".into(),
+            },
+        )?;
+        return Ok(format!(
+            "Replayed a verified local workflow:\n{}",
+            replay.join("\n")
+        ));
+    }
+    let mut history = Vec::<String>::new();
+    let mut calls = Vec::<Value>::new();
+    for _ in 0..max_actions {
+        let prompt = format!(
+            "Goal: {goal}\n\nTools:\n{}\n\nPrior results:\n{}\n\nReturn exactly one JSON object with snake_case keys: {{\"tool\": string|null, \"args\": object, \"say_to_user\": string, \"done\": bool, \"ask_user\": string|null}}. Choose one listed tool, or set done=true only when the goal is complete.",
+            tools::stable_tool_prompt(),
+            history.join("\n")
+        );
+        let mut raw = String::new();
+        stream_ollama(
+            &config.tool_model,
+            "You are a careful local tool manager. Never invent tool results.",
+            Some(&prompt),
+            |chunk| {
+                raw.push_str(chunk);
+                Ok(())
+            },
+        )?;
+        let decision: ToolDecision = serde_json::from_str(extract_json_object(&raw))
+            .map_err(|error| format!("Tool model returned invalid JSON: {error}"))?;
+        decision.validate()?;
+        if let Some(question) = decision.ask_user {
+            return Ok(format!("MICE needs your input: {question}"));
+        }
+        if decision.done {
+            store.put_macro(goal, &Value::Array(calls))?;
+            return Ok(if decision.say_to_user.is_empty() {
+                "Delegated task completed.".into()
+            } else {
+                decision.say_to_user
+            });
+        }
+        let call = ToolCall {
+            name: decision.tool.unwrap_or_default(),
+            args: decision.args,
+        };
+        let output = run_registered_tool(config, &session.id, call.clone())?;
+        calls.push(json!({"name": call.name, "args": call.args}));
+        history.push(format!("{} => {}", call.name, output.text));
+    }
+    Err("MICE delegated task reached its action budget.".into())
+}
+
+fn extract_json_object(value: &str) -> &str {
+    let start = value.find('{').unwrap_or(0);
+    let end = value
+        .rfind('}')
+        .map(|index| index + 1)
+        .unwrap_or(value.len());
+    &value[start..end]
+}
+
 fn doctor() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = config()?;
     let output = Command::new("df").args(["-g", "."]).output()?;
     let line = String::from_utf8(output.stdout)?
         .lines()
@@ -1796,6 +2273,53 @@ fn doctor() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "not installed"
         }
+    );
+    let memory_gib = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|bytes| bytes / 1024 / 1024 / 1024);
+    let detected = match memory_gib.unwrap_or(0) {
+        0..=16 => MachineProfile::Light,
+        17..=31 => MachineProfile::Standard,
+        _ => MachineProfile::Heavy,
+    };
+    config.machine_profile = detected;
+    let path = config_path().ok_or("HOME is not set")?;
+    save_config(&path, &config)?;
+    println!(
+        "Machine profile: {:?}{}",
+        detected,
+        memory_gib
+            .map(|gib| format!(" ({gib} GiB detected)"))
+            .unwrap_or_default()
+    );
+    println!(
+        "Tool loop: {} (model {})",
+        if detected == MachineProfile::Light {
+            "disabled on light profile"
+        } else {
+            "run `mice bench-tools` before trusting"
+        },
+        config.tool_model
+    );
+    println!("Tool adapters:");
+    for (name, available) in tools::availability(&SystemRunner) {
+        println!(
+            "  {name}: {}",
+            if available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+    println!("GitHub setup: run `gh auth login` if GitHub tools are unavailable.");
+    println!(
+        "Browser setup: npx -y chrome-devtools-axi; optionally install chrome-devtools-mcp globally to avoid cold starts."
     );
     Ok(())
 }
@@ -3476,6 +4000,7 @@ fn route_preview() -> Result<(), Box<dyn std::error::Error>> {
 /// larger harness without silently sending their repository text elsewhere.
 fn mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
+    let mut session = McpSession::default();
     let stdin = std::io::stdin();
     let mut output = std::io::BufWriter::new(std::io::stdout().lock());
 
@@ -3504,20 +4029,22 @@ fn mcp_server() -> Result<(), Box<dyn std::error::Error>> {
 
         let response = match method {
             "initialize" => id.map(|id| {
+                session = McpSession::from_initialize(request.get("params"));
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
                         "protocolVersion": "2025-06-18",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "mice", "version": env!("CARGO_PKG_VERSION")}
+                        "serverInfo": {"name": "mice", "version": env!("CARGO_PKG_VERSION")},
+                        "instructions": "You are paired with MICE, a local execution manager. Delegate mechanical or token-heavy work through delegate_task or run_tool; MICE first uses deterministic local CLIs and returns bounded results. Check team_status before editing shared files and record durable decisions with memory_note."
                     }
                 })
             }),
             "tools/list" => id.map(|id| mcp_result(id, json!({"tools": mcp_tools()}))),
             "tools/call" => id.map(|id| {
                 let result = match request.get("params") {
-                    Some(params) => mcp_call_tool(&config, params),
+                    Some(params) => mcp_call_tool(&config, &session, params),
                     None => Err("Missing tool parameters".into()),
                 };
                 match result {
@@ -3540,6 +4067,36 @@ fn mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct McpSession {
+    id: String,
+    agent: String,
+}
+
+impl Default for McpSession {
+    fn default() -> Self {
+        let id = tool_session_name();
+        Self {
+            agent: id.clone(),
+            id,
+        }
+    }
+}
+
+impl McpSession {
+    fn from_initialize(params: Option<&Value>) -> Self {
+        let agent = params
+            .and_then(|params| params.get("clientInfo"))
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("mcp-agent")
+            .to_owned();
+        let id = format!("{}-{}", agent, std::process::id());
+        Self { id, agent }
+    }
+}
+
 fn write_mcp_message(
     output: &mut impl Write,
     message: &Value,
@@ -3559,7 +4116,7 @@ fn mcp_error(id: Value, code: i32, message: impl Into<String>) -> Value {
 }
 
 fn mcp_tools() -> Vec<Value> {
-    vec![
+    let mut values = vec![
         json!({
             "name": "summarize_text",
             "description": "Summarize text using MICE's configured local Ollama model.",
@@ -3585,11 +4142,21 @@ fn mcp_tools() -> Vec<Value> {
             "description": "Answer a short question using the configured local Ollama model.",
             "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}
         }),
-    ]
+        json!({"name": "run_tool", "description": "Run one bounded deterministic MICE registry tool. Cheap, local, and cacheable.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "args": {"type": "object"}}, "required": ["name"]}}),
+        json!({"name": "delegate_task", "description": "Delegate a bounded mechanical task to MICE's local tool manager.", "inputSchema": {"type": "object", "properties": {"instruction": {"type": "string"}, "max_actions": {"type": "integer"}}, "required": ["instruction"]}}),
+        json!({"name": "git_summary", "description": "Return a bounded local git status, log, and diff brief.", "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "repo_grep", "description": "Search this repository locally with a bounded result.", "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["pattern"]}}),
+        json!({"name": "memory_note", "description": "Record a durable shared-team decision or fact.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
+        json!({"name": "memory_query", "description": "Search shared MICE events, decisions, and recent work deterministically.", "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}),
+        json!({"name": "team_status", "description": "Show active MICE sessions and early file-overlap warnings.", "inputSchema": {"type": "object", "properties": {}}}),
+    ];
+    values.extend(tools::tool_schema());
+    values
 }
 
 fn mcp_call_tool(
     config: &mice_core::Config,
+    session: &McpSession,
     params: &Value,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let name = params
@@ -3627,8 +4194,97 @@ fn mcp_call_tool(
             "Answer this question briefly and directly. Say when the provided context is insufficient.",
             Some(string_argument("question")?),
         ),
+        "run_tool" => {
+            let tool_name = string_argument("name")?;
+            let tool_args = arguments.get("args").cloned().unwrap_or_else(|| json!({}));
+            Ok(format_tool_output(run_registered_tool(
+                config,
+                &session.id,
+                ToolCall {
+                    name: tool_name.into(),
+                    args: tool_args,
+                },
+            )?))
+        }
+        "git_summary" => {
+            let mut output = Vec::new();
+            for name in ["git.status", "git.log", "git.diff"] {
+                output.push(format!(
+                    "{name}:\n{}",
+                    run_registered_tool(
+                        config,
+                        &session.id,
+                        ToolCall {
+                            name: name.into(),
+                            args: json!({})
+                        }
+                    )?
+                    .text
+                ));
+            }
+            Ok(output.join("\n\n"))
+        }
+        "repo_grep" => Ok(format_tool_output(run_registered_tool(
+            config,
+            &session.id,
+            ToolCall {
+                name: "repo.grep".into(),
+                args: json!({"pattern": string_argument("pattern")?, "path": arguments.get("path").and_then(Value::as_str)}),
+            },
+        )?)),
+        "memory_note" => {
+            let cwd = env::current_dir()?;
+            shared_memory()?.append(&memory::MemoryEvent {
+                event_ts: memory::now(),
+                recorded_ts: memory::now(),
+                session: session.id.clone(),
+                agent: session.agent.clone(),
+                branch: current_branch(&cwd),
+                kind: "memory_note".into(),
+                text: string_argument("text")?.into(),
+                files: Vec::new(),
+            })?;
+            Ok("Shared memory note recorded.".into())
+        }
+        "memory_query" => Ok(shared_memory()?.query(string_argument("question")?)?),
+        "team_status" => Ok(shared_memory()?.team_status()?),
+        "delegate_task" => delegate_task(
+            config,
+            session,
+            string_argument("instruction")?,
+            arguments
+                .get("max_actions")
+                .and_then(Value::as_u64)
+                .unwrap_or(6) as usize,
+        ),
+        name if tools::specs().iter().any(|spec| spec.name == name) => {
+            Ok(format_tool_output(run_registered_tool(
+                config,
+                &session.id,
+                ToolCall {
+                    name: name.into(),
+                    args: arguments.clone(),
+                },
+            )?))
+        }
         _ => Err(format!("Unknown MICE tool: {name}").into()),
     }
+}
+
+fn format_tool_output(output: ToolOutput) -> String {
+    let marker = if output.truncated {
+        "\n[truncated: request full_output_ref for the complete artifact]"
+    } else {
+        ""
+    };
+    format!(
+        "{}{}\nfull_output_ref: {}",
+        output.text,
+        marker,
+        output
+            .full_output_ref
+            .unwrap_or_else(|| "unavailable".into())
+    )
 }
 
 fn mcp_local_response(

@@ -28,6 +28,7 @@ models, or user configuration belong in this repository.
 | M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. |
 | M11 Guide-me that acts | Complete in the M12 companion flow: native transport, verified actions, and double-enforced sensitive-control blocklist. |
 | M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
+| M13/M15 execution manager | Implemented: deterministic CLI registry, local tool loop, MCP delegation surface, shared memory/artifact cache, workflow macros, capability advertisement, and savings ledger. |
 | Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; Phases 1, 2a, 3 (local MCP server), and M7 file-scale summarization are complete. |
 
 ## Current capabilities
@@ -78,6 +79,17 @@ models, or user configuration belong in this repository.
   and `quick_answer`. These use only the configured local Ollama model; MICE
   never routes MCP tool text to a cloud provider. Large local summaries reuse
   M7's structural chunk-and-reduce flow.
+- **Execution manager (M13/M15, v8 multipliers):** `mice tools` exposes a
+  deterministic-first registry for Git, repository search, GitHub (`gh-axi`
+  with `gh` fallback), Chrome AXI, and quota inspection. Results have a
+  bounded return contract with an artifact reference; read-only results cache
+  by tool arguments plus repository state. `mice do` runs bounded local tool
+  loops on capable machines, while `mice mcp-server` exposes `run_tool`,
+  `delegate_task`, `git_summary`, `repo_grep`, `memory_note`, `memory_query`,
+  and `team_status` to every MCP-compatible harness. The shared file-backed
+  memory store records bi-temporal events, derived facts/digests, artifacts,
+  macro workflows, overlap warnings, and the `mice savings` ledger. Tool
+  subprocesses receive a scrubbed environment without provider API keys.
 - **Phase 2b Send to…:** completed text results offer a native Send to… menu.
   Its first destination pastes MICE's existing rich clipboard result into the
   app that is frontmost when Send to… is chosen (or the original app as a

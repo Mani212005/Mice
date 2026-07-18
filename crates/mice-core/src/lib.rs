@@ -17,6 +17,14 @@ pub struct Config {
     pub cloud_model: String,
     #[serde(default = "default_local_model")]
     pub local_model: String,
+    /// Model reserved for short local tool loops. It is selected by the
+    /// machine profile and never replaces the privacy-first summary model.
+    #[serde(default = "default_tool_model")]
+    pub tool_model: String,
+    #[serde(default)]
+    pub routing: RoutingConfig,
+    #[serde(default)]
+    pub machine_profile: MachineProfile,
     #[serde(default)]
     pub gesture: GestureConfig,
     #[serde(default)]
@@ -29,6 +37,9 @@ fn default_cloud_model() -> String {
 fn default_local_model() -> String {
     DEFAULT_LOCAL_MODEL.into()
 }
+fn default_tool_model() -> String {
+    "phi4-mini".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -37,10 +48,92 @@ impl Default for Config {
             cost_policy: CostPolicy::Cheapest,
             cloud_model: default_cloud_model(),
             local_model: default_local_model(),
+            tool_model: default_tool_model(),
+            routing: RoutingConfig::default(),
+            machine_profile: MachineProfile::default(),
             gesture: GestureConfig::default(),
             autopilot: AutopilotConfig::default(),
         }
     }
+}
+
+/// Machine capability controls which execution lanes are trustworthy. A light
+/// machine distils locally but does not attempt an unreliable local tool loop.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineProfile {
+    #[default]
+    Light,
+    Standard,
+    Heavy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    #[serde(default = "enabled")]
+    pub deterministic: bool,
+    #[serde(default = "enabled")]
+    pub local: bool,
+    #[serde(default = "enabled")]
+    pub cheap_cloud: bool,
+    #[serde(default = "enabled")]
+    pub frontier: bool,
+    #[serde(default = "default_quota_bias")]
+    pub quota_bias_percent: u8,
+}
+
+fn enabled() -> bool {
+    true
+}
+fn default_quota_bias() -> u8 {
+    80
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            deterministic: true,
+            local: true,
+            cheap_cloud: true,
+            frontier: true,
+            quota_bias_percent: default_quota_bias(),
+        }
+    }
+}
+
+/// The execution-cost ladder, ordered from work that needs no model to the
+/// most expensive fresh frontier call. The registry uses this before asking an
+/// SLM to reason about a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionLane {
+    Deterministic,
+    Local,
+    CheapCloud,
+    Frontier,
+    Unavailable,
+}
+
+pub fn route_execution_lane(
+    profile: MachineProfile,
+    routing: &RoutingConfig,
+    deterministic_available: bool,
+    requires_loop: bool,
+    quota_percent: Option<u8>,
+) -> ExecutionLane {
+    if deterministic_available && routing.deterministic {
+        return ExecutionLane::Deterministic;
+    }
+    let quota_biased = quota_percent.is_some_and(|value| value >= routing.quota_bias_percent);
+    if routing.local && (!requires_loop || profile != MachineProfile::Light) {
+        return ExecutionLane::Local;
+    }
+    if !quota_biased && routing.cheap_cloud {
+        return ExecutionLane::CheapCloud;
+    }
+    if !quota_biased && routing.frontier {
+        return ExecutionLane::Frontier;
+    }
+    ExecutionLane::Unavailable
 }
 
 /// Autopilot stays deliberately conservative by default. These preferences
@@ -156,7 +249,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
 }
 
 pub fn default_config_toml() -> &'static str {
-    "privacy_mode = \"cloud_allowed\"\ncost_policy = \"cheapest\"\ncloud_model = \"gpt-5.6-luna\"\n# Safe default: gemma3:4b. Alternatives: phi4-mini, gpt-oss:20b (heavy opt-in only).\nlocal_model = \"gemma3:4b\"\n\n[autopilot]\npersona = \"patient\"\n# The first completed goal confirms each safe action, then this turns off automatically.\nfirst_run = true\n# Set true to keep per-action confirmation for every future goal.\ncareful_mode = false\n\n[gesture]\ntrigger = \"ctrl+shift+space\"\nchord_window_ms = 120\nhold_threshold_ms = 350\nsummarize_selection_trigger = \"ctrl-double-tap\"\ninfographic_selection_trigger = \"ctrl+alt+i\"\ngoal_trigger = \"ctrl+alt+space\"\n"
+    "privacy_mode = \"cloud_allowed\"\ncost_policy = \"cheapest\"\ncloud_model = \"gpt-5.6-luna\"\n# Safe default: gemma3:4b. Alternatives: phi4-mini, gpt-oss:20b (heavy opt-in only).\nlocal_model = \"gemma3:4b\"\n# Tool-loop model; light machines automatically keep this lane disabled.\ntool_model = \"phi4-mini\"\nmachine_profile = \"light\"\n\n[routing]\ndeterministic = true\nlocal = true\ncheap_cloud = true\nfrontier = true\n# Bias away from paid lanes once quota-axi reports this percent of a window used.\nquota_bias_percent = 80\n\n[autopilot]\npersona = \"patient\"\n# The first completed goal confirms each safe action, then this turns off automatically.\nfirst_run = true\n# Set true to keep per-action confirmation for every future goal.\ncareful_mode = false\n\n[gesture]\ntrigger = \"ctrl+shift+space\"\nchord_window_ms = 120\nhold_threshold_ms = 350\nsummarize_selection_trigger = \"ctrl-double-tap\"\ninfographic_selection_trigger = \"ctrl+alt+i\"\ngoal_trigger = \"ctrl+alt+space\"\n"
 }
 
 /// Portable, side-effect-free state for the first Goal Guide stage. Platform
@@ -270,6 +363,37 @@ pub struct AgentDecision {
     pub value: Option<String>,
     pub done_summary: Option<String>,
     pub question: Option<String>,
+}
+
+/// Model-neutral tool-loop turn. Models with native function calling are
+/// normalized into this shape; smaller models emit the same snake_case JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDecision {
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(default)]
+    pub say_to_user: String,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub ask_user: Option<String>,
+}
+
+impl ToolDecision {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.done || self.ask_user.is_some() {
+            return Ok(());
+        }
+        if self.tool.as_deref().is_none_or(str::is_empty) {
+            return Err("A tool decision must select a tool, finish, or ask the user.");
+        }
+        if !self.args.is_object() {
+            return Err("Tool decision args must be a JSON object.");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -777,6 +901,38 @@ mod tests {
         assert_eq!(decision.say_to_user, "Opening Canva.");
         assert_eq!(decision.candidate_id.as_deref(), Some("candidate-3"));
         assert_eq!(decision.action, AgentAction::Click);
+    }
+
+    #[test]
+    fn tool_decision_requires_a_tool_or_terminal_state() {
+        let decision: ToolDecision = serde_json::from_str(
+            r#"{"tool":"git.status","args":{},"say_to_user":"Checking status","done":false,"ask_user":null}"#,
+        )
+        .unwrap();
+        assert!(decision.validate().is_ok());
+        assert!(
+            ToolDecision {
+                tool: None,
+                args: serde_json::json!({}),
+                say_to_user: String::new(),
+                done: false,
+                ask_user: None,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn light_profile_never_uses_the_local_loop_lane() {
+        let lane = route_execution_lane(
+            MachineProfile::Light,
+            &RoutingConfig::default(),
+            false,
+            true,
+            Some(90),
+        );
+        assert_eq!(lane, ExecutionLane::Unavailable);
     }
 
     #[test]
