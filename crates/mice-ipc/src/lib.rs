@@ -122,6 +122,10 @@ pub enum ScreenCaptureScope {
     FrontWindow,
     /// The entire display currently under the mouse pointer.
     DisplayUnderMouse,
+    /// The frontmost window captured at native pixel resolution with tiled
+    /// OCR, for dense small text such as spreadsheets. The image sent onward
+    /// remains bounded; only the on-device OCR pass sees full resolution.
+    FrontWindowDetail,
 }
 
 /// A native screen capture produced only in response to an explicit
@@ -142,6 +146,17 @@ pub struct ScreenCaptured {
     pub app_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_title: Option<String>,
+}
+
+/// The current Finder selection, read only after an explicit filing command.
+/// File paths are transient and are never persisted by the platform agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FinderCaptured {
+    pub session_id: String,
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
 }
 
 /// Text submitted by a native prompt owned by the platform agent. The core
@@ -263,6 +278,11 @@ pub enum AgentCommand {
         session_id: String,
         scope: ScreenCaptureScope,
     },
+    /// Read the Finder's current selection. This is read-only and is issued
+    /// only by `mice file --finder` after the user asks for it.
+    FinderCapture {
+        session_id: String,
+    },
     ClipboardSet {
         contents: ClipboardContents,
     },
@@ -334,6 +354,9 @@ impl AgentCommand {
                 "screen.capture",
                 json!({ "sessionId": session_id, "scope": scope }),
             ),
+            Self::FinderCapture { session_id } => {
+                ("finder.capture", json!({ "sessionId": session_id }))
+            }
             Self::ClipboardSet { contents } => (
                 "clipboard.set",
                 json!({

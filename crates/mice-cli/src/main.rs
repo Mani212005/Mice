@@ -106,7 +106,9 @@ fn usage() -> Result<(), Box<dyn std::error::Error>> {
         "Usage: mice <start|stop|status|doctor|settings|actions|tools|do|bench-tools|savings|advertise|browser-bridge|setup-browser|autopilot|route|ask|see|tidy|file|mcp-server>"
     );
     println!("       mice ask [--action <preset>] <instruction>");
-    println!("       mice see [--display] <question about your screen>");
+    println!(
+        "       mice see [--display|--sheet] <question about your screen>   (--sheet: dense text/spreadsheets)"
+    );
     println!("       mice autopilot <goal>");
     println!("       mice mcp-server");
     println!("       mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>");
@@ -115,6 +117,7 @@ fn usage() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("       mice tidy --undo");
     println!("       mice file --add-root <folder>");
+    println!("       mice file --finder   (file selected in frontmost Finder window)");
     println!("       mice file <path>");
     println!("       mice mcp list");
     println!("       mice mcp call <server> <tool> [json-arguments]");
@@ -4745,6 +4748,91 @@ fn start_agent_overlay_only(
     spawn_agent(gesture, false, true)
 }
 
+/// Ask the thin macOS agent for the existing Finder selection. The core only
+/// receives the path after the explicit `mice file --finder` command; it never
+/// watches Finder or persists the selection.
+/// How long `mice file --finder` waits for the agent. Generous because the
+/// first use can show a macOS Automation permission prompt the person has to
+/// approve; a stuck agent must still never hang the command forever.
+const FINDER_CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) fn capture_finder_file(
+    gesture: &mice_core::GestureConfig,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let agent = start_agent_overlay_only(gesture)?;
+    let session_id = format!("finder-{}", std::process::id());
+    let AgentSession {
+        mut child,
+        mut stdin,
+        reader,
+        ..
+    } = agent;
+    let outcome = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
+        send_command(
+            &mut stdin,
+            AgentCommand::FinderCapture {
+                session_id: session_id.clone(),
+            },
+        )?;
+        println!(
+            "Reading the Finder selection (approve the macOS Automation prompt if it appears)…"
+        );
+        let (sender, receiver) = mpsc::channel();
+        let expected = session_id.clone();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            loop {
+                let Ok(message) = read_frame::<mice_ipc::RpcNotification>(&mut reader) else {
+                    return;
+                };
+                if message.method != "finder.captured" {
+                    continue;
+                }
+                let Ok(captured) =
+                    serde_json::from_value::<mice_ipc::FinderCaptured>(message.params)
+                else {
+                    return;
+                };
+                if captured.session_id == expected {
+                    let _ = sender.send(captured);
+                    return;
+                }
+            }
+        });
+        let captured = receiver.recv_timeout(FINDER_CAPTURE_TIMEOUT).map_err(|_| {
+            format!(
+                "Timed out after {} seconds waiting for the Finder selection. If macOS showed an Automation permission prompt, approve it and run `mice file --finder` again.",
+                FINDER_CAPTURE_TIMEOUT.as_secs()
+            )
+        })?;
+        if let Some(error) = captured.capture_error {
+            return Err(error.into());
+        }
+        // The protocol is exactly one selected file. Anything else is a
+        // malformed or incompatible agent response; silently taking the
+        // first path could file an unintended item.
+        if captured.paths.len() != 1 {
+            return Err(format!(
+                "The agent returned {} paths where exactly one Finder selection was expected; nothing was filed.",
+                captured.paths.len()
+            )
+            .into());
+        }
+        let path = captured
+            .paths
+            .into_iter()
+            .next()
+            .expect("length was checked above");
+        Ok(PathBuf::from(path))
+    })();
+    // The one-shot agent may be stuck inside the AppleScript call after a
+    // timeout; end it explicitly rather than waiting on EOF behavior.
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
 fn spawn_agent(
     gesture: &mice_core::GestureConfig,
     autopilot_active: bool,
@@ -4775,6 +4863,14 @@ fn spawn_agent(
             if autopilot_active { "1" } else { "0" },
         )
         .env("MICE_OVERLAY_ONLY", if overlay_only { "1" } else { "0" })
+        .env(
+            "MICE_EXCLUDE_PIDS",
+            launch_chain_pids()
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Agent stdout is reserved for length-prefixed JSON-RPC. AppKit may log
@@ -4802,6 +4898,35 @@ fn spawn_agent(
         platform: params.platform,
         capabilities: params.capabilities,
     })
+}
+
+/// The process chain that launched this command: mice itself, its shell, and
+/// the terminal application above them. Running `mice see` necessarily makes
+/// that terminal frontmost, so the agent excludes these processes' windows
+/// when choosing the "front" window to capture.
+fn launch_chain_pids() -> Vec<u32> {
+    let mut pids = vec![std::process::id()];
+    let mut current = std::process::id();
+    for _ in 0..6 {
+        let Ok(output) = Command::new("/bin/ps")
+            .args(["-o", "ppid=", "-p", &current.to_string()])
+            .output()
+        else {
+            break;
+        };
+        let Ok(parent) = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+        else {
+            break;
+        };
+        if parent <= 1 {
+            break;
+        }
+        pids.push(parent);
+        current = parent;
+    }
+    pids
 }
 
 fn agent_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -5347,15 +5472,22 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
 fn see() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let mut arguments = env::args().skip(2).collect::<Vec<_>>();
-    let scope = if arguments.first().map(String::as_str) == Some("--display") {
-        arguments.remove(0);
-        mice_ipc::ScreenCaptureScope::DisplayUnderMouse
-    } else {
-        mice_ipc::ScreenCaptureScope::FrontWindow
+    let scope = match arguments.first().map(String::as_str) {
+        Some("--display") => {
+            arguments.remove(0);
+            mice_ipc::ScreenCaptureScope::DisplayUnderMouse
+        }
+        // Detail mode: native-resolution tiled OCR for dense small text such
+        // as spreadsheets; the outbound image stays bounded.
+        Some("--sheet") => {
+            arguments.remove(0);
+            mice_ipc::ScreenCaptureScope::FrontWindowDetail
+        }
+        _ => mice_ipc::ScreenCaptureScope::FrontWindow,
     };
     let question = arguments.join(" ");
     if question.is_empty() {
-        return Err("Usage: mice see [--display] <question about your screen>".into());
+        return Err("Usage: mice see [--display|--sheet] <question about your screen>".into());
     }
     let agent = start_agent_overlay_only(&config.gesture)?;
     if !agent.capabilities.screen_capture {
@@ -5455,7 +5587,14 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
         let payload = mice_providers::openai_vision_answer_payload(
             model,
             &question,
-            &bounded_for_model(&ocr_text, 4_000),
+            &bounded_for_model(
+                &ocr_text,
+                if scope == mice_ipc::ScreenCaptureScope::FrontWindowDetail {
+                    8_000
+                } else {
+                    4_000
+                },
+            ),
             &data_url,
         )
         .to_string();
@@ -5515,7 +5654,14 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
     stream_ollama(
         &config.local_model,
         &instruction,
-        Some(&bounded_for_model(&ocr_text, 12_000)),
+        Some(&bounded_for_model(
+            &ocr_text,
+            if scope == mice_ipc::ScreenCaptureScope::FrontWindowDetail {
+                24_000
+            } else {
+                12_000
+            },
+        )),
         |chunk| stream.push(chunk),
     )?;
     let answer = stream.finish()?;

@@ -47,6 +47,16 @@ struct FilingIndex {
 pub fn file_cmd() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(2).collect::<Vec<_>>();
     match arguments.first().map(String::as_str) {
+        Some("--finder") => {
+            if arguments.len() != 1 {
+                return Err(
+                    "`mice file --finder` takes no path; select one file in Finder first.".into(),
+                );
+            }
+            let config = crate::config()?;
+            let path = crate::capture_finder_file(&config.gesture)?;
+            file_path(&path)
+        }
         Some("--add-root") => {
             let root = arguments
                 .get(1)

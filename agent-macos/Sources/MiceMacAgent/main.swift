@@ -376,11 +376,23 @@ struct MiceMacAgent {
             let image: CGImage
             var appName = frontmost?.localizedName
             var windowTitle: String?
-            if scope == "front_window" {
-                guard let window = frontWindow(of: frontmost, in: content) else {
+            let detailScope = scope == "front_window_detail"
+            if scope == "front_window" || detailScope {
+                guard let window = frontWindow(in: content) else {
                     sendScreenCaptured(
                         sessionID: sessionID,
                         error: "No eligible front window is available. Use `mice see --display ...` to explicitly capture the display."
+                    )
+                    return
+                }
+                // The sensitive-app rule must apply to the app actually being
+                // captured, which is not the frontmost app when the command
+                // runs from a terminal.
+                if let ownerBundle = window.owningApplication?.bundleIdentifier.lowercased(),
+                   sensitiveCaptureBundlePrefixes.contains(where: { ownerBundle.hasPrefix($0) }) {
+                    sendScreenCaptured(
+                        sessionID: sessionID,
+                        error: "MICE does not capture credential or password-manager apps."
                     )
                     return
                 }
@@ -388,9 +400,23 @@ struct MiceMacAgent {
                 appName = window.owningApplication?.applicationName ?? appName
                 flashFrame(cgRect: window.frame)
                 let configuration = SCStreamConfiguration()
-                let size = boundedCaptureSize(window.frame.size)
-                configuration.width = size.width
-                configuration.height = size.height
+                if detailScope {
+                    // Native-resolution capture: dense small text (spreadsheet
+                    // cells) survives for the tiled OCR pass below. Only the
+                    // on-device OCR ever sees this full-resolution image. One
+                    // uniform fit factor preserves the aspect ratio when a
+                    // single dimension exceeds the cap.
+                    let scale = backingScale(forCGRect: window.frame)
+                    let pixelWidth = window.frame.width * scale
+                    let pixelHeight = window.frame.height * scale
+                    let fit = min(1, 6_000 / max(pixelWidth, pixelHeight, 1))
+                    configuration.width = max(Int(pixelWidth * fit), 8)
+                    configuration.height = max(Int(pixelHeight * fit), 8)
+                } else {
+                    let size = boundedCaptureSize(window.frame.size)
+                    configuration.width = size.width
+                    configuration.height = size.height
+                }
                 image = try await SCScreenshotManager.captureImage(
                     contentFilter: SCContentFilter(desktopIndependentWindow: window),
                     configuration: configuration
@@ -411,8 +437,13 @@ struct MiceMacAgent {
                     configuration: configuration
                 )
             }
-            let ocrText = await performOCR(on: image)
-            guard let pngBase64 = imageToBase64(image), pngBase64.count <= 12 * 1024 * 1024 else {
+            let ocrText = detailScope
+                ? await performTiledOCR(on: image)
+                : await performOCR(on: image)
+            // The outbound image stays bounded even in detail mode; the
+            // full-resolution pixels never leave this machine.
+            let outbound = detailScope ? (downscaled(image, maxDimension: 1_600) ?? image) : image
+            guard let pngBase64 = imageToBase64(outbound), pngBase64.count <= 12 * 1024 * 1024 else {
                 sendScreenCaptured(sessionID: sessionID, error: "The capture is too large to send safely.")
                 return
             }
@@ -431,16 +462,27 @@ struct MiceMacAgent {
         }
     }
 
-    /// The frontmost normal-layer window of the frontmost app, never one of
-    /// MICE's own panels. SCShareableContent orders windows front to back.
-    private static func frontWindow(
-        of application: NSRunningApplication?,
-        in content: SCShareableContent
-    ) -> SCWindow? {
-        guard let pid = application?.processIdentifier else { return nil }
-        return content.windows.first { window in
-            window.owningApplication?.processID == pid
-                && window.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier
+    /// Processes whose windows must never be the "front window": MICE itself
+    /// plus the shell/terminal chain that launched the command. Running
+    /// `mice see` from a terminal necessarily makes that terminal frontmost,
+    /// so capturing the literal frontmost app would always read the terminal
+    /// instead of the app the person is asking about.
+    private static let excludedLaunchPids: Set<pid_t> = {
+        var pids = Set(
+            (ProcessInfo.processInfo.environment["MICE_EXCLUDE_PIDS"] ?? "")
+                .split(separator: ",")
+                .compactMap { pid_t($0) }
+        )
+        pids.insert(pid_t(ProcessInfo.processInfo.processIdentifier))
+        return pids
+    }()
+
+    /// The frontmost eligible normal-layer window that is not owned by MICE
+    /// or its launch chain. SCShareableContent orders windows front to back.
+    private static func frontWindow(in content: SCShareableContent) -> SCWindow? {
+        content.windows.first { window in
+            guard let pid = window.owningApplication?.processID else { return false }
+            return !excludedLaunchPids.contains(pid)
                 && window.windowLayer == 0
                 && window.isOnScreen
                 && window.frame.width >= 120 && window.frame.height >= 90
@@ -455,8 +497,67 @@ struct MiceMacAgent {
         return (max(Int(size.width * scale), 8), max(Int(size.height * scale), 8))
     }
 
-    /// Flash a cyan frame over the captured area for a moment so the person
-    /// always sees what MICE just looked at.
+    /// The backing scale of the screen containing a CG-space rectangle, for
+    /// native-resolution detail captures.
+    private static func backingScale(forCGRect cgRect: CGRect) -> CGFloat {
+        let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+        let cocoaCenter = NSPoint(x: cgRect.midX, y: primaryHeight - cgRect.midY)
+        return NSScreen.screens
+            .first { $0.frame.contains(cocoaCenter) }?
+            .backingScaleFactor ?? 2
+    }
+
+    /// OCR dense content viewport by viewport, in reading order. Vision
+    /// recognizes small spreadsheet text far better on native-resolution
+    /// tiles than on one downscaled full-window image.
+    static func performTiledOCR(on image: CGImage) async -> String {
+        let tileSize = 2_000
+        let columns = max(1, (image.width + tileSize - 1) / tileSize)
+        let rows = max(1, (image.height + tileSize - 1) / tileSize)
+        if columns == 1 && rows == 1 {
+            return await performOCR(on: image)
+        }
+        var parts: [String] = []
+        for row in 0..<rows {
+            for column in 0..<columns {
+                let rect = CGRect(
+                    x: column * tileSize,
+                    y: row * tileSize,
+                    width: min(tileSize, image.width - column * tileSize),
+                    height: min(tileSize, image.height - row * tileSize)
+                )
+                guard let tile = image.cropping(to: rect) else { continue }
+                let text = await performOCR(on: tile)
+                if !text.isEmpty {
+                    parts.append(text)
+                }
+            }
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    private static func downscaled(_ image: CGImage, maxDimension: Int) -> CGImage? {
+        let scale = min(1.0, Double(maxDimension) / Double(max(image.width, image.height, 1)))
+        if scale >= 1 { return image }
+        let width = max(Int(Double(image.width) * scale), 8)
+        let height = max(Int(Double(image.height) * scale), 8)
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
+    /// Flash a frame over the captured area for a moment so the person
+    /// always sees what MICE just looked at. Shares the guide-highlight
+    /// styling for a consistent visual language.
     private static func flashFrame(cgRect: CGRect) {
         let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
         let cocoaRect = NSRect(
@@ -465,24 +566,11 @@ struct MiceMacAgent {
             width: cgRect.width,
             height: cgRect.height
         )
-        let panel = NSPanel(
-            contentRect: cocoaRect,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
+        let panel = OverlayController.makeHighlightPanel(
+            around: cocoaRect,
+            label: "MICE is reading this area",
+            pulsing: false
         )
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.ignoresMouseEvents = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let border = NSView(frame: panel.contentView?.bounds ?? .zero)
-        border.wantsLayer = true
-        border.layer?.borderWidth = 4
-        border.layer?.borderColor = NSColor.systemCyan.cgColor
-        border.autoresizingMask = [.width, .height]
-        panel.contentView?.addSubview(border)
         panel.orderFrontRegardless()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             panel.orderOut(nil)
@@ -619,6 +707,53 @@ struct MiceMacAgent {
             "method": "clipboard.captured",
             "params": ["sessionId": sessionID, "captureError": message],
         ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        writeFrame(data)
+    }
+
+    /// Read Finder's existing selection only after `mice file --finder`.
+    /// AppleScript may request macOS Automation permission on first use; MICE
+    /// never changes the selection or asks Finder to move anything.
+    ///
+    /// Finder is deliberately *not* required to be frontmost: running the
+    /// command from a terminal always makes the terminal frontmost, and the
+    /// CLI still shows the exact file and asks for confirmation before any
+    /// move. Finder must merely be running with a selection.
+    static func captureFinderSelection(sessionID: String) {
+        let finderRunning = NSWorkspace.shared.runningApplications
+            .contains { $0.bundleIdentifier == "com.apple.finder" }
+        guard finderRunning else {
+            sendFinderCaptured(sessionID: sessionID, error: "Finder is not running; open it, select one file, then run `mice file --finder` again.")
+            return
+        }
+        let source = "tell application \"Finder\" to get POSIX path of every item of selection"
+        var error: NSDictionary?
+        guard let result = NSAppleScript(source: source)?.executeAndReturnError(&error) else {
+            let detail = (error?[NSAppleScript.errorMessage] as? String) ?? "Finder did not allow selection access."
+            sendFinderCaptured(sessionID: sessionID, error: detail)
+            return
+        }
+        // Trailing whitespace and newlines are legal in macOS filenames, so
+        // paths are forwarded exactly as Finder reported them; trimming could
+        // silently redirect the move to a different existing file.
+        var paths: [String] = []
+        if result.numberOfItems > 0 {
+            paths = (1...result.numberOfItems).compactMap { result.atIndex($0)?.stringValue }
+        } else if let single = result.stringValue, !single.isEmpty {
+            paths = [single]
+        }
+        paths = paths.filter { !$0.isEmpty }
+        guard paths.count == 1 else {
+            sendFinderCaptured(sessionID: sessionID, error: paths.isEmpty ? "Select one file in Finder first." : "Select exactly one file in Finder first.")
+            return
+        }
+        sendFinderCaptured(sessionID: sessionID, paths: paths)
+    }
+
+    static func sendFinderCaptured(sessionID: String, paths: [String] = [], error: String? = nil) {
+        var params: [String: Any] = ["sessionId": sessionID, "paths": paths]
+        if let error { params["captureError"] = error }
+        let payload: [String: Any] = ["jsonrpc": "2.0", "method": "finder.captured", "params": params]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         writeFrame(data)
     }
@@ -870,6 +1005,15 @@ private final class OverlayController: NSObject {
         textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 456, height: 256))
         textView.isEditable = false
         textView.isSelectable = true
+        // Fetch Links is an explicit user action; MICE applies link
+        // attributes itself (HTTP/HTTPS only) rather than enabling automatic
+        // detection, which would also linkify file:, mailto:, and custom
+        // schemes. MICE never follows external MCP links automatically.
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+        ]
         textView.drawsBackground = false
         textView.font = .systemFont(ofSize: 14)
         textView.textColor = .labelColor
@@ -925,11 +1069,13 @@ private final class OverlayController: NSObject {
         case "overlay.appendResult":
             textView.string += params["chunk"] as? String ?? ""
             trimOverlayTextIfNeeded()
+            applyHttpLinkAttributes()
             textView.scrollToEndOfDocument(nil)
         case "overlay.finishResult":
             if let text = params["text"] as? String {
                 if imageView.isHidden { textView.string = text } else { captionLabel.stringValue = text }
             }
+            applyHttpLinkAttributes()
         case "overlay.result":
             guard let sessionID = params["sessionId"] as? String else { return }
             currentSessionId = sessionID
@@ -998,6 +1144,9 @@ private final class OverlayController: NSObject {
             guard let sessionID = params["sessionId"] as? String,
                   let scope = params["scope"] as? String else { return }
             Task { await MiceMacAgent.captureForVision(sessionID: sessionID, scope: scope) }
+        case "finder.capture":
+            guard let sessionID = params["sessionId"] as? String else { return }
+            MiceMacAgent.captureFinderSelection(sessionID: sessionID)
         case "clipboard.paste":
             MiceMacAgent.pasteClipboard()
         case "overlay.dismiss":
@@ -1024,6 +1173,24 @@ private final class OverlayController: NSObject {
             tail = Self.overlayTrimNotice + tail
         }
         textView.string = tail
+    }
+
+    /// Attribute only HTTP/HTTPS URLs as clickable links. Foundation's
+    /// automatic detection would also linkify file:, mailto:, and custom URL
+    /// schemes, which the result panel deliberately never offers.
+    private func applyHttpLinkAttributes() {
+        guard let storage = textView.textStorage, storage.length > 0 else { return }
+        let full = NSRange(location: 0, length: storage.length)
+        storage.removeAttribute(.link, range: full)
+        guard let detector = try? NSDataDetector(
+            types: NSTextCheckingResult.CheckingType.link.rawValue
+        ) else { return }
+        for match in detector.matches(in: storage.string, options: [], range: full) {
+            guard let url = match.url,
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { continue }
+            storage.addAttribute(.link, value: url, range: match.range)
+        }
     }
 
     func dismiss() {
@@ -1177,37 +1344,94 @@ private final class OverlayController: NSObject {
                   let y = bounds["y"] as? CGFloat,
                   let width = bounds["width"] as? CGFloat,
                   let height = bounds["height"] as? CGFloat else { continue }
-            let highlight = NSPanel(
-                contentRect: NSRect(x: x, y: y, width: width, height: height),
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false
+            let panel = OverlayController.makeHighlightPanel(
+                around: NSRect(x: x, y: y, width: width, height: height),
+                label: (box["instructionText"] as? String) ?? "",
+                pulsing: true
             )
-            highlight.isOpaque = false
-            highlight.backgroundColor = .clear
-            highlight.hasShadow = false
-            highlight.ignoresMouseEvents = true
-            highlight.level = .floating
-            highlight.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            let border = NSView(frame: highlight.contentView?.bounds ?? .zero)
-            border.wantsLayer = true
-            border.layer?.borderWidth = 3
-            border.layer?.borderColor = NSColor.systemCyan.cgColor
-            border.layer?.cornerRadius = 6
-            border.autoresizingMask = [.width, .height]
-            highlight.contentView?.addSubview(border)
-            if let instruction = box["instructionText"] as? String, !instruction.isEmpty {
-                let text = NSTextField(labelWithString: instruction)
-                text.textColor = .black
-                text.backgroundColor = .systemCyan
-                text.font = .systemFont(ofSize: 12, weight: .semibold)
-                text.sizeToFit()
-                text.frame.origin = NSPoint(x: 4, y: max(height - text.frame.height - 4, 0))
-                highlight.contentView?.addSubview(text)
-            }
-            highlight.orderFrontRegardless()
-            highlightPanels.append(highlight)
+            panel.orderFrontRegardless()
+            highlightPanels.append(panel)
         }
+    }
+
+    /// A rounded, softly glowing target frame with an optional pill label
+    /// floating above it. Guide highlights pulse to draw the eye; the capture
+    /// flash uses the same styling without the pulse so MICE's "look here"
+    /// visuals stay consistent.
+    static func makeHighlightPanel(around rect: NSRect, label: String, pulsing: Bool) -> NSPanel {
+        let margin: CGFloat = 6
+        let labelHeight: CGFloat = label.isEmpty ? 0 : 26
+        let labelGap: CGFloat = label.isEmpty ? 0 : 6
+        let panelRect = NSRect(
+            x: rect.origin.x - margin,
+            y: rect.origin.y - margin,
+            width: rect.width + margin * 2,
+            height: rect.height + margin * 2 + labelHeight + labelGap
+        )
+        let panel = NSPanel(
+            contentRect: panelRect,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let border = NSView(
+            frame: NSRect(x: margin, y: margin, width: rect.width, height: rect.height)
+        )
+        border.wantsLayer = true
+        border.layer?.borderWidth = 2.5
+        border.layer?.borderColor = NSColor.systemCyan.cgColor
+        border.layer?.cornerRadius = 8
+        border.layer?.shadowColor = NSColor.systemCyan.cgColor
+        border.layer?.shadowOpacity = 0.55
+        border.layer?.shadowRadius = 6
+        border.layer?.shadowOffset = .zero
+        border.layer?.masksToBounds = false
+        panel.contentView?.addSubview(border)
+        if pulsing, let layer = border.layer {
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.45
+            pulse.duration = 0.8
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            layer.add(pulse, forKey: "mice-pulse")
+        }
+
+        if !label.isEmpty {
+            let text = NSTextField(labelWithString: label)
+            text.textColor = .white
+            text.font = .systemFont(ofSize: 12, weight: .semibold)
+            text.lineBreakMode = .byTruncatingTail
+            text.sizeToFit()
+            let pillWidth = min(text.frame.width + 20, max(panelRect.width - 8, 60))
+            let pill = NSView(
+                frame: NSRect(
+                    x: margin,
+                    y: rect.height + margin + labelGap,
+                    width: pillWidth,
+                    height: labelHeight
+                )
+            )
+            pill.wantsLayer = true
+            pill.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
+            pill.layer?.cornerRadius = labelHeight / 2
+            text.frame = NSRect(
+                x: 10,
+                y: (labelHeight - text.frame.height) / 2,
+                width: pillWidth - 20,
+                height: text.frame.height
+            )
+            pill.addSubview(text)
+            panel.contentView?.addSubview(pill)
+        }
+        return panel
     }
 }
 
