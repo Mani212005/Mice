@@ -4871,6 +4871,10 @@ fn spawn_agent(
                 .collect::<Vec<_>>()
                 .join(","),
         )
+        .env(
+            "MICE_EXCLUDE_BUNDLES",
+            terminal_host_bundle_prefixes().join(","),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Agent stdout is reserved for length-prefixed JSON-RPC. AppKit may log
@@ -4927,6 +4931,30 @@ fn launch_chain_pids() -> Vec<u32> {
         current = parent;
     }
     pids
+}
+
+/// Terminal-host applications are excluded from implicit front-window screen
+/// capture even when the invoking shell is detached from them (tmux, SSH, or
+/// an IDE-integrated terminal). A caller can still request an explicit display
+/// capture, which performs its own credential-manager check.
+fn terminal_host_bundle_prefixes() -> Vec<&'static str> {
+    let mut prefixes = vec![
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "dev.warp",
+        "net.kovidgoyal.kitty",
+        "org.alacritty",
+        "com.github.wez.wezterm",
+        "co.zeit.hyper",
+        "com.mitchellh.ghostty",
+    ];
+    match std::env::var("TERM_PROGRAM").ok().as_deref() {
+        Some("vscode") => prefixes.push("com.microsoft.vscode"),
+        Some("vscode-insiders") => prefixes.push("com.microsoft.vscodeinsiders"),
+        Some("JetBrains-JediTerm") => prefixes.push("com.jetbrains."),
+        _ => {}
+    }
+    prefixes
 }
 
 fn agent_path() -> Result<PathBuf, Box<dyn std::error::Error>> {

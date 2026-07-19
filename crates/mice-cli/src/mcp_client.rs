@@ -187,25 +187,37 @@ impl McpServerProcess {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
+                let error = format!(
                     "MCP server `{}` timed out after {} seconds on `{method}`",
                     sanitize_external_text(&self.name),
                     self.timeout.as_secs()
-                )
-                .into());
+                );
+                self.terminate();
+                return Err(error.into());
             }
-            let line = self.lines.recv_timeout(remaining).map_err(|_| {
-                format!(
-                    "MCP server `{}` closed or timed out during `{method}`",
-                    sanitize_external_text(&self.name)
-                )
-            })?;
-            let line = line.map_err(|error| {
-                format!(
-                    "MCP server `{}` sent an invalid response: {error}",
-                    sanitize_external_text(&self.name)
-                )
-            })?;
+            let line = match self.lines.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(_) => {
+                    let error = format!(
+                        "MCP server `{}` closed or timed out during `{method}`",
+                        sanitize_external_text(&self.name)
+                    );
+                    self.terminate();
+                    return Err(error.into());
+                }
+            };
+            let line = match line {
+                Ok(line) => line,
+                Err(source) => {
+                    let error = format!(
+                        "MCP server `{}` sent an invalid response: {error}",
+                        sanitize_external_text(&self.name),
+                        error = sanitize_external_text(&source)
+                    );
+                    self.terminate();
+                    return Err(error.into());
+                }
+            };
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 // Tolerate stray non-JSON output instead of failing the call.
                 continue;
@@ -511,6 +523,26 @@ mod tests {
             "{error}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_read_timeout_terminates_a_retained_server() {
+        let config = mock_config(
+            [
+                r#"read line; printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}\n'"#,
+                "read line; sleep 30",
+            ]
+            .join("; "),
+        );
+        let mut server =
+            McpServerProcess::spawn_with_timeout(&config, Duration::from_millis(200)).unwrap();
+        let error = server.list_tools().unwrap_err().to_string();
+        assert!(
+            error.contains("timed out") || error.contains("closed"),
+            "{error}"
+        );
+        assert!(server.terminated);
+        assert!(server.child.try_wait().unwrap().is_some());
     }
 
     #[test]

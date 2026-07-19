@@ -427,6 +427,17 @@ struct MiceMacAgent {
                     sendScreenCaptured(sessionID: sessionID, error: "No display is available to capture.")
                     return
                 }
+                // `--display` captures every visible app under the pointer,
+                // not merely the app that happened to be frontmost when the
+                // CLI ran. Refuse before flashing or capturing if even one
+                // credential-manager window is visible on that display.
+                if sensitiveWindow(on: display, in: content) != nil {
+                    sendScreenCaptured(
+                        sessionID: sessionID,
+                        error: "MICE does not capture a display containing a credential or password-manager window."
+                    )
+                    return
+                }
                 flashFrame(cgRect: display.frame)
                 let configuration = SCStreamConfiguration()
                 let size = boundedCaptureSize(display.frame.size)
@@ -477,12 +488,45 @@ struct MiceMacAgent {
         return pids
     }()
 
+    /// Known terminal hosts are excluded even if their shell is no longer an
+    /// ancestor of MICE (for example after tmux/SSH detach). The Rust launcher
+    /// adds the specific IDE host when TERM_PROGRAM identifies one.
+    private static let excludedTerminalBundlePrefixes: [String] = {
+        let defaults = [
+            "com.apple.terminal", "com.googlecode.iterm2", "dev.warp",
+            "net.kovidgoyal.kitty", "org.alacritty", "com.github.wez.wezterm",
+            "co.zeit.hyper", "com.mitchellh.ghostty",
+        ]
+        let inherited = (ProcessInfo.processInfo.environment["MICE_EXCLUDE_BUNDLES"] ?? "")
+            .split(separator: ",")
+            .map { String($0).lowercased() }
+        return Array(Set(defaults + inherited))
+    }()
+
+    private static func isSensitiveCaptureWindow(_ window: SCWindow) -> Bool {
+        guard let bundleID = window.owningApplication?.bundleIdentifier.lowercased() else {
+            return false
+        }
+        return sensitiveCaptureBundlePrefixes.contains { bundleID.hasPrefix($0) }
+    }
+
+    private static func sensitiveWindow(on display: SCDisplay, in content: SCShareableContent) -> SCWindow? {
+        content.windows.first { window in
+            window.isOnScreen
+                && !window.frame.isEmpty
+                && window.frame.intersects(display.frame)
+                && isSensitiveCaptureWindow(window)
+        }
+    }
+
     /// The frontmost eligible normal-layer window that is not owned by MICE
     /// or its launch chain. SCShareableContent orders windows front to back.
     private static func frontWindow(in content: SCShareableContent) -> SCWindow? {
         content.windows.first { window in
             guard let pid = window.owningApplication?.processID else { return false }
+            let bundleID = window.owningApplication?.bundleIdentifier.lowercased() ?? ""
             return !excludedLaunchPids.contains(pid)
+                && !excludedTerminalBundlePrefixes.contains(where: { bundleID.hasPrefix($0) })
                 && window.windowLayer == 0
                 && window.isOnScreen
                 && window.frame.width >= 120 && window.frame.height >= 90
