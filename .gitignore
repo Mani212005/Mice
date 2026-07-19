@@ -17,3 +17,4 @@ config.toml
 *.png
 *.jpg
 *.jpeg
+dist/

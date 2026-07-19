@@ -47,6 +47,20 @@ private enum SelectionGesture {
     }
 }
 
+private enum SmartCopyGesture {
+    static let trigger = ProcessInfo.processInfo.environment["MICE_SMART_COPY_TRIGGER"] ?? "ctrl+alt+c"
+
+    static func matches(_ event: CGEvent) -> Bool {
+        guard event.flags.contains([.maskControl, .maskAlternate]) else { return false }
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        switch trigger {
+        case "ctrl+alt+c": return keyCode == 8
+        case "ctrl+alt+x": return keyCode == 7
+        default: return false
+        }
+    }
+}
+
 private enum GoalGesture {
     static let trigger = ProcessInfo.processInfo.environment["MICE_GOAL_TRIGGER"] ?? "ctrl+alt+space"
 
@@ -64,6 +78,11 @@ private enum AutopilotStopGesture {
         enabled && event.getIntegerValueField(.keyboardEventKeycode) == 53
     }
 }
+
+/// One-shot commands only need the overlay surface. In this mode the agent
+/// never creates its global event tap, so `mice ask` works without an Input
+/// Monitoring grant and observes no input at all.
+private let overlayOnlyMode = ProcessInfo.processInfo.environment["MICE_OVERLAY_ONLY"] == "1"
 
 private struct ClipboardSnapshot {
     private let items: [[(type: NSPasteboard.PasteboardType, data: Data)]]
@@ -112,7 +131,9 @@ struct MiceMacAgent {
         let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
             | (CGEventMask(1) << CGEventType.mouseMoved.rawValue)
             | (CGEventMask(1) << CGEventType.flagsChanged.rawValue)
-        if let tap = CGEvent.tapCreate(
+        if overlayOnlyMode {
+            // No event tap, no hover, no gestures: display-only lifetime.
+        } else if let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
@@ -150,6 +171,13 @@ struct MiceMacAgent {
                     if gestureTrigger.matches(event) {
                         Task {
                             await MiceMacAgent.triggerCapture()
+                        }
+                        return nil
+                    }
+                    if SmartCopyGesture.matches(event) {
+                        Task { @MainActor in
+                            MiceMacAgent.cancelHover()
+                            MiceMacAgent.sendClipboardCaptured()
                         }
                         return nil
                     }
@@ -230,6 +258,7 @@ struct MiceMacAgent {
                     "overlay": true,
                     "local_ocr": MicePermission.screenRecording.granted,
                     "browser_bridge": false,
+                    "input_monitoring": MicePermission.inputMonitoring.granted,
                 ],
             ],
         ]
@@ -241,15 +270,32 @@ struct MiceMacAgent {
         await captureRegion(centeredAt: NSEvent.mouseLocation, mode: "prompt")
     }
 
+    /// Convert a Cocoa screen point (bottom-left origin on the primary
+    /// display) into the CoreGraphics top-left-origin global space that
+    /// ScreenCaptureKit display frames use.
+    static func cocoaToCG(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x, y: CGDisplayBounds(CGMainDisplayID()).height - point.y)
+    }
+
+    /// The display actually containing the point, so capture follows the
+    /// mouse across a multi-display arrangement instead of always using the
+    /// first display.
+    static func display(containing point: CGPoint, in content: SCShareableContent) -> SCDisplay? {
+        content.displays.first { $0.frame.contains(point) } ?? content.displays.first
+    }
+
     static func captureRegion(centeredAt mouse: CGPoint, mode: String) async {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first else { return }
+            let cgPoint = cocoaToCG(mouse)
+            guard let display = display(containing: cgPoint, in: content) else { return }
             let width: CGFloat = 400
             let height: CGFloat = 300
             let frame = display.frame
-            let x = min(max(mouse.x - frame.origin.x - width / 2, 0), frame.width - width)
-            let y = min(max(frame.maxY - mouse.y - height / 2, 0), frame.height - height)
+            // sourceRect is display-relative with a top-left origin, matching
+            // the CG space of `frame`; clamp so the region stays on-display.
+            let x = min(max(cgPoint.x - frame.origin.x - width / 2, 0), max(frame.width - width, 0))
+            let y = min(max(cgPoint.y - frame.origin.y - height / 2, 0), max(frame.height - height, 0))
             try await captureRegion(
                 content: content,
                 display: display,
@@ -294,6 +340,178 @@ struct MiceMacAgent {
             sendSelectionCaptured(pixels: base64, text: ocrText, role: role, title: title, mode: mode)
     }
 
+    /// Bundle-ID prefixes MICE refuses to capture: a credential manager's
+    /// window would put secrets into a model-bound image.
+    private static let sensitiveCaptureBundlePrefixes = [
+        "com.1password", "com.agilebits", "com.apple.keychainaccess",
+        "com.apple.passwords", "com.bitwarden", "com.dashlane", "com.lastpass",
+        "com.keepassium", "org.keepassxc",
+    ]
+
+    /// One native capture, only ever in response to an explicit
+    /// `screen.capture` request from the core. Nothing is persisted; the
+    /// captured area is flashed on screen so the person sees exactly what
+    /// MICE looked at.
+    static func captureForVision(sessionID: String, scope: String) async {
+        guard MicePermission.screenRecording.granted else {
+            sendScreenCaptured(
+                sessionID: sessionID,
+                error: "Screen Recording permission is not granted to MICE."
+            )
+            return
+        }
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        if let bundleID = frontmost?.bundleIdentifier?.lowercased(),
+           sensitiveCaptureBundlePrefixes.contains(where: { bundleID.hasPrefix($0) }) {
+            sendScreenCaptured(
+                sessionID: sessionID,
+                error: "MICE does not capture credential or password-manager apps."
+            )
+            return
+        }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false, onScreenWindowsOnly: true
+            )
+            let image: CGImage
+            var appName = frontmost?.localizedName
+            var windowTitle: String?
+            if scope == "front_window" {
+                guard let window = frontWindow(of: frontmost, in: content) else {
+                    sendScreenCaptured(
+                        sessionID: sessionID,
+                        error: "No eligible front window is available. Use `mice see --display ...` to explicitly capture the display."
+                    )
+                    return
+                }
+                windowTitle = window.title
+                appName = window.owningApplication?.applicationName ?? appName
+                flashFrame(cgRect: window.frame)
+                let configuration = SCStreamConfiguration()
+                let size = boundedCaptureSize(window.frame.size)
+                configuration.width = size.width
+                configuration.height = size.height
+                image = try await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(desktopIndependentWindow: window),
+                    configuration: configuration
+                )
+            } else {
+                let cgPoint = cocoaToCG(NSEvent.mouseLocation)
+                guard let display = display(containing: cgPoint, in: content) else {
+                    sendScreenCaptured(sessionID: sessionID, error: "No display is available to capture.")
+                    return
+                }
+                flashFrame(cgRect: display.frame)
+                let configuration = SCStreamConfiguration()
+                let size = boundedCaptureSize(display.frame.size)
+                configuration.width = size.width
+                configuration.height = size.height
+                image = try await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                    configuration: configuration
+                )
+            }
+            let ocrText = await performOCR(on: image)
+            guard let pngBase64 = imageToBase64(image), pngBase64.count <= 12 * 1024 * 1024 else {
+                sendScreenCaptured(sessionID: sessionID, error: "The capture is too large to send safely.")
+                return
+            }
+            sendScreenCaptured(
+                sessionID: sessionID,
+                pngBase64: pngBase64,
+                ocrText: ocrText,
+                appName: appName,
+                windowTitle: windowTitle
+            )
+        } catch {
+            sendScreenCaptured(
+                sessionID: sessionID,
+                error: "Screen capture failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// The frontmost normal-layer window of the frontmost app, never one of
+    /// MICE's own panels. SCShareableContent orders windows front to back.
+    private static func frontWindow(
+        of application: NSRunningApplication?,
+        in content: SCShareableContent
+    ) -> SCWindow? {
+        guard let pid = application?.processIdentifier else { return nil }
+        return content.windows.first { window in
+            window.owningApplication?.processID == pid
+                && window.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier
+                && window.windowLayer == 0
+                && window.isOnScreen
+                && window.frame.width >= 120 && window.frame.height >= 90
+        }
+    }
+
+    /// Cap the larger dimension so uploads stay bounded while text remains
+    /// legible for OCR and vision models.
+    private static func boundedCaptureSize(_ size: CGSize) -> (width: Int, height: Int) {
+        let maxDimension: CGFloat = 1_600
+        let scale = min(1, maxDimension / max(size.width, size.height, 1))
+        return (max(Int(size.width * scale), 8), max(Int(size.height * scale), 8))
+    }
+
+    /// Flash a cyan frame over the captured area for a moment so the person
+    /// always sees what MICE just looked at.
+    private static func flashFrame(cgRect: CGRect) {
+        let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+        let cocoaRect = NSRect(
+            x: cgRect.origin.x,
+            y: primaryHeight - cgRect.maxY,
+            width: cgRect.width,
+            height: cgRect.height
+        )
+        let panel = NSPanel(
+            contentRect: cocoaRect,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let border = NSView(frame: panel.contentView?.bounds ?? .zero)
+        border.wantsLayer = true
+        border.layer?.borderWidth = 4
+        border.layer?.borderColor = NSColor.systemCyan.cgColor
+        border.autoresizingMask = [.width, .height]
+        panel.contentView?.addSubview(border)
+        panel.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            panel.orderOut(nil)
+        }
+    }
+
+    private static func sendScreenCaptured(
+        sessionID: String,
+        error: String? = nil,
+        pngBase64: String? = nil,
+        ocrText: String? = nil,
+        appName: String? = nil,
+        windowTitle: String? = nil
+    ) {
+        var params: [String: Any] = ["sessionId": sessionID]
+        if let error { params["captureError"] = error }
+        if let pngBase64 { params["pngBase64"] = pngBase64 }
+        if let ocrText, !ocrText.isEmpty { params["ocrText"] = ocrText }
+        if let appName { params["appName"] = appName }
+        if let windowTitle, !windowTitle.isEmpty { params["windowTitle"] = windowTitle }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "screen.captured",
+            "params": params,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        writeFrame(data)
+    }
+
     static func scheduleHover(at point: CGPoint) {
         hoverTask?.cancel()
         hoverTask = Task { @MainActor in
@@ -327,6 +545,79 @@ struct MiceMacAgent {
             "jsonrpc": "2.0",
             "method": "selection.text",
             "params": params,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        writeFrame(data)
+    }
+
+    /// Smart copy reads the pasteboard exactly once, only when its gesture
+    /// fires after the user's own Cmd-C. The pasteboard is never observed
+    /// continuously and is only rewritten by an explicit clipboard.set.
+    static func sendClipboardCaptured() {
+        let pasteboard = NSPasteboard.general
+        let sessionID = UUID().uuidString
+        // `clipboard.set` intentionally owns only these representations. Do
+        // not clear a pasteboard that also contains TIFF, file URLs, custom
+        // application data, or multiple items: MICE could not restore those
+        // losslessly. Leaving it untouched is safer than a partial rewrite.
+        let supportedTypes: Set<NSPasteboard.PasteboardType> = [.string, .html, .rtf, .png]
+        let items = pasteboard.pasteboardItems ?? []
+        let containsUnsupportedRepresentation = items.contains { item in
+            item.types.contains { !supportedTypes.contains($0) }
+        }
+        if items.count > 1 || containsUnsupportedRepresentation {
+            sendClipboardCaptureError(
+                sessionID: sessionID,
+                message: "This copy has additional rich formats MICE cannot preserve yet; the clipboard was left unchanged."
+            )
+            return
+        }
+        var params: [String: Any] = ["sessionId": sessionID]
+        if let text = pasteboard.string(forType: .string) {
+            params["text"] = text
+        }
+        if let html = pasteboard.data(forType: .html).flatMap({ String(data: $0, encoding: .utf8) }) {
+            params["html"] = html
+        }
+        if let rtf = pasteboard.data(forType: .rtf) {
+            params["rtfBase64"] = rtf.base64EncodedString()
+        }
+        // Preserve an existing PNG independently, but never relabel TIFF
+        // bytes as PNG. Smart Copy does not interpret or transform images.
+        if let image = pasteboard.data(forType: .png) {
+            guard image.count <= 8 * 1024 * 1024 else {
+                sendClipboardCaptureError(
+                    sessionID: sessionID,
+                    message: "This PNG is too large for Smart Copy to preserve safely; the clipboard was left unchanged."
+                )
+                return
+            }
+            params["pngBase64"] = image.base64EncodedString()
+        }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "clipboard.captured",
+            "params": params,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        // The Rust IPC reader rejects frames larger than 16 MiB. Do not write
+        // an oversized frame and tear down the agent/core session just because
+        // the user copied a large document; send a tiny typed failure instead.
+        guard data.count <= 16 * 1024 * 1024 else {
+            sendClipboardCaptureError(
+                sessionID: sessionID,
+                message: "Copied content is too large for Smart Copy; the clipboard was left unchanged."
+            )
+            return
+        }
+        writeFrame(data)
+    }
+
+    static func sendClipboardCaptureError(sessionID: String, message: String) {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "clipboard.captured",
+            "params": ["sessionId": sessionID, "captureError": message],
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         writeFrame(data)
@@ -633,6 +924,7 @@ private final class OverlayController: NSObject {
             panel.orderFrontRegardless()
         case "overlay.appendResult":
             textView.string += params["chunk"] as? String ?? ""
+            trimOverlayTextIfNeeded()
             textView.scrollToEndOfDocument(nil)
         case "overlay.finishResult":
             if let text = params["text"] as? String {
@@ -702,6 +994,10 @@ private final class OverlayController: NSObject {
                let data = Data(base64Encoded: pngBase64) {
                 pasteboard.setData(data, forType: .png)
             }
+        case "screen.capture":
+            guard let sessionID = params["sessionId"] as? String,
+                  let scope = params["scope"] as? String else { return }
+            Task { await MiceMacAgent.captureForVision(sessionID: sessionID, scope: scope) }
         case "clipboard.paste":
             MiceMacAgent.pasteClipboard()
         case "overlay.dismiss":
@@ -711,6 +1007,23 @@ private final class OverlayController: NSObject {
         default:
             break
         }
+    }
+
+    /// Very long results make NSTextView relayout quadratic during streaming
+    /// and are unreadable in a floating panel anyway. Keep the live tail; the
+    /// complete text still reaches the clipboard when the result finishes.
+    private static let maximumOverlayCharacters = 40_000
+    private static let overlayTrimNotice =
+        "… (earlier text trimmed — the complete result is on the clipboard)\n\n"
+
+    private func trimOverlayTextIfNeeded() {
+        let text = textView.string
+        guard text.count > Self.maximumOverlayCharacters else { return }
+        var tail = String(text.suffix(Self.maximumOverlayCharacters * 3 / 4))
+        if tail.hasPrefix(Self.overlayTrimNotice) == false {
+            tail = Self.overlayTrimNotice + tail
+        }
+        textView.string = tail
     }
 
     func dismiss() {
@@ -843,7 +1156,6 @@ private final class OverlayController: NSObject {
             + (sensitive ? "\n\nDo this yourself, then choose Next." : "")
         alert.addButton(withTitle: "Next")
         alert.addButton(withTitle: "Back")
-        if browserCapable { alert.addButton(withTitle: "Do it") }
         alert.addButton(withTitle: "Quit")
         NSApp.activate(ignoringOtherApps: true)
         switch alert.runModal() {
@@ -851,20 +1163,6 @@ private final class OverlayController: NSObject {
             MiceMacAgent.sendGuideControl(sessionID: sessionID, action: "next")
         case .alertSecondButtonReturn:
             MiceMacAgent.sendGuideControl(sessionID: sessionID, action: "back")
-        case .alertThirdButtonReturn where browserCapable:
-            let preview = NSAlert()
-            let needsText = ["type", "enter", "write", "fill"].contains { instruction.lowercased().contains($0) }
-            preview.messageText = "Confirm browser action"
-            preview.informativeText = needsText ? "MICE will type only text you provide. This performs one action only." : "MICE will click the highlighted browser control. This performs one action only."
-            preview.addButton(withTitle: "Confirm")
-            preview.addButton(withTitle: "Cancel")
-            let field = NSTextField(string: "")
-            if needsText { field.placeholderString = "Text to type (never stored)"; field.frame = NSRect(x: 0, y: 0, width: 320, height: 24); preview.accessoryView = field }
-            if preview.runModal() == .alertFirstButtonReturn {
-                MiceMacAgent.sendGuideControl(sessionID: sessionID, action: needsText ? "do-it-fill" : "do-it", value: needsText ? field.stringValue : nil)
-            } else {
-                MiceMacAgent.sendGuideControl(sessionID: sessionID, action: "stay")
-            }
         default:
             MiceMacAgent.sendGuideControl(sessionID: sessionID, action: "quit")
         }

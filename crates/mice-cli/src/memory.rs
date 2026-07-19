@@ -346,6 +346,18 @@ impl SharedMemory {
             match OpenOptions::new().create_new(true).write(true).open(&path) {
                 Ok(_) => return Ok(MemoryLock(path)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A lock is held only across a small append/rebuild. If a
+                    // process crashed, reclaim a clearly stale lock instead
+                    // of permanently wedging every future writer.
+                    let stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(120));
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
                     thread::sleep(Duration::from_millis(5))
                 }
                 Err(error) => return Err(error),
@@ -369,12 +381,19 @@ fn read_jsonl<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<Vec<T>, std::io
     if !path.exists() {
         return Ok(Vec::new());
     }
-    BufReader::new(OpenOptions::new().read(true).open(path)?)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(&line).map_err(std::io::Error::other))
-        .collect()
+    let mut events = Vec::new();
+    for line in BufReader::new(OpenOptions::new().read(true).open(path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // JSONL's final line can be torn by a crash. Keep valid history
+        // readable and let the next append/rebuild repair derived views.
+        if let Ok(event) = serde_json::from_str(&line) {
+            events.push(event);
+        }
+    }
+    Ok(events)
 }
 
 fn digest_name(value: &str) -> String {

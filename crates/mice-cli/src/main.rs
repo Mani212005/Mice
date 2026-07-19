@@ -1,4 +1,7 @@
+mod filing;
+mod mcp_client;
 mod memory;
+mod tidy;
 mod tools;
 
 use std::{
@@ -13,11 +16,12 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use crossterm::{
@@ -26,20 +30,22 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use mice_core::{
-    AgentAction, AgentDecision, AgentLoop, AgentLoopState, AgentMode, ExecutionLane, GoalSession,
-    GoalState, LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, MachineProfile,
+    AgentAction, AgentDecision, AgentLoop, AgentLoopState, ExecutionLane, GoalSession, GoalState,
+    LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, MachineProfile, SmartCopyPlan,
     ToolDecision, action_instruction, chunk_summary_instruction, clipboard_contents, config_path,
-    estimate_tokens, load_config, looks_like_code, reduce_summary_instruction,
-    route_execution_lane, save_config, selection_summary_instruction, structural_summary_chunks,
-    summary_reduce_batches,
+    estimate_tokens, load_config, looks_like_code, parse_markdown_table,
+    reduce_summary_instruction, route_execution_lane, save_config, selection_summary_instruction,
+    smart_copy_chunks, smart_copy_clean_instruction, smart_copy_plan, smart_copy_preserves_links,
+    smart_copy_preserves_visible_text, smart_copy_table_instruction, structural_summary_chunks,
+    summary_reduce_batches, table_clipboard_contents,
 };
 use mice_ipc::{
-    AgentCommand, Capabilities, HoverCaptured, InitializeParams, PromptSubmitted, RpcRequest,
-    SelectionAction, SelectionText, read_frame, write_frame,
+    AgentCommand, Capabilities, ClipboardCaptured, HoverCaptured, InitializeParams,
+    PromptSubmitted, RpcRequest, SelectionAction, SelectionText, read_frame, write_frame,
 };
 use mice_providers::{
-    Action, Artifacts, ModelPreferences, OllamaError, RouteRequest, SelectionSummaryRoute, route,
-    route_selection_summary, stream_ollama_chat,
+    Action, Artifacts, ModelPreferences, OllamaError, PrivacyMode, RouteRequest,
+    SelectionSummaryRoute, route, route_selection_summary, stream_ollama_chat,
 };
 use ratatui::{
     Terminal,
@@ -51,6 +57,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tools::{CommandRunner, SystemRunner, ToolCall, ToolContext, ToolOutput};
 
 fn main() {
@@ -80,6 +87,10 @@ fn main() {
         Some("stop") => stop(),
         Some("route") => route_preview(),
         Some("ask") => ask(),
+        Some("see") => see(),
+        Some("tidy") => tidy::tidy(),
+        Some("file") => filing::file_cmd(),
+        Some("mcp") => mcp_cmd(),
         Some("mcp-server") => mcp_server(),
         _ if chrome_native_host => native_host(),
         _ => usage(),
@@ -92,13 +103,94 @@ fn main() {
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Usage: mice <start|stop|status|doctor|settings|actions|tools|do|bench-tools|savings|advertise|browser-bridge|setup-browser|autopilot|route|ask|mcp-server>"
+        "Usage: mice <start|stop|status|doctor|settings|actions|tools|do|bench-tools|savings|advertise|browser-bridge|setup-browser|autopilot|route|ask|see|tidy|file|mcp-server>"
     );
     println!("       mice ask [--action <preset>] <instruction>");
+    println!("       mice see [--display] <question about your screen>");
     println!("       mice autopilot <goal>");
     println!("       mice mcp-server");
     println!("       mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>");
+    println!(
+        "       mice tidy [--apply] [--no-label] [folder]   (default ~/Downloads; dry run without --apply)"
+    );
+    println!("       mice tidy --undo");
+    println!("       mice file --add-root <folder>");
+    println!("       mice file <path>");
+    println!("       mice mcp list");
+    println!("       mice mcp call <server> <tool> [json-arguments]");
     Ok(())
+}
+
+/// Inspect and exercise user-granted external MCP servers. Both forms are
+/// explicit user invocations: MICE never sends content to an external server
+/// on its own.
+fn mcp_cmd() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    match arguments.first().map(String::as_str) {
+        Some("list") => {
+            let granted = mcp_client::granted_servers(&config);
+            if granted.is_empty() {
+                println!(
+                    "No MCP servers are granted. Add an [[mcp.servers]] entry with enabled = true to {}.",
+                    config_path().ok_or("HOME is not set")?.display()
+                );
+                return Ok(());
+            }
+            for server in granted {
+                match mcp_client::McpServerProcess::spawn(server) {
+                    Ok(mut process) => match process.list_tools() {
+                        Ok(tools) => {
+                            println!(
+                                "{} ({}):",
+                                mcp_client::sanitize_external_text(&server.name),
+                                mcp_client::sanitize_external_text(&server.command)
+                            );
+                            for tool in tools {
+                                println!(
+                                    "  {} — {}",
+                                    tool.name,
+                                    mcp_client::sanitize_external_text(&tool.description)
+                                );
+                            }
+                        }
+                        Err(error) => println!(
+                            "{}: tool discovery failed ({})",
+                            mcp_client::sanitize_external_text(&server.name),
+                            mcp_client::sanitize_external_text(&error.to_string())
+                        ),
+                    },
+                    Err(error) => println!(
+                        "{}: unavailable ({})",
+                        mcp_client::sanitize_external_text(&server.name),
+                        mcp_client::sanitize_external_text(&error.to_string())
+                    ),
+                }
+            }
+            Ok(())
+        }
+        Some("call") => {
+            let (Some(server_name), Some(tool)) = (arguments.get(1), arguments.get(2)) else {
+                return Err("Usage: mice mcp call <server> <tool> [json-arguments]".into());
+            };
+            let tool_arguments: Value = match arguments.get(3) {
+                Some(raw) => serde_json::from_str(raw)
+                    .map_err(|error| format!("Tool arguments must be JSON: {error}"))?,
+                None => json!({}),
+            };
+            let server = mcp_client::granted_servers(&config)
+                .into_iter()
+                .find(|server| server.name == *server_name)
+                .ok_or_else(|| {
+                    format!("`{server_name}` is not a granted MCP server; run `mice mcp list`.")
+                })?;
+            let mut process = mcp_client::McpServerProcess::spawn(server)?;
+            let answer = process.call_tool(tool, tool_arguments)?;
+            println!("{}", mcp_client::sanitize_external_text(&answer));
+            Ok(())
+        }
+        _ => Err("Usage: mice mcp <list|call>".into()),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -194,7 +286,6 @@ struct NativeBridgeState {
 
 #[derive(Clone)]
 struct BrowserTarget {
-    selector: String,
     label: String,
     role: String,
 }
@@ -219,7 +310,6 @@ struct AutopilotRun {
     in_flight: bool,
 }
 
-const AUTOPILOT_ACTION_BUDGET: usize = 15;
 const AUTOPILOT_WALL_CLOCK_CAP: Duration = Duration::from_secs(15 * 60);
 const AUTOPILOT_ACTION_ACK_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -329,78 +419,19 @@ fn handle_native_bridge(
                 std::process::exit(0);
             }
             Some("autopilot.start") => {
-                let goal = message["goal"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
-                if goal.is_empty() {
-                    write_frame(
-                        &mut stream,
-                        &serde_json::json!({"type":"autopilot.status", "text":"Enter a goal before starting autopilot.", "done":true}),
-                    )?;
-                    continue;
-                }
-                if config.privacy_mode == mice_providers::PrivacyMode::LocalOnly {
-                    write_frame(
-                        &mut stream,
-                        &serde_json::json!({"type":"autopilot.status", "text":"Autopilot requires cloud access. Change privacy mode first.", "done":true}),
-                    )?;
-                    continue;
-                }
-                let session_id = format!(
-                    "autopilot-{}",
-                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
-                );
-                let writer = Arc::new(Mutex::new(stream.try_clone()?));
-                let directive = BrowserGoalDirective {
-                    session_id: session_id.clone(),
-                    instruction: goal.clone(),
-                };
-                let chrome_connected = if let Ok(mut state) = bridge.lock() {
-                    state.control_client = Some(writer);
-                    state.directive = Some(directive.clone());
-                    state.autopilot = Some(AutopilotRun {
-                        session_id,
-                        loop_state: AgentLoop::new(
-                            goal,
-                            AgentMode::Autopilot,
-                            AUTOPILOT_ACTION_BUDGET,
-                        ),
-                        started_at: Instant::now(),
-                        awaiting_page_change: false,
-                        pending_snapshot: None,
-                        action_deadline: None,
-                        stuck_turns: 0,
-                        last_observed_url: None,
-                        in_flight: false,
-                    });
-                    state.client.is_some()
-                } else {
-                    false
-                };
-                // The goal.step below reaches the browser only if the Chrome
-                // extension is connected to this daemon. If it is not, say so
-                // clearly instead of pretending to observe — the pending
-                // directive is replayed automatically when the extension
-                // connects (see the bridge.hello handler).
-                if chrome_connected {
-                    autopilot_status(
-                        &bridge,
-                        "Autopilot started. Observing the current page.",
-                        false,
-                    );
-                    native_bridge_send(
-                        &bridge,
-                        &serde_json::json!({"type":"goal.step", "directive":directive}),
-                    );
-                } else {
-                    autopilot_status(
-                        &bridge,
-                        "Autopilot is ready, but Chrome is not connected yet. Keep `mice start` running with the MICE extension loaded and Chrome open — I will begin automatically when it connects.",
-                        false,
-                    );
-                }
+                // The extension-era autopilot was able to mutate Chrome
+                // directly. It is retired: AXI is the sole browser mutation
+                // executor and confirms every individual action. Keep this
+                // protocol response so an old extension fails closed rather
+                // than silently regaining that capability.
+                write_frame(
+                    &mut stream,
+                    &serde_json::json!({
+                        "type":"autopilot.status",
+                        "text":"The legacy extension autopilot is retired. Run `mice autopilot --engine axi <goal>` for individually confirmed browser actions.",
+                        "done":true
+                    }),
+                )?;
             }
             Some("autopilot.stop") => stop_autopilot(&bridge, "Autopilot stopped."),
             Some("bridge.hello") => {
@@ -445,7 +476,6 @@ fn handle_native_bridge(
                         state.targets.insert(
                             request.session_id.clone(),
                             BrowserTarget {
-                                selector: response.selector.clone(),
                                 label: response.label.clone(),
                                 role: response.role.clone(),
                             },
@@ -737,7 +767,6 @@ fn advance_autopilot(
     }
     if let Some(selected) = selected {
         let target = BrowserTarget {
-            selector: selected.selector.clone(),
             label: selected.label.clone(),
             role: selected.role.clone(),
         };
@@ -1144,7 +1173,7 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
         .is_some_and(|argument| argument == "--engine")
     {
         if arguments.len() < 2 {
-            return Err("Usage: mice autopilot [--engine axi|extension] <goal>".into());
+            return Err("Usage: mice autopilot [--engine axi] <goal>".into());
         }
         let engine = arguments[1].clone();
         arguments.drain(0..2);
@@ -1159,51 +1188,484 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    if engine == "axi" {
-        return autopilot_axi(&goal);
+    if engine != "axi" {
+        return Err(
+            "The legacy extension autopilot is retired. Use `mice autopilot --engine axi <goal>`; it requires confirmation for every action."
+                .into(),
+        );
     }
-    if engine != "extension" {
-        return Err("Autopilot engine must be `axi` or `extension`.".into());
-    }
-    println!(
-        "MICE will use the configured cloud model to click and type for this goal. It never enters passwords, one-time codes, payment data, or final submissions."
-    );
-    println!("Goal: {goal}");
-    print!("Start autopilot? [y/N] ");
-    std::io::stdout().flush()?;
-    let mut consent = String::new();
-    std::io::stdin().read_line(&mut consent)?;
-    if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        println!("Autopilot was not started.");
-        return Ok(());
-    }
-
-    let mut stream = UnixStream::connect(bridge_socket_path()?)
-        .map_err(|_| "Start the MICE daemon first: `cargo run -p mice-cli -- start`.")?;
-    write_frame(
-        &mut stream,
-        &serde_json::json!({"type":"autopilot.start", "goal":goal}),
-    )?;
-    while let Ok(status) = read_frame::<serde_json::Value>(&mut stream) {
-        if status["type"] != "autopilot.status" {
-            continue;
-        }
-        if let Some(text) = status["text"].as_str() {
-            println!("[MICE autopilot] {text}");
-        }
-        if status["done"].as_bool().unwrap_or(false) {
-            break;
-        }
-    }
-    Ok(())
+    autopilot_axi(&goal)
 }
 
 /// Browser autopilot v2: the registry shells out to chrome-devtools-axi, so no
 /// Chrome extension/native-host chain is involved. The same bounded local tool
 /// loop supplies observe → act → verify turns through browser.snapshot/actions.
 fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = goal;
-    Err("AXI autopilot is paused: generic browser mutation is disabled until MICE has a trusted current snapshot plus explicit per-action confirmation. Read-only `browser.snapshot` remains available through MICE tools.".into())
+    let config = config()?;
+    let runner = SystemRunner;
+    if !runner.available("npx") {
+        return Err("AXI autopilot requires Node's `npx`. Install Node, then retry.".into());
+    }
+    let context = ToolContext {
+        working_dir: env::current_dir()?,
+        session_name: format!("mice-autopilot-{}", std::process::id()),
+        output_budget_tokens: tools::DEFAULT_RETURN_TOKENS,
+    };
+    let primary_lane = axi_model_lane(&config, local_tool_model_available(&config, &runner))?;
+    println!("MICE AXI guide: {goal}");
+    println!(
+        "Every browser action will be shown and requires your confirmation. MICE never fills credentials or payment data, and never clicks sign-in, payment, transfer, or final-submission controls."
+    );
+    if matches!(
+        primary_lane,
+        ExecutionLane::CheapCloud | ExecutionLane::Frontier
+    ) && config.privacy_mode == PrivacyMode::CloudAllowed
+    {
+        confirm_axi_cloud_fallback(
+            &config.cloud_model,
+            "this machine profile cannot run the local browser loop",
+        )?;
+    }
+
+    let mut history = Vec::new();
+    let mut local_uncertainties = 0_u8;
+    let mut completed_actions = 0_usize;
+    while completed_actions < 6 {
+        // A stale retry belongs to this proposed action, not to the whole
+        // guide. A replan does not use up a successfully-dispatched action.
+        let mut recovery = AxiActionRecovery::default();
+        loop {
+            let observed = match observe_axi(&runner, &context) {
+                Ok(observed) => observed,
+                Err(error) => return pause_axi(goal, &history, &error),
+            };
+            let observation = observed.text.clone();
+            let lane = if primary_lane == ExecutionLane::Local
+                && local_uncertainties >= AXI_LOCAL_UNCERTAINTY_LIMIT
+            {
+                let fallback = axi_cloud_fallback_lane(&config)?;
+                confirm_axi_cloud_fallback(
+                    &config.cloud_model,
+                    "the local guide was uncertain twice on the current page",
+                )?;
+                fallback
+            } else {
+                primary_lane
+            };
+            let decision = call_axi_agent_turn(&config, lane, goal, &observation, &history)?;
+            validate_agent_decision(&decision)?;
+            println!("MICE: {}", decision.say_to_user);
+
+            let Some(call) = axi_call_from_decision(&decision)? else {
+                if lane == ExecutionLane::Local
+                    && config.privacy_mode == PrivacyMode::CloudAllowed
+                    && matches!(
+                        &decision.action,
+                        AgentAction::Handoff | AgentAction::AskUser
+                    )
+                {
+                    local_uncertainties += 1;
+                    history.push(format!(
+                        "local guide uncertainty {local_uncertainties}/{AXI_LOCAL_UNCERTAINTY_LIMIT}: {}",
+                        decision.say_to_user
+                    ));
+                    if local_uncertainties < AXI_LOCAL_UNCERTAINTY_LIMIT {
+                        println!(
+                            "MICE will take one more local-only look before considering a cloud fallback."
+                        );
+                    }
+                    continue;
+                }
+                match decision.action {
+                    AgentAction::Done => println!(
+                        "MICE AXI guide complete: {}",
+                        decision
+                            .done_summary
+                            .as_deref()
+                            .unwrap_or("The requested step is complete.")
+                    ),
+                    AgentAction::AskUser => println!(
+                        "MICE needs your input: {}",
+                        decision
+                            .question
+                            .as_deref()
+                            .unwrap_or("Please clarify the next step.")
+                    ),
+                    AgentAction::Handoff => println!("MICE has handed this step back to you."),
+                    _ => unreachable!("action conversion handles executable actions"),
+                }
+                return Ok(());
+            };
+
+            println!(
+                "Proposed action {}/6: {}",
+                completed_actions + 1,
+                observed.snapshot.approval_summary(&call)
+            );
+            print!("Do this one action? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut consent = String::new();
+            std::io::stdin().read_line(&mut consent)?;
+            if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("MICE did not act. You can continue manually or run a narrower goal.");
+                return Ok(());
+            }
+
+            // Re-observe after confirmation so a stale model reference can
+            // never be acted upon. A changed UID is rejected and replanned.
+            let current = match observe_axi(&runner, &context) {
+                Ok(current) => current,
+                Err(error) => return pause_axi(goal, &history, &error),
+            };
+            if !observed
+                .snapshot
+                .same_target_context(&current.snapshot, &call)
+            {
+                history.push("AXI target context changed after confirmation; replanning.".into());
+                println!(
+                    "The target changed after confirmation. Re-observing and replanning without acting."
+                );
+                continue;
+            }
+            let result = tools::execute_verified_browser_action(
+                &runner,
+                &call,
+                &context,
+                &current.snapshot,
+                true,
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(error) if is_axi_stale_error(&error) && recovery.retry_stale_once() => {
+                    history.push(format!("stale AXI target: {error}"));
+                    println!(
+                        "The page changed before MICE acted. Re-observing once and replanning safely."
+                    );
+                    continue;
+                }
+                Err(error) => return pause_axi(goal, &history, &error),
+            };
+            let outcome = if result.text.trim().is_empty() {
+                "action sent".into()
+            } else {
+                bounded_for_model(&result.text, 300)
+            };
+            history.push(format!("{} {} => {outcome}", call.name, call.args));
+            completed_actions += 1;
+            break;
+        }
+    }
+    Err(
+        "MICE AXI guide reached its six-action limit. Continue with a narrower follow-up goal."
+            .into(),
+    )
+}
+
+const AXI_LOCAL_UNCERTAINTY_LIMIT: u8 = 2;
+
+#[derive(Default)]
+struct AxiActionRecovery {
+    stale_retried: bool,
+}
+
+impl AxiActionRecovery {
+    /// Return true exactly once for a proposed action. A completed action gets
+    /// a fresh recovery state on the next outer-loop iteration.
+    fn retry_stale_once(&mut self) -> bool {
+        if self.stale_retried {
+            false
+        } else {
+            self.stale_retried = true;
+            true
+        }
+    }
+}
+
+fn local_tool_model_available(config: &mice_core::Config, runner: &impl CommandRunner) -> bool {
+    runner.available("ollama")
+        && mice_providers::model_descriptor(&config.tool_model).is_some()
+        && mice_providers::ollama_model_ready("http://127.0.0.1:11434", &config.tool_model).is_ok()
+}
+
+fn axi_model_lane(
+    config: &mice_core::Config,
+    local_tool_available: bool,
+) -> Result<ExecutionLane, Box<dyn std::error::Error>> {
+    match config.privacy_mode {
+        PrivacyMode::LocalOnly => {
+            let lane = route_execution_lane(
+                config.machine_profile,
+                &config.routing,
+                false,
+                true,
+                current_quota_usage_percent(),
+            );
+            if lane != ExecutionLane::Local {
+                return Err("AXI local-only mode needs a standard or heavy machine profile with the local tool loop enabled. MICE will not export browser content to a cloud provider.".into());
+            }
+            if !local_tool_available {
+                return Err(format!(
+                    "AXI local-only mode needs a reachable Ollama installation and a supported tool model (`{}`). Run `ollama serve`, pull the model, then run `mice bench-tools`.",
+                    config.tool_model
+                )
+                .into());
+            }
+            Ok(lane)
+        }
+        PrivacyMode::CloudOnly => axi_cloud_fallback_lane(config),
+        PrivacyMode::CloudAllowed => match route_execution_lane(
+            config.machine_profile,
+            &config.routing,
+            false,
+            true,
+            current_quota_usage_percent(),
+        ) {
+            ExecutionLane::Local if local_tool_available => Ok(ExecutionLane::Local),
+            ExecutionLane::Local => axi_cloud_fallback_lane(config),
+            ExecutionLane::CheapCloud | ExecutionLane::Frontier => Ok(route_execution_lane(
+                config.machine_profile,
+                &config.routing,
+                false,
+                true,
+                current_quota_usage_percent(),
+            )),
+            _ => Err(
+                "AXI browser guidance has no enabled local or cloud model lane in MICE settings."
+                    .into(),
+            ),
+        },
+    }
+}
+
+fn current_quota_usage_percent() -> Option<u8> {
+    type QuotaCache = Option<(Instant, Option<u8>)>;
+    static CACHE: OnceLock<Mutex<QuotaCache>> = OnceLock::new();
+    if let Some(value) = env::var("MICE_QUOTA_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| *value <= 100)
+    {
+        return Some(value);
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((checked, value)) = *guard
+        && checked.elapsed() < Duration::from_secs(300)
+    {
+        return value;
+    }
+    let value = tools::run(
+        &SystemRunner,
+        &ToolCall {
+            name: "quota.status".into(),
+            args: json!({}),
+        },
+        &ToolContext {
+            working_dir: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            session_name: tool_session_name(),
+            output_budget_tokens: 300,
+        },
+    )
+    .ok()
+    .and_then(|output| serde_json::from_str::<Value>(&output.raw).ok())
+    .and_then(|value| quota_usage_percent_from_value(&value));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), value));
+    }
+    value
+}
+
+fn quota_usage_percent_from_value(value: &Value) -> Option<u8> {
+    match value {
+        Value::Object(values) => values.iter().find_map(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            let number = value.as_f64().filter(|value| (0.0..=100.0).contains(value));
+            match (key.as_str(), number) {
+                (
+                    "used_percent" | "usage_percent" | "percent_used" | "usedpercent"
+                    | "usagepercent" | "percentused",
+                    Some(value),
+                ) => Some(value.round() as u8),
+                (
+                    "remaining_percent" | "percent_remaining" | "remainingpercent"
+                    | "percentremaining",
+                    Some(value),
+                ) => Some(100_u8.saturating_sub(value.round() as u8)),
+                _ => quota_usage_percent_from_value(value),
+            }
+        }),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(quota_usage_percent_from_value)
+            .max(),
+        _ => None,
+    }
+}
+
+fn axi_cloud_fallback_lane(
+    config: &mice_core::Config,
+) -> Result<ExecutionLane, Box<dyn std::error::Error>> {
+    if config.routing.cheap_cloud {
+        Ok(ExecutionLane::CheapCloud)
+    } else if config.routing.frontier {
+        Ok(ExecutionLane::Frontier)
+    } else {
+        Err("Cloud fallback is disabled in MICE settings; MICE will pause rather than export this browser snapshot.".into())
+    }
+}
+
+fn confirm_axi_cloud_fallback(model: &str, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "MICE needs cloud model `{model}` because {reason}. This sends the current bounded AXI snapshot to that provider."
+    );
+    print!("Allow this cloud fallback? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut consent = String::new();
+    std::io::stdin().read_line(&mut consent)?;
+    if matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err("Cloud fallback was not approved; MICE did not export browser content.".into())
+    }
+}
+
+fn is_axi_stale_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("stale_ref")
+        || message.contains("stale ref")
+        || message.contains("not in the current axi snapshot")
+}
+
+fn pause_axi(
+    goal: &str,
+    history: &[String],
+    error: &impl std::fmt::Display,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let detail = error.to_string();
+    let reason = if is_axi_stale_error(&detail) {
+        "the page changed again"
+    } else {
+        "Chrome or the AXI browser bridge became unavailable"
+    };
+    let last_history = history.last().map(String::as_str).unwrap_or("none");
+    println!(
+        "MICE AXI guide paused for ‘{goal}’: {reason}. No further action was taken. Reopen Chrome if needed, then rerun this goal. Last safe history: {last_history}"
+    );
+    eprintln!("[MICE AXI paused] {detail}");
+    Ok(())
+}
+
+struct AxiObservation {
+    text: String,
+    snapshot: tools::BrowserSnapshot,
+}
+
+fn observe_axi(
+    runner: &impl CommandRunner,
+    context: &ToolContext,
+) -> Result<AxiObservation, Box<dyn std::error::Error>> {
+    let output = tools::run(
+        runner,
+        &ToolCall {
+            name: "browser.snapshot".into(),
+            args: json!({}),
+        },
+        context,
+    )?;
+    Ok(AxiObservation {
+        snapshot: tools::BrowserSnapshot::from_axi_output(&output.raw),
+        text: output.text,
+    })
+}
+
+fn call_axi_agent_turn(
+    config: &mice_core::Config,
+    lane: ExecutionLane,
+    goal: &str,
+    observation: &str,
+    history: &[String],
+) -> Result<AgentDecision, Box<dyn std::error::Error>> {
+    let history = if history.is_empty() {
+        "No prior actions.".into()
+    } else {
+        history.join("\n")
+    };
+    let output = if lane == ExecutionLane::Local {
+        let mut output = String::new();
+        let instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing.";
+        stream_ollama(
+            &config.tool_model,
+            instruction,
+            Some(&format!(
+                "Goal: {goal}\n\nCurrent AXI snapshot:\n{observation}\n\nPrior actions:\n{history}"
+            )),
+            |chunk| {
+                output.push_str(chunk);
+                Ok(())
+            },
+        )?;
+        output
+    } else if is_groq_model(&config.cloud_model) {
+        call_groq_agent_turn(
+            &config.cloud_model,
+            goal,
+            observation,
+            &history,
+            &config.autopilot.persona,
+        )?
+    } else {
+        call_openai_agent_turn(
+            &config.cloud_model,
+            goal,
+            observation,
+            &history,
+            None,
+            &config.autopilot.persona,
+        )?
+    };
+    Ok(
+        serde_json::from_str(extract_json_object(&output)).map_err(|error| {
+            format!(
+                "AXI guide model returned an invalid decision: {error}; output: {}",
+                bounded_for_model(&output, 1_000)
+            )
+        })?,
+    )
+}
+
+fn axi_call_from_decision(
+    decision: &AgentDecision,
+) -> Result<Option<ToolCall>, Box<dyn std::error::Error>> {
+    let require_candidate = || {
+        decision
+            .candidate_id
+            .as_deref()
+            .filter(|candidate| !candidate.trim().is_empty())
+            .ok_or("The AXI guide chose an action without a current target reference.")
+    };
+    let call = match decision.action {
+        AgentAction::Click => ToolCall {
+            name: "browser.click".into(),
+            args: json!({"uid": require_candidate()?}),
+        },
+        AgentAction::Fill => ToolCall {
+            name: "browser.fill".into(),
+            args: json!({
+                "uid": require_candidate()?,
+                "text": decision.value.as_deref().ok_or("The AXI guide chose fill without text.")?
+            }),
+        },
+        AgentAction::OpenUrl => ToolCall {
+            name: "browser.open".into(),
+            args: json!({"url": decision.url.as_deref().ok_or("The AXI guide chose open_url without a URL.")?}),
+        },
+        AgentAction::Scroll => ToolCall {
+            name: "browser.scroll".into(),
+            args: json!({"direction": decision.value.as_deref().unwrap_or("down")}),
+        },
+        AgentAction::Done | AgentAction::Handoff | AgentAction::AskUser => return Ok(None),
+    };
+    Ok(Some(call))
 }
 
 /// Ask the running daemon to stop over its owner-only bridge socket. This is
@@ -1492,6 +1954,47 @@ fn rank_guide_candidates(instruction: &str, elements: Vec<BrowserElement>) -> Ve
         .collect()
 }
 
+/// Send credentials in HTTP headers, never in a child process argument list.
+/// This removes the runtime `curl` dependency and keeps provider failures
+/// useful without exposing secrets.
+fn post_provider_request(
+    service: &str,
+    endpoint: &str,
+    api_key: &str,
+    payload: &str,
+) -> Result<ureq::Response, Box<dyn std::error::Error>> {
+    ureq::post(endpoint)
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {api_key}"))
+        .send_string(payload)
+        .map_err(|error| match error {
+            ureq::Error::Status(status, response) => {
+                let body = response.into_string().unwrap_or_default();
+                let detail = body.trim();
+                let message = if detail.is_empty() {
+                    format!("{service} failed with HTTP {status}")
+                } else {
+                    format!("{service} failed with HTTP {status}: {detail}")
+                };
+                std::io::Error::other(message)
+            }
+            ureq::Error::Transport(error) => {
+                std::io::Error::other(format!("{service} request failed: {error}"))
+            }
+        })
+        .map_err(Into::into)
+}
+
+fn post_provider_json(
+    service: &str,
+    endpoint: &str,
+    api_key: &str,
+    payload: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let response = post_provider_request(service, endpoint, api_key, payload)?;
+    Ok(serde_json::from_reader(response.into_reader())?)
+}
+
 fn call_openai_guide(
     instruction: &str,
     dom_snapshot: &str,
@@ -1499,30 +2002,12 @@ fn call_openai_guide(
     let api_key = env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY is required for browser guide-me")?;
     let payload = mice_providers::openai_guide_payload(instruction, dom_snapshot).to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.openai.com/v1/responses",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "OpenAI Responses API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "OpenAI Responses API",
+        "https://api.openai.com/v1/responses",
+        &api_key,
+        &payload,
+    )?;
     response["output"]
         .as_array()
         .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
@@ -1543,30 +2028,12 @@ fn call_groq_guide(
     let api_key = env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY is required when Groq is selected for browser guide-me")?;
     let payload = mice_providers::groq_guide_payload(model, instruction, dom_snapshot).to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.groq.com/openai/v1/chat/completions",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "Groq guide API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "Groq guide API",
+        "https://api.groq.com/openai/v1/chat/completions",
+        &api_key,
+        &payload,
+    )?;
     response["choices"]
         .as_array()
         .and_then(|choices| choices.first())
@@ -1579,30 +2046,12 @@ fn call_openai_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std:
     let api_key =
         env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for Goal Guide")?;
     let payload = mice_providers::structured_goal_plan_payload(model, goal).to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.openai.com/v1/responses",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "OpenAI Goal Guide API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "OpenAI Goal Guide API",
+        "https://api.openai.com/v1/responses",
+        &api_key,
+        &payload,
+    )?;
     response["output"]
         .as_array()
         .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
@@ -1615,30 +2064,12 @@ fn call_groq_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std::e
     let api_key = env::var("GROQ_API_KEY")
         .map_err(|_| "GROQ_API_KEY is required when Groq is selected for Goal Guide")?;
     let payload = mice_providers::groq_goal_plan_payload(model, goal).to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.groq.com/openai/v1/chat/completions",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "Groq Goal Guide API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "Groq Goal Guide API",
+        "https://api.groq.com/openai/v1/chat/completions",
+        &api_key,
+        &payload,
+    )?;
     response["choices"]
         .as_array()
         .and_then(|choices| choices.first())
@@ -1666,30 +2097,12 @@ fn call_openai_agent_turn(
         persona,
     )
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.openai.com/v1/responses",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "OpenAI autopilot API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "OpenAI autopilot API",
+        "https://api.openai.com/v1/responses",
+        &api_key,
+        &payload,
+    )?;
     response["output"]
         .as_array()
         .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
@@ -1715,30 +2128,12 @@ fn call_groq_agent_turn(
         persona,
     )
     .to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.groq.com/openai/v1/chat/completions",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "Groq autopilot API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "Groq autopilot API",
+        "https://api.groq.com/openai/v1/chat/completions",
+        &api_key,
+        &payload,
+    )?;
     response["choices"]
         .as_array()
         .and_then(|choices| choices.first())
@@ -1788,6 +2183,10 @@ fn print_capabilities(capabilities: &Capabilities) {
     println!("  Overlay: {}", enabled(capabilities.overlay));
     println!("  Local OCR: {}", enabled(capabilities.local_ocr));
     println!("  Browser bridge: {}", enabled(capabilities.browser_bridge));
+    println!(
+        "  Input Monitoring: {}",
+        enabled(capabilities.input_monitoring)
+    );
 }
 
 fn enabled(value: bool) -> &'static str {
@@ -1804,23 +2203,136 @@ fn tool_session_name() -> String {
 }
 
 fn repo_state_fingerprint(cwd: &std::path::Path) -> String {
+    let directory = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .display()
+        .to_string();
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(cwd)
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_else(|| "no-git".into());
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let Some(head) = head else {
+        // Repository tools are deliberately not cached outside Git (see
+        // `run_registered_tool`), so a stable namespace is enough here.
+        return format!("no-git:{directory}");
+    };
+    // `git status` only records that a dirty file exists; it does not change
+    // when that same file is edited again. Fingerprint the changed path list
+    // and bounded regular-file state instead of collecting a potentially huge
+    // binary diff in memory. If a list exceeds the cap, disable caching rather
+    // than risk a stale or memory-hungry cache key.
+    let Some(tracked) =
+        bounded_git_output(cwd, &["diff", "--no-ext-diff", "--name-only", "-z", "HEAD"])
+    else {
+        return format!("uncacheable:{directory}");
+    };
+    let Some(untracked) =
+        bounded_git_output(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])
+    else {
+        return format!("uncacheable:{directory}");
+    };
+    let mut digest = Sha256::new();
+    for paths in [&tracked, &untracked] {
+        for path in paths
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            digest.update(path);
+            if let Ok(path) = std::str::from_utf8(path) {
+                hash_regular_file_for_fingerprint(&mut digest, &cwd.join(path));
+            }
+        }
+    }
+    format!("{directory}:{head}:{:x}", digest.finalize())
+}
+
+const MAX_GIT_FINGERPRINT_LIST_BYTES: usize = 512 * 1024;
+
+fn bounded_git_output(cwd: &std::path::Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (bytes, truncated) =
+        read_bounded_bytes(&mut stdout, MAX_GIT_FINGERPRINT_LIST_BYTES).ok()?;
+    let status = child.wait().ok()?;
+    (status.success() && !truncated).then_some(bytes)
+}
+
+fn read_bounded_bytes(
+    reader: &mut impl Read,
+    maximum: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let mut bytes = Vec::with_capacity(maximum.min(16 * 1024));
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = maximum.saturating_sub(bytes.len());
+        let kept = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..kept]);
+        truncated |= kept < read;
+    }
+    Ok((bytes, truncated))
+}
+
+fn is_git_repository(cwd: &std::path::Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
         .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_default();
-    format!("{head}:{dirty}")
+        .is_some_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+}
+
+fn repository_cacheable(cwd: &std::path::Path) -> bool {
+    is_git_repository(cwd) && !repo_state_fingerprint(cwd).starts_with("uncacheable:")
+}
+
+const MAX_FINGERPRINT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn hash_regular_file_for_fingerprint(digest: &mut Sha256, path: &std::path::Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        digest.update(b"unreadable");
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        digest.update(b"non-regular");
+        return;
+    }
+    digest.update(metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified()
+        && let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH)
+    {
+        digest.update(since_epoch.as_nanos().to_le_bytes());
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        digest.update(b"unreadable");
+        return;
+    };
+    let mut reader = file.take(MAX_FINGERPRINT_FILE_BYTES);
+    let mut buffer = Vec::new();
+    if reader.read_to_end(&mut buffer).is_ok() {
+        digest.update(&buffer);
+    }
+}
+
+fn workflow_macro_key(goal: &str) -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    format!("{goal}\nrepository:{}", repo_state_fingerprint(&cwd))
 }
 
 fn current_branch(cwd: &std::path::Path) -> String {
@@ -1844,7 +2356,11 @@ fn run_registered_tool(
     let state = repo_state_fingerprint(&cwd);
     let key = tools::call_fingerprint(&call, &state);
     let store = shared_memory()?;
-    let cacheable = tools::cache_policy(&call.name) == Some(tools::CachePolicy::Repository);
+    // In a non-Git directory there is no bounded, authoritative revision
+    // token. Do not let repository answers survive between invocations.
+    let cacheable = tools::cache_policy(&call.name) == Some(tools::CachePolicy::Repository)
+        && !state.starts_with("uncacheable:")
+        && is_git_repository(&cwd);
     if cacheable && let Some(cached) = store.artifact(&key)? {
         store.record_ledger(
             session,
@@ -1864,7 +2380,7 @@ fn run_registered_tool(
             text: cached.distilled,
             raw: String::new(),
             truncated: cached.truncated,
-            full_output_ref: None,
+            full_output_ref: Some(format!("artifact:{key}")),
             needs_distillation: false,
         });
     }
@@ -1926,7 +2442,7 @@ fn run_registered_tool(
         },
     )?;
     Ok(ToolOutput {
-        full_output_ref: None,
+        full_output_ref: cacheable.then(|| format!("artifact:{key}")),
         ..output
     })
 }
@@ -1954,8 +2470,7 @@ fn list_tools() -> Result<(), Box<dyn std::error::Error>> {
 fn bench_tools() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let runner = SystemRunner;
-    let tool_model_available = runner.available("ollama")
-        && mice_providers::model_descriptor(&config.tool_model).is_some();
+    let tool_model_available = local_tool_model_available(&config, &runner);
     let trusted_loop_lane = match config.machine_profile {
         MachineProfile::Light => false,
         MachineProfile::Standard | MachineProfile::Heavy => tool_model_available,
@@ -2058,8 +2573,13 @@ fn do_goal() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Usage: mice do <goal>".into());
     }
     validate_tool_action_budget(max_actions)?;
-    if route_execution_lane(config.machine_profile, &config.routing, false, true, None)
-        != ExecutionLane::Local
+    if route_execution_lane(
+        config.machine_profile,
+        &config.routing,
+        false,
+        true,
+        current_quota_usage_percent(),
+    ) != ExecutionLane::Local
     {
         return Err("This light machine profile keeps SLM tool loops disabled. Use `mice tools` / MCP `run_tool`, or change the profile only after `mice bench-tools` trusts a capable model.".into());
     }
@@ -2127,13 +2647,14 @@ fn persist_safe_macro(
     calls: Vec<Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !calls.is_empty()
+        && repository_cacheable(&env::current_dir()?)
         && calls.iter().all(|call| {
             call.get("name")
                 .and_then(Value::as_str)
                 .is_some_and(tools::is_read_only)
         })
     {
-        store.put_macro(goal, &Value::Array(calls))?;
+        store.put_macro(&workflow_macro_key(goal), &Value::Array(calls))?;
     }
     Ok(())
 }
@@ -2145,13 +2666,19 @@ fn delegate_task(
     max_actions: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
     validate_tool_action_budget(max_actions)?;
-    if route_execution_lane(config.machine_profile, &config.routing, false, true, None)
-        != ExecutionLane::Local
+    if route_execution_lane(
+        config.machine_profile,
+        &config.routing,
+        false,
+        true,
+        current_quota_usage_percent(),
+    ) != ExecutionLane::Local
     {
         return Err("This light machine profile disables local SLM loops. Use run_tool for deterministic delegation.".into());
     }
     let store = shared_memory()?;
-    if let Some(macro_calls) = store.macro_for(goal)?
+    if repository_cacheable(&env::current_dir()?)
+        && let Some(macro_calls) = store.macro_for(&workflow_macro_key(goal))?
         && let Some(calls) = macro_calls.as_array()
         && !calls.is_empty()
         && calls.iter().all(|call| {
@@ -2251,6 +2778,9 @@ fn extract_json_object(value: &str) -> &str {
 
 fn doctor() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = config()?;
+    for warning in mice_core::config_warnings(&config) {
+        println!("Config warning: {warning}");
+    }
     let output = Command::new("df").args(["-g", "."]).output()?;
     let line = String::from_utf8(output.stdout)?
         .lines()
@@ -2381,8 +2911,8 @@ fn settings_event_loop(
             continue;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.checked_sub(1).unwrap_or(9),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % 10,
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.checked_sub(1).unwrap_or(10),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % 11,
             KeyCode::Left | KeyCode::Char('h') => adjust_setting(config, selected, false),
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                 adjust_setting(config, selected, true)
@@ -2420,6 +2950,7 @@ fn draw_settings(frame: &mut ratatui::Frame, config: &mice_core::Config, selecte
             "Selection image    {}",
             config.gesture.infographic_selection_trigger
         ),
+        format!("Smart copy         {}", config.gesture.smart_copy_trigger),
         format!("Goal Guide        {}", config.gesture.goal_trigger),
         format!("Autopilot persona  {}", config.autopilot.persona),
         format!(
@@ -2512,16 +3043,21 @@ fn adjust_setting(config: &mut mice_core::Config, selected: usize, forward: bool
             forward,
         ),
         7 => cycle_value(
+            &mut config.gesture.smart_copy_trigger,
+            &["ctrl+alt+c", "ctrl+alt+x"],
+            forward,
+        ),
+        8 => cycle_value(
             &mut config.gesture.goal_trigger,
             &["ctrl+alt+space"],
             forward,
         ),
-        8 => cycle_value(
+        9 => cycle_value(
             &mut config.autopilot.persona,
             &["patient", "concise", "playful"],
             forward,
         ),
-        9 => config.autopilot.careful_mode = !config.autopilot.careful_mode,
+        10 => config.autopilot.careful_mode = !config.autopilot.careful_mode,
         _ => {}
     }
 }
@@ -2557,6 +3093,13 @@ fn cost_policy_name(policy: mice_providers::CostPolicy) -> &'static str {
 
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
+    for warning in mice_core::config_warnings(&config) {
+        println!("[MICE config] warning: {warning}");
+    }
+    MCP_SERVERS_GRANTED.store(
+        !mcp_client::granted_servers(&config).is_empty(),
+        Ordering::Relaxed,
+    );
     let browser_goal_directive: NativeBridge = Arc::new(Mutex::new(NativeBridgeState::default()));
     start_native_bridge(config.clone(), Arc::clone(&browser_goal_directive))?;
     let watchdog_bridge = Arc::clone(&browser_goal_directive);
@@ -2573,7 +3116,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("=== MICE Keyboard Gesture Loop ===");
     println!(
-        "Capture: Ctrl+Shift+Space. Hover: hold Control. Select text, then Ctrl double-tap to summarize or Ctrl+Option+I for an infographic."
+        "Capture: Ctrl+Shift+Space. Hover: hold Control. Select text, then Ctrl double-tap to summarize or Ctrl+Option+I for an infographic. After a normal Cmd-C, Ctrl+Option+C smart-copies."
     );
 
     let mut goal_sessions = HashMap::<String, GoalSession>::new();
@@ -2683,6 +3226,17 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(None) => {}
                 Err(error) => eprintln!("MICE selection action failed: {error}"),
             }
+        } else if msg.method == "clipboard.captured" {
+            let captured: ClipboardCaptured = match serde_json::from_value(msg.params) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    eprintln!("MICE received an invalid clipboard capture: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = handle_smart_copy(&mut agent.stdin, &config, captured) {
+                eprintln!("MICE smart copy failed: {error}");
+            }
         } else if msg.method == "overlay.action" {
             let session_id = msg.params["sessionId"]
                 .as_str()
@@ -2781,57 +3335,27 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            let mut response = String::new();
+            let mut stream = OverlayStream::echoing(&mut agent.stdin);
             let result = if selected.locality == mice_providers::Locality::Local {
                 stream_ollama(
                     selected.id,
                     &request.instruction,
                     text.as_deref(),
-                    |chunk| {
-                        print!("{chunk}");
-                        let _ = std::io::stdout().flush();
-                        response.push_str(chunk);
-                        send_command(
-                            &mut agent.stdin,
-                            AgentCommand::OverlayAppendResult {
-                                chunk: chunk.into(),
-                            },
-                        )
-                    },
+                    |chunk| stream.push(chunk),
                 )
             } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
                 stream_groq(
                     selected.id,
                     &request.instruction,
                     text.as_deref(),
-                    |chunk| {
-                        print!("{chunk}");
-                        let _ = std::io::stdout().flush();
-                        response.push_str(chunk);
-                        send_command(
-                            &mut agent.stdin,
-                            AgentCommand::OverlayAppendResult {
-                                chunk: chunk.into(),
-                            },
-                        )
-                    },
+                    |chunk| stream.push(chunk),
                 )
             } else {
                 stream_openai(
                     selected.id,
                     &request.instruction,
                     text.as_deref(),
-                    |chunk| {
-                        print!("{chunk}");
-                        let _ = std::io::stdout().flush();
-                        response.push_str(chunk);
-                        send_command(
-                            &mut agent.stdin,
-                            AgentCommand::OverlayAppendResult {
-                                chunk: chunk.into(),
-                            },
-                        )
-                    },
+                    |chunk| stream.push(chunk),
                 )
             };
 
@@ -2839,6 +3363,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 
             match result {
                 Ok(()) => {
+                    let response = stream.finish()?;
                     if !response.is_empty() {
                         send_command(&mut agent.stdin, clipboard_command(&response))?;
                     }
@@ -2848,6 +3373,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                 }
                 Err(error) => {
+                    let _ = stream.finish();
                     println!("Error: {}", error);
                     let _ = send_command(
                         &mut agent.stdin,
@@ -2898,8 +3424,12 @@ fn is_short_phrase(text: &str) -> bool {
 const GO_DEEPER_INSTRUCTION: &str = "Explain the selected content in greater depth: define the key terms, give background and context, why it matters, and any important nuance or implications. Be clear and thorough.";
 
 /// The action buttons shown on a finished text result.
+/// Set once at daemon start when the user has granted at least one external
+/// MCP server; it only controls whether the Fetch Links button is offered.
+static MCP_SERVERS_GRANTED: AtomicBool = AtomicBool::new(false);
+
 fn selection_result_actions() -> Vec<mice_ipc::OverlayAction> {
-    vec![
+    let mut actions = vec![
         mice_ipc::OverlayAction {
             id: "go_deeper".into(),
             label: "Go Deeper".into(),
@@ -2912,7 +3442,53 @@ fn selection_result_actions() -> Vec<mice_ipc::OverlayAction> {
             id: "send_to".into(),
             label: "Send to…".into(),
         },
-    ]
+    ];
+    if MCP_SERVERS_GRANTED.load(Ordering::Relaxed) {
+        actions.push(mice_ipc::OverlayAction {
+            id: "fetch_links".into(),
+            label: "Fetch Links".into(),
+        });
+    }
+    actions
+}
+
+/// Ask the first granted MCP server that offers a search-style tool about the
+/// selection. Only an explicit button press reaches this path, the query is a
+/// bounded prefix of the selection, and the result is rendered as sanitized
+/// text whose links MICE never follows on its own.
+fn fetch_links_via_mcp(
+    config: &mice_core::Config,
+    selection_text: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let query = bounded_for_model(selection_text.trim(), 200);
+    for server in mcp_client::granted_servers(config) {
+        let mut process = match mcp_client::McpServerProcess::spawn(server) {
+            Ok(process) => process,
+            Err(error) => {
+                eprintln!(
+                    "MICE MCP server {} unavailable: {}",
+                    mcp_client::sanitize_external_text(&server.name),
+                    mcp_client::sanitize_external_text(&error.to_string())
+                );
+                continue;
+            }
+        };
+        let Ok(tools) = process.list_tools() else {
+            continue;
+        };
+        let Some(tool) = tools.iter().find(|tool| mcp_client::is_search_tool(tool)) else {
+            continue;
+        };
+        let answer = process.call_tool(&tool.name, json!({ "query": query }))?;
+        return Ok((
+            mcp_client::sanitize_external_text(&server.name),
+            mcp_client::sanitize_external_text(&answer),
+        ));
+    }
+    Err(
+        "No granted MCP server offers a search tool; add one in config.toml under [[mcp.servers]]."
+            .into(),
+    )
 }
 
 /// Stream a text action to the overlay through the appropriate provider lane and
@@ -2923,22 +3499,22 @@ fn stream_selected(
     instruction: &str,
     text: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut response = String::new();
+    let mut stream = OverlayStream::new(writer);
     let result = if selected.locality == mice_providers::Locality::Local {
         stream_ollama(selected.id, instruction, Some(text), |chunk| {
-            append_overlay_chunk(writer, &mut response, chunk)
+            stream.push(chunk)
         })
     } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
         stream_groq(selected.id, instruction, Some(text), |chunk| {
-            append_overlay_chunk(writer, &mut response, chunk)
+            stream.push(chunk)
         })
     } else {
         stream_openai(selected.id, instruction, Some(text), |chunk| {
-            append_overlay_chunk(writer, &mut response, chunk)
+            stream.push(chunk)
         })
     };
     result?;
-    Ok(response)
+    stream.finish()
 }
 
 /// Summarize an oversized selection entirely through the configured local
@@ -3019,14 +3595,14 @@ fn stream_chunked_local_text(
                     text: plan.final_status.into(),
                 },
             )?;
-            let mut response = String::new();
+            let mut stream = OverlayStream::new(writer);
             stream_ollama(
                 model.id,
                 plan.final_instruction,
                 Some(&batches[0].join("\n\n")),
-                |output| append_overlay_chunk(writer, &mut response, output),
+                |output| stream.push(output),
             )?;
-            return Ok(response);
+            return stream.finish();
         }
 
         let total_batches = batches.len();
@@ -3342,9 +3918,316 @@ fn handle_overlay_action(
                 },
             )?;
         }
+        "fetch_links" => {
+            let Some(text) = cache.as_ref().map(|entry| entry.text.clone()) else {
+                return Ok(());
+            };
+            send_command(
+                writer,
+                AgentCommand::OverlayUpdate {
+                    text: "Fetching links from your granted MCP server…".into(),
+                },
+            )?;
+            let chunk = match fetch_links_via_mcp(config, &text) {
+                Ok((server, result)) => format!(
+                    "\n\n— Links from `{server}` (external result; MICE does not open links itself) —\n{result}"
+                ),
+                Err(error) => format!(
+                    "\n\n(Fetch Links failed: {})",
+                    mcp_client::sanitize_external_text(&error.to_string())
+                ),
+            };
+            send_command(writer, AgentCommand::OverlayAppendResult { chunk })?;
+            send_command(writer, AgentCommand::OverlayFinishResult { text: None })?;
+            send_command(
+                writer,
+                AgentCommand::OverlayResult {
+                    session_id: session_id.to_owned(),
+                    actions: selection_result_actions(),
+                },
+            )?;
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// Enrich the pasteboard the user's own Cmd-C produced, only after the
+/// explicit smart-copy gesture. Deterministic table rebuilds need no model;
+/// everything else uses the configured local model regardless of the privacy
+/// mode, because clipboard content never goes to a cloud provider. On any
+/// failure the pasteboard stays exactly as the user's copy wrote it.
+fn handle_smart_copy(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    captured: ClipboardCaptured,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(error) = captured.capture_error.as_deref() {
+        return finish_smart_copy(writer, error);
+    }
+    if captured.text.is_none() && captured.html.is_none() && captured.rtf_base64.is_some() {
+        return finish_smart_copy(
+            writer,
+            "This copy only exposes RTF. Smart Copy left the original rich text unchanged.",
+        );
+    }
+    if captured.text.is_none() && captured.html.is_none() && captured.png_base64.is_some() {
+        return finish_smart_copy(writer, "Image copy left unchanged.");
+    }
+    match smart_copy_plan(captured.text.as_deref(), captured.html.as_deref()) {
+        SmartCopyPlan::Ready { contents, notice } => {
+            if send_smart_copy_contents(writer, contents, captured.png_base64.as_deref())? {
+                finish_smart_copy(writer, notice)
+            } else {
+                finish_smart_copy(
+                    writer,
+                    "The cleaned copy is too large for MICE's safe clipboard transport; your clipboard is unchanged.",
+                )
+            }
+        }
+        SmartCopyPlan::ModelMarkdownTable { source } => {
+            let Some(table) = smart_copy_local_table(writer, config, &source)? else {
+                return finish_smart_copy(
+                    writer,
+                    "The local model could not rebuild this table losslessly; your clipboard is unchanged.",
+                );
+            };
+            if send_smart_copy_contents(
+                writer,
+                table_clipboard_contents(&table),
+                captured.png_base64.as_deref(),
+            )? {
+                finish_smart_copy(writer, mice_core::SMART_COPY_TABLE_NOTICE)
+            } else {
+                finish_smart_copy(
+                    writer,
+                    "The cleaned table is too large for MICE's safe clipboard transport; your clipboard is unchanged.",
+                )
+            }
+        }
+        SmartCopyPlan::ModelMarkdownClean { source } => {
+            let response =
+                smart_copy_local_response(writer, config, smart_copy_clean_instruction(), &source)?;
+            let markdown = strip_markdown_fence(&response);
+            if markdown.trim().is_empty()
+                || !smart_copy_preserves_visible_text(&source, markdown)
+                || !smart_copy_preserves_links(&source, markdown)
+            {
+                return finish_smart_copy(
+                    writer,
+                    "The local model could not clean this copy losslessly; your clipboard is unchanged.",
+                );
+            }
+            if send_smart_copy_contents(
+                writer,
+                clipboard_contents(markdown),
+                captured.png_base64.as_deref(),
+            )? {
+                finish_smart_copy(
+                    writer,
+                    "Copy cleaned to Markdown with rich-text representations; paste anywhere.",
+                )
+            } else {
+                finish_smart_copy(
+                    writer,
+                    "The cleaned copy is too large for MICE's safe clipboard transport; your clipboard is unchanged.",
+                )
+            }
+        }
+        SmartCopyPlan::NothingToEnrich { reason } => finish_smart_copy(writer, reason),
+    }
+}
+
+fn send_smart_copy_contents(
+    writer: &mut ChildStdin,
+    contents: mice_core::ClipboardContents,
+    preserved_png_base64: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let command = AgentCommand::ClipboardSet {
+        contents: mice_ipc::ClipboardContents {
+            text: contents.text,
+            html: contents.html,
+            rtf: contents.rtf,
+            png_base64: preserved_png_base64.map(str::to_owned),
+        },
+    };
+    let mut probe = Vec::new();
+    match write_frame(&mut probe, &command.notification()) {
+        Ok(()) => {
+            send_command(writer, command)?;
+            Ok(true)
+        }
+        Err(mice_ipc::FrameError::TooLarge) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn finish_smart_copy(
+    writer: &mut ChildStdin,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_command(
+        writer,
+        AgentCommand::OverlayShow {
+            text: message.into(),
+        },
+    )?;
+    send_command(writer, AgentCommand::OverlayFinishResult { text: None })
+}
+
+/// Run the smart-copy fallback on the configured local model and collect its
+/// full response. A model failure reports through the overlay and returns the
+/// error so the caller writes nothing to the pasteboard.
+fn smart_copy_local_response(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    instruction: &str,
+    source: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    send_command(
+        writer,
+        AgentCommand::OverlayShow {
+            text: format!(
+                "Smart copy: rebuilding with {} (clipboard stays local)…",
+                config.local_model
+            ),
+        },
+    )?;
+    let budget_tokens = mice_providers::model_descriptor(&config.local_model)
+        .and_then(|descriptor| descriptor.input_budget_tokens)
+        .unwrap_or(4_000);
+    let maximum_characters = budget_tokens.saturating_mul(3);
+    let Some(chunks) = smart_copy_chunks(source, maximum_characters) else {
+        finish_smart_copy(
+            writer,
+            "This copy has no safe chunk boundaries for local cleanup; your clipboard is unchanged.",
+        )?;
+        return Err("Smart copy source cannot be chunked losslessly.".into());
+    };
+    let mut responses = Vec::new();
+    for chunk in chunks {
+        let response = smart_copy_local_model(writer, config, instruction, &chunk)?;
+        if !smart_copy_preserves_visible_text(&chunk, strip_markdown_fence(&response))
+            || !smart_copy_preserves_links(&chunk, strip_markdown_fence(&response))
+        {
+            finish_smart_copy(
+                writer,
+                "The local model changed visible content or a link; your clipboard is unchanged.",
+            )?;
+            return Err("Smart copy verification rejected a changed model response.".into());
+        }
+        responses.push(strip_markdown_fence(&response).to_owned());
+    }
+    Ok(responses.join("\n\n"))
+}
+
+fn smart_copy_local_table(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    source: &str,
+) -> Result<Option<mice_core::ExtractedTable>, Box<dyn std::error::Error>> {
+    send_command(
+        writer,
+        AgentCommand::OverlayShow {
+            text: format!(
+                "Smart copy: rebuilding table with {} (clipboard stays local)…",
+                config.local_model
+            ),
+        },
+    )?;
+    let budget_tokens = mice_providers::model_descriptor(&config.local_model)
+        .and_then(|descriptor| descriptor.input_budget_tokens)
+        .unwrap_or(4_000);
+    let maximum_characters = budget_tokens.saturating_mul(3);
+    let lines = source.lines().collect::<Vec<_>>();
+    let Some((header, rows)) = lines.split_first() else {
+        return Ok(None);
+    };
+    let mut chunks = Vec::new();
+    let mut current = (*header).to_owned();
+    for row in rows {
+        let candidate = format!("{current}\n{row}");
+        if candidate.chars().count() > maximum_characters {
+            if current == *header {
+                return Ok(None);
+            }
+            chunks.push(current);
+            current = format!("{header}\n{row}");
+            if current.chars().count() > maximum_characters {
+                return Ok(None);
+            }
+        } else {
+            current = candidate;
+        }
+    }
+    if current != *header {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut combined: Option<mice_core::ExtractedTable> = None;
+    for chunk in chunks {
+        let response =
+            smart_copy_local_model(writer, config, smart_copy_table_instruction(), &chunk)?;
+        let Some(table) = parse_markdown_table(strip_markdown_fence(&response)) else {
+            return Ok(None);
+        };
+        match combined.as_mut() {
+            Some(all) if all.headers == table.headers => all.rows.extend(table.rows),
+            Some(_) => return Ok(None),
+            None => combined = Some(table),
+        }
+    }
+    let Some(table) = combined else {
+        return Ok(None);
+    };
+    if smart_copy_preserves_visible_text(source, &mice_core::table_markdown(&table)) {
+        Ok(Some(table))
+    } else {
+        Ok(None)
+    }
+}
+
+fn smart_copy_local_model(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    instruction: &str,
+    source: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut response = String::new();
+    match stream_ollama(&config.local_model, instruction, Some(source), |chunk| {
+        response.push_str(chunk);
+        Ok(())
+    }) {
+        Ok(()) => Ok(response),
+        Err(error) => {
+            let _ = finish_smart_copy(
+                writer,
+                &format!(
+                    "Smart copy could not run the local model; your clipboard is unchanged. ({error})"
+                ),
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Local models often wrap requested Markdown in a code fence; unwrap one if
+/// the whole response is fenced, otherwise return the response as-is.
+fn strip_markdown_fence(value: &str) -> &str {
+    let trimmed = value.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((_, body)) = rest.split_once('\n') else {
+        return trimmed;
+    };
+    body.trim_end()
+        .strip_suffix("```")
+        .map(str::trim_end)
+        .unwrap_or(trimmed)
 }
 
 fn handle_selection_action(
@@ -3603,7 +4486,10 @@ fn show_active_guide_step(
             instruction: step.instruction.clone(),
             app_hint: step.app_hint.clone(),
             sensitive: step.sensitive,
-            browser_capable: is_browser_step(step) && !step.sensitive,
+            // Goal Guide is advisory/highlight-only. Browser mutation is
+            // exclusively owned by the AXI executor, which supplies the
+            // current-snapshot and per-action consent guarantees.
+            browser_capable: false,
         },
     )
 }
@@ -3614,66 +4500,13 @@ fn handle_guide_control(
     browser_goal_directive: &NativeBridge,
     session_id: &str,
     action: &str,
-    value: Option<&str>,
+    _value: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if action == "do-it" || action == "do-it-fill" {
-        let guide = guides
-            .get(session_id)
-            .ok_or("No active guide was found for this session.")?;
-        let step = guide
-            .steps
-            .get(guide.current_step)
-            .ok_or("The active guide has no current step.")?;
-        if step.sensitive || !is_browser_step(step) {
-            return send_command(
-                writer,
-                AgentCommand::OverlayFinishResult {
-                    text: Some("This one's yours — MICE will only highlight this step.".into()),
-                },
-            );
-        }
-        let target = browser_goal_directive
-            .lock()
-            .ok()
-            .and_then(|state| state.targets.get(session_id).cloned());
-        let Some(target) = target else {
-            return send_command(writer, AgentCommand::OverlayFinishResult { text: Some("No verified target is available. Reopen this step to highlight the current page first.".into()) });
-        };
-        let kind = if action == "do-it-fill" {
-            "fill"
-        } else {
-            "click"
-        };
-        if kind == "fill" && value.unwrap_or_default().is_empty() {
-            return send_command(
-                writer,
-                AgentCommand::OverlayFinishResult {
-                    text: Some("Enter text before confirming a type action.".into()),
-                },
-            );
-        }
-        if let Some(reason) = blocked_browser_action(kind, &target, &step.instruction) {
-            return send_command(
-                writer,
-                AgentCommand::OverlayFinishResult {
-                    text: Some(format!(
-                        "This one's yours — MICE highlights it but won't act: {reason}"
-                    )),
-                },
-            );
-        }
-        native_bridge_send(
-            browser_goal_directive,
-            &serde_json::json!({"type":"browser.act", "sessionId":session_id, "action":kind, "selector":target.selector, "value":value}),
-        );
-        println!("[MICE act] confirmed {kind} on '{}'", target.label);
         return send_command(
             writer,
             AgentCommand::OverlayFinishResult {
-                text: Some(format!(
-                    "Action sent: {kind} {}. Check the page, then choose Next when ready.",
-                    target.label
-                )),
+                text: Some("Goal Guide only highlights and explains. Use `mice autopilot --engine axi <goal>` for individually confirmed browser actions.".into()),
             },
         );
     }
@@ -3858,41 +4691,27 @@ fn explain_hover(
             text: "Explaining control…".into(),
         },
     )?;
-    let mut response = String::new();
+    let mut stream = OverlayStream::new(writer);
     let result = if selected.locality == mice_providers::Locality::Local {
         stream_ollama(selected.id, &request.instruction, Some(&context), |chunk| {
-            response.push_str(chunk);
-            send_command(
-                writer,
-                AgentCommand::OverlayAppendResult {
-                    chunk: chunk.into(),
-                },
-            )
+            stream.push(chunk)
         })
     } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
         stream_groq(selected.id, &request.instruction, Some(&context), |chunk| {
-            response.push_str(chunk);
-            send_command(
-                writer,
-                AgentCommand::OverlayAppendResult {
-                    chunk: chunk.into(),
-                },
-            )
+            stream.push(chunk)
         })
     } else {
         stream_openai(selected.id, &request.instruction, Some(&context), |chunk| {
-            response.push_str(chunk);
-            send_command(
-                writer,
-                AgentCommand::OverlayAppendResult {
-                    chunk: chunk.into(),
-                },
-            )
+            stream.push(chunk)
         })
     };
     match result {
-        Ok(()) => send_command(writer, AgentCommand::OverlayFinishResult { text: None }),
+        Ok(()) => {
+            stream.finish()?;
+            send_command(writer, AgentCommand::OverlayFinishResult { text: None })
+        }
         Err(error) => {
+            let _ = stream.finish();
             let _ = send_command(
                 writer,
                 AgentCommand::OverlayFinishResult {
@@ -3915,12 +4734,21 @@ struct AgentSession {
 fn start_agent(
     gesture: &mice_core::GestureConfig,
 ) -> Result<AgentSession, Box<dyn std::error::Error>> {
-    start_agent_with_mode(gesture, false)
+    spawn_agent(gesture, false, false)
 }
 
-fn start_agent_with_mode(
+/// A display-only agent for one-shot commands: it never creates an event tap,
+/// so it needs no Input Monitoring grant and observes no input.
+fn start_agent_overlay_only(
+    gesture: &mice_core::GestureConfig,
+) -> Result<AgentSession, Box<dyn std::error::Error>> {
+    spawn_agent(gesture, false, true)
+}
+
+fn spawn_agent(
     gesture: &mice_core::GestureConfig,
     autopilot_active: bool,
+    overlay_only: bool,
 ) -> Result<AgentSession, Box<dyn std::error::Error>> {
     let agent = agent_path()?;
     if !agent.exists() {
@@ -3941,10 +4769,12 @@ fn start_agent_with_mode(
             &gesture.infographic_selection_trigger,
         )
         .env("MICE_GOAL_TRIGGER", &gesture.goal_trigger)
+        .env("MICE_SMART_COPY_TRIGGER", &gesture.smart_copy_trigger)
         .env(
             "MICE_AUTOPILOT_ACTIVE",
             if autopilot_active { "1" } else { "0" },
         )
+        .env("MICE_OVERLAY_ONLY", if overlay_only { "1" } else { "0" })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Agent stdout is reserved for length-prefixed JSON-RPC. AppKit may log
@@ -3979,9 +4809,19 @@ fn agent_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Ok(PathBuf::from(path));
     }
 
+    // A packaged install (MICE.app/Contents/MacOS) ships the agent beside the
+    // CLI binary, so upgrades replace both together and never mix versions.
+    if let Ok(executable) = env::current_exe()
+        && let Some(sibling) = executable
+            .parent()
+            .map(|directory| directory.join("mice-mac-agent"))
+        && sibling.exists()
+    {
+        return Ok(sibling);
+    }
+
     // Cargo compiles this source inside `crates/mice-cli`; use that stable
-    // workspace location instead of the caller's current directory. Packaging
-    // can supply its agent location through MICE_MAC_AGENT_PATH later.
+    // workspace location instead of the caller's current directory.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest_dir
         .parent()
@@ -4423,7 +5263,9 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let selected = route(&request)?.model;
-    let mut agent = start_agent(&config.gesture)?;
+    // A one-shot ask only displays a result; the lightweight agent mode needs
+    // no Input Monitoring grant and observes no input.
+    let mut agent = start_agent_overlay_only(&config.gesture)?;
     send_command(
         &mut agent.stdin,
         AgentCommand::OverlayShow {
@@ -4431,7 +5273,6 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     println!("[{}]", selected.id);
-    let mut response = String::new();
     if action == Action::Image {
         let result = generate_and_present_image(&mut agent.stdin, &request.instruction);
         return match result {
@@ -4450,69 +5291,43 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
     }
+    let mut stream = OverlayStream::echoing(&mut agent.stdin);
     let result = if selected.locality == mice_providers::Locality::Local {
         stream_ollama(
             selected.id,
             &request.instruction,
             text.as_deref(),
-            |chunk| {
-                print!("{chunk}");
-                let _ = std::io::stdout().flush();
-                response.push_str(chunk);
-                send_command(
-                    &mut agent.stdin,
-                    AgentCommand::OverlayAppendResult {
-                        chunk: chunk.into(),
-                    },
-                )
-            },
+            |chunk| stream.push(chunk),
         )
     } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
         stream_groq(
             selected.id,
             &request.instruction,
             text.as_deref(),
-            |chunk| {
-                print!("{chunk}");
-                let _ = std::io::stdout().flush();
-                response.push_str(chunk);
-                send_command(
-                    &mut agent.stdin,
-                    AgentCommand::OverlayAppendResult {
-                        chunk: chunk.into(),
-                    },
-                )
-            },
+            |chunk| stream.push(chunk),
         )
     } else {
         stream_openai(
             selected.id,
             &request.instruction,
             text.as_deref(),
-            |chunk| {
-                print!("{chunk}");
-                let _ = std::io::stdout().flush();
-                response.push_str(chunk);
-                send_command(
-                    &mut agent.stdin,
-                    AgentCommand::OverlayAppendResult {
-                        chunk: chunk.into(),
-                    },
-                )
-            },
+            |chunk| stream.push(chunk),
         )
     };
     match result {
         Ok(()) => {
+            let response = stream.finish()?;
             if !response.is_empty() {
                 send_command(&mut agent.stdin, clipboard_command(&response))?;
             }
             send_command(
                 &mut agent.stdin,
                 AgentCommand::OverlayFinishResult { text: None },
-            )
+            )?;
+            hold_one_shot_overlay(agent)
         }
         Err(error) => {
+            let _ = stream.finish();
             let _ = send_command(
                 &mut agent.stdin,
                 AgentCommand::OverlayFinishResult {
@@ -4522,6 +5337,266 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
             Err(error)
         }
     }
+}
+
+/// Answer a question about the user's own screen (M12 extended to native
+/// apps). The capture happens only for this explicit command, is flashed on
+/// screen by the agent, and is never persisted. `local_only` sends only the
+/// on-device OCR text to the local model; the image itself reaches a cloud
+/// model only when the privacy mode allows cloud work.
+fn see() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    let mut arguments = env::args().skip(2).collect::<Vec<_>>();
+    let scope = if arguments.first().map(String::as_str) == Some("--display") {
+        arguments.remove(0);
+        mice_ipc::ScreenCaptureScope::DisplayUnderMouse
+    } else {
+        mice_ipc::ScreenCaptureScope::FrontWindow
+    };
+    let question = arguments.join(" ");
+    if question.is_empty() {
+        return Err("Usage: mice see [--display] <question about your screen>".into());
+    }
+    let agent = start_agent_overlay_only(&config.gesture)?;
+    if !agent.capabilities.screen_capture {
+        return Err(
+            "Screen Recording permission is not granted; enable it for this terminal in System Settings > Privacy & Security, then retry."
+                .into(),
+        );
+    }
+    let AgentSession {
+        mut child,
+        mut stdin,
+        reader,
+        platform,
+        capabilities,
+    } = agent;
+    send_command(
+        &mut stdin,
+        AgentCommand::OverlayShow {
+            text: "Capturing your screen…".into(),
+        },
+    )?;
+    let session_id = format!(
+        "see-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    send_command(
+        &mut stdin,
+        AgentCommand::ScreenCapture {
+            session_id: session_id.clone(),
+            scope,
+        },
+    )?;
+    let (captured, reader) = match wait_for_screen_capture(reader, &session_id) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = send_command(
+                &mut stdin,
+                AgentCommand::OverlayFinishResult {
+                    text: Some(error.to_string()),
+                },
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let mut agent = AgentSession {
+        child,
+        stdin,
+        reader,
+        platform,
+        capabilities,
+    };
+    if let Some(error) = captured.capture_error.as_deref() {
+        let _ = send_command(
+            &mut agent.stdin,
+            AgentCommand::OverlayFinishResult {
+                text: Some(error.into()),
+            },
+        );
+        return Err(error.into());
+    }
+    let source = match (
+        captured.app_name.as_deref(),
+        captured.window_title.as_deref(),
+    ) {
+        (Some(app), Some(title)) => format!("{app} — {title}"),
+        (Some(app), None) => app.to_owned(),
+        _ => "the captured display".to_owned(),
+    };
+    println!("[MICE see] captured {source} (not stored)");
+    let ocr_text = captured.ocr_text.unwrap_or_default();
+
+    let cloud_vision_allowed = config.privacy_mode != PrivacyMode::LocalOnly
+        && env::var_os("OPENAI_API_KEY").is_some()
+        && captured.png_base64.is_some();
+    if cloud_vision_allowed {
+        let model = mice_providers::model_descriptor(&config.cloud_model)
+            .filter(|descriptor| descriptor.vision)
+            .map_or("gpt-5.6-sol", |descriptor| descriptor.id);
+        println!("[{model} vision]");
+        send_command(
+            &mut agent.stdin,
+            AgentCommand::OverlayUpdate {
+                text: format!("Looking at {source} with {model}…"),
+            },
+        )?;
+        let api_key = env::var("OPENAI_API_KEY")?;
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            captured.png_base64.unwrap_or_default()
+        );
+        let payload = mice_providers::openai_vision_answer_payload(
+            model,
+            &question,
+            &bounded_for_model(&ocr_text, 4_000),
+            &data_url,
+        )
+        .to_string();
+        let response = post_provider_json(
+            "OpenAI vision",
+            "https://api.openai.com/v1/responses",
+            &api_key,
+            &payload,
+        )?;
+        let answer = response["output"]
+            .as_array()
+            .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
+            .and_then(|content| content.iter().find_map(|part| part["text"].as_str()))
+            .map(str::to_owned)
+            .ok_or("OpenAI vision returned no text answer.")?;
+        println!("{answer}");
+        send_command(&mut agent.stdin, clipboard_command(&answer))?;
+        send_command(
+            &mut agent.stdin,
+            AgentCommand::OverlayFinishResult { text: Some(answer) },
+        )?;
+        return hold_one_shot_overlay(agent);
+    }
+
+    // The local lane: only the on-device OCR text goes to the local model.
+    // The captured pixels never leave this machine.
+    if ocr_text.trim().is_empty() {
+        let message = if config.privacy_mode == PrivacyMode::LocalOnly {
+            "The capture contains no readable text, and local-only mode never sends the image to a cloud model."
+        } else {
+            "The capture contains no readable text, and no OPENAI_API_KEY is set for the vision lane."
+        };
+        let _ = send_command(
+            &mut agent.stdin,
+            AgentCommand::OverlayFinishResult {
+                text: Some(message.into()),
+            },
+        );
+        return Err(message.into());
+    }
+    if config.privacy_mode != PrivacyMode::LocalOnly {
+        println!(
+            "(no OPENAI_API_KEY; answering from on-device OCR text with {})",
+            config.local_model
+        );
+    }
+    send_command(
+        &mut agent.stdin,
+        AgentCommand::OverlayUpdate {
+            text: format!("Reading {source} with {} (local)…", config.local_model),
+        },
+    )?;
+    let instruction = format!(
+        "Answer the question using only the OCR text extracted from the user's own screen. Be concrete and concise; if the answer is not in the text, say so plainly.\n\nQuestion: {question}"
+    );
+    let mut stream = OverlayStream::echoing(&mut agent.stdin);
+    stream_ollama(
+        &config.local_model,
+        &instruction,
+        Some(&bounded_for_model(&ocr_text, 12_000)),
+        |chunk| stream.push(chunk),
+    )?;
+    let answer = stream.finish()?;
+    println!();
+    if !answer.is_empty() {
+        send_command(&mut agent.stdin, clipboard_command(&answer))?;
+    }
+    send_command(
+        &mut agent.stdin,
+        AgentCommand::OverlayFinishResult { text: None },
+    )?;
+    hold_one_shot_overlay(agent)
+}
+
+const SCREEN_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Wait for the one explicit native capture without allowing a stalled
+/// ScreenCaptureKit/Vision operation to hold the CLI or overlay forever. The
+/// caller kills the one-shot agent on timeout, which closes its IPC pipe too.
+fn wait_for_screen_capture(
+    reader: BufReader<std::process::ChildStdout>,
+    session_id: &str,
+) -> Result<
+    (
+        mice_ipc::ScreenCaptured,
+        BufReader<std::process::ChildStdout>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let wanted = session_id.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = reader;
+        loop {
+            let result =
+                (|| -> Result<Option<mice_ipc::ScreenCaptured>, Box<dyn std::error::Error>> {
+                    let message: mice_ipc::RpcNotification = read_frame(&mut reader)?;
+                    if message.method != "screen.captured" {
+                        return Ok(None);
+                    }
+                    let captured: mice_ipc::ScreenCaptured =
+                        serde_json::from_value(message.params)?;
+                    Ok((captured.session_id == wanted).then_some(captured))
+                })();
+            match result {
+                Ok(Some(captured)) => {
+                    let _ = sender.send(Ok((captured, reader)));
+                    return;
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+    receiver
+        .recv_timeout(SCREEN_CAPTURE_TIMEOUT)
+        .map_err(|_| {
+            format!(
+                "Screen capture timed out after {} seconds; MICE stopped the capture safely.",
+                SCREEN_CAPTURE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(Into::into)
+}
+
+/// Keep a one-shot overlay on screen until the person dismisses it; dropping
+/// the agent immediately would close the panel before it could be read.
+fn hold_one_shot_overlay(mut agent: AgentSession) -> Result<(), Box<dyn std::error::Error>> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    println!();
+    print!("(overlay shown — press Enter to close it) ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let _ = send_command(&mut agent.stdin, AgentCommand::OverlayDismiss);
+    Ok(())
 }
 
 fn parse_action(value: &str) -> Result<Action, Box<dyn std::error::Error>> {
@@ -4551,7 +5626,10 @@ fn action_for_interactive_instruction(instruction: &str) -> Action {
 }
 
 fn clipboard_command(text: &str) -> AgentCommand {
-    let contents = clipboard_contents(text);
+    clipboard_set_command(clipboard_contents(text))
+}
+
+fn clipboard_set_command(contents: mice_core::ClipboardContents) -> AgentCommand {
     AgentCommand::ClipboardSet {
         contents: mice_ipc::ClipboardContents {
             text: contents.text,
@@ -4659,18 +5737,67 @@ fn is_generic_hover_label(value: &str) -> bool {
     )
 }
 
-fn append_overlay_chunk(
-    writer: &mut ChildStdin,
-    response: &mut String,
-    chunk: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    response.push_str(chunk);
-    send_command(
-        writer,
-        AgentCommand::OverlayAppendResult {
-            chunk: chunk.into(),
-        },
-    )
+/// Streams model output to the overlay in coalesced batches. One IPC frame
+/// per token can outrun the agent's stdin pipe, and the resulting blocking
+/// write stalls the provider stream itself; batching to ~512 bytes or 80 ms
+/// keeps the overlay live while bounding the frame rate.
+struct OverlayStream<'a> {
+    writer: &'a mut ChildStdin,
+    response: String,
+    pending: String,
+    last_flush: Instant,
+    echo_to_terminal: bool,
+}
+
+impl<'a> OverlayStream<'a> {
+    const FLUSH_BYTES: usize = 512;
+    const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+
+    fn new(writer: &'a mut ChildStdin) -> Self {
+        Self {
+            writer,
+            response: String::new(),
+            pending: String::new(),
+            last_flush: Instant::now(),
+            echo_to_terminal: false,
+        }
+    }
+
+    fn echoing(writer: &'a mut ChildStdin) -> Self {
+        Self {
+            echo_to_terminal: true,
+            ..Self::new(writer)
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if self.echo_to_terminal {
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
+        }
+        self.response.push_str(chunk);
+        self.pending.push_str(chunk);
+        if self.pending.len() >= Self::FLUSH_BYTES
+            || self.last_flush.elapsed() >= Self::FLUSH_INTERVAL
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.pending.is_empty() {
+            let chunk = std::mem::take(&mut self.pending);
+            send_command(self.writer, AgentCommand::OverlayAppendResult { chunk })?;
+        }
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String, Box<dyn std::error::Error>> {
+        self.flush()?;
+        Ok(self.response)
+    }
 }
 
 fn bounded_for_model(value: &str, maximum_characters: usize) -> String {
@@ -4695,27 +5822,13 @@ fn stream_openai(
     let api_key =
         env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for cloud requests")?;
     let payload = mice_providers::openai_responses_payload(model, instruction, text).to_string();
-    let mut child = Command::new("curl")
-        .args([
-            "--no-buffer",
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.openai.com/v1/responses",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout = child.stdout.take().ok_or("OpenAI stdout was unavailable")?;
-    for line in BufReader::new(stdout).lines() {
+    let response = post_provider_request(
+        "OpenAI Responses API",
+        "https://api.openai.com/v1/responses",
+        &api_key,
+        &payload,
+    )?;
+    for line in BufReader::new(response.into_reader()).lines() {
         let line = line?;
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
@@ -4730,14 +5843,6 @@ fn stream_openai(
             on_chunk(delta)?;
         }
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "OpenAI Responses API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
     Ok(())
 }
 
@@ -4745,30 +5850,12 @@ fn generate_openai_image(prompt: &str) -> Result<String, Box<dyn std::error::Err
     let api_key = env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY is required for image generation")?;
     let payload = mice_providers::openai_image_generation_payload(prompt).to_string();
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.openai.com/v1/images/generations",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "OpenAI Images API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let response = post_provider_json(
+        "OpenAI Images API",
+        "https://api.openai.com/v1/images/generations",
+        &api_key,
+        &payload,
+    )?;
     response["data"][0]["b64_json"]
         .as_str()
         .map(str::to_owned)
@@ -4816,27 +5903,13 @@ fn stream_groq(
     })
     .to_string();
 
-    let mut child = Command::new("curl")
-        .args([
-            "--no-buffer",
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--request",
-            "POST",
-            "https://api.groq.com/openai/v1/chat/completions",
-            "--header",
-            "Content-Type: application/json",
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-            "--data",
-            &payload,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout = child.stdout.take().ok_or("Groq stdout was unavailable")?;
-    for line in BufReader::new(stdout).lines() {
+    let response = post_provider_request(
+        "Groq API",
+        "https://api.groq.com/openai/v1/chat/completions",
+        &api_key,
+        &payload,
+    )?;
+    for line in BufReader::new(response.into_reader()).lines() {
         let line = line?;
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
@@ -4855,14 +5928,6 @@ fn stream_groq(
         {
             on_chunk(content)?;
         }
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "Groq API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
     }
     Ok(())
 }
@@ -4897,6 +5962,81 @@ mod hover_tests {
         assert!(validate_tool_action_budget(MAX_TOOL_ACTIONS).is_ok());
         assert!(validate_tool_action_budget(0).is_err());
         assert!(validate_tool_action_budget(MAX_TOOL_ACTIONS + 1).is_err());
+    }
+
+    #[test]
+    fn axi_routing_is_local_first_and_cloud_is_explicitly_mode_controlled() {
+        // Lane routing consults the live quota reading unless this override is
+        // set; a machine near its quota would otherwise bias the cheap-cloud
+        // lane off and make this test's expectations depend on system state.
+        unsafe { env::set_var("MICE_QUOTA_PERCENT", "10") };
+        let mut config = mice_core::Config {
+            machine_profile: mice_core::MachineProfile::Standard,
+            privacy_mode: PrivacyMode::CloudAllowed,
+            ..mice_core::Config::default()
+        };
+        assert_eq!(axi_model_lane(&config, true).unwrap(), ExecutionLane::Local);
+
+        // A configured standard profile without a usable Ollama/tool model
+        // takes the explicit cloud-fallback path instead of failing on turn 1.
+        assert_eq!(
+            axi_model_lane(&config, false).unwrap(),
+            ExecutionLane::CheapCloud
+        );
+
+        config.machine_profile = mice_core::MachineProfile::Light;
+        assert_eq!(
+            axi_model_lane(&config, true).unwrap(),
+            ExecutionLane::CheapCloud,
+            "a light profile must not silently select the local tool loop"
+        );
+
+        config.privacy_mode = PrivacyMode::LocalOnly;
+        assert!(axi_model_lane(&config, true).is_err());
+
+        config.privacy_mode = PrivacyMode::CloudOnly;
+        assert_eq!(
+            axi_model_lane(&config, false).unwrap(),
+            ExecutionLane::CheapCloud
+        );
+    }
+
+    #[test]
+    fn axi_failure_classification_allows_one_safe_stale_retry_and_pauses_other_failures() {
+        assert!(is_axi_stale_error(&"STALE_REF g2:button7"));
+        assert!(is_axi_stale_error(
+            &"Target g2:button7 is not in the current AXI snapshot"
+        ));
+        assert!(!is_axi_stale_error(
+            &"Could not run npx: Chrome remote debugging port is unavailable"
+        ));
+    }
+
+    #[test]
+    fn each_completed_axi_action_gets_its_own_one_time_stale_retry() {
+        let mut first_action = AxiActionRecovery::default();
+        assert!(first_action.retry_stale_once());
+        assert!(!first_action.retry_stale_once());
+
+        let mut second_action = AxiActionRecovery::default();
+        assert!(second_action.retry_stale_once());
+        assert!(!second_action.retry_stale_once());
+
+        // The same rule applies at the action-budget boundary: the sixth
+        // proposed action is allowed to replan once before dispatch.
+        let mut final_action = AxiActionRecovery::default();
+        assert!(final_action.retry_stale_once());
+    }
+
+    #[test]
+    fn provider_endpoints_remain_https_only() {
+        for endpoint in [
+            "https://api.openai.com/v1/responses",
+            "https://api.openai.com/v1/images/generations",
+            "https://api.groq.com/openai/v1/chat/completions",
+        ] {
+            assert!(endpoint.starts_with("https://"));
+        }
     }
 
     #[test]
@@ -4998,17 +6138,14 @@ mod hover_tests {
     #[test]
     fn safety_blocklist_refuses_sensitive_browser_actions() {
         let password = BrowserTarget {
-            selector: "#password".into(),
             label: "Password".into(),
             role: "textbox".into(),
         };
         let payment = BrowserTarget {
-            selector: "#pay".into(),
             label: "Confirm payment".into(),
             role: "button".into(),
         };
         let normal = BrowserTarget {
-            selector: "#continue".into(),
             label: "Continue".into(),
             role: "button".into(),
         };

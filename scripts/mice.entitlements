@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- MICE runs under the hardened runtime with no extra entitlements.
+         Accessibility, Screen Recording, and Input Monitoring are TCC grants
+         the user makes in System Settings, not entitlements. -->
+</dict>
+</plist>
