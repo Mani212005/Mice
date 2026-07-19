@@ -23,13 +23,16 @@ models, or user configuration belong in this repository.
 | M1 IPC spine and cloud flow | Complete. |
 | M2 actions, clipboard, local lane, settings | Implemented; manual image/paste acceptance deferred. |
 | M3 hover and browser guide-me | Functionally accepted; visual highlight polish deferred. |
-| M4 packaging and Linux preparation | Started; Linux handshake scaffold exists. Apple refinement is the active priority. |
+| M4 packaging and Linux preparation | macOS packaging pipeline complete (`scripts/package-macos.sh`: app bundle, ad-hoc or Developer-ID signing, credential-gated notarization, DMG/zip). Linux handshake scaffold exists; desktop implementation deferred. |
 | M5 selection actions (summarize / infographic gestures) | Implemented; manual acceptance remains. |
 | M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. |
-| M11 Guide-me that acts | Complete in the M12 companion flow: native transport, verified actions, and double-enforced sensitive-control blocklist. |
+| M11 Guide-me that acts | Superseded for mutation: Goal Guide is highlight/explain-only; AXI is the sole confirmed browser-action path. |
 | M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
 | M13/M15 execution manager | Implemented: deterministic CLI registry, local tool loop, MCP delegation surface, shared memory/artifact cache, workflow macros, capability advertisement, and savings ledger. |
-| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | In progress; Phases 1, 2a, 3 (local MCP server), and M7 file-scale summarization are complete. |
+| M14 AXI browser guide | Review-first implementation: AXI observes, proposes one action with target context, re-observes after confirmation, validates the current UID, then acts. Controls without trusted form metadata deliberately hand off; form enrichment/live coverage remains. |
+| Product polish (interactive UI, selection intelligence, MCP, M7–M10) | Phases 1, 2a, 3 (local MCP server), M7 file-scale summarization, M8 smart copy, M9 `mice tidy`, and M10 `mice file` are complete; manual acceptance for M8–M10 remains. |
+| M16 MCP client (Phase 4) | Implemented: user-granted stdio servers, scrubbed environment, timeouts, `mice mcp list/call`, overlay Fetch Links; imported tools are text-only and cannot reach mutation surfaces. |
+| Native vision & platform hardening | Implemented: `mice see` window/display capture with OCR/vision privacy routing, multi-display fixes, overlay-only one-shot mode, Input Monitoring status, stream backpressure, Unicode RTF, config warnings, long-result trimming. |
 
 ## Current capabilities
 
@@ -74,6 +77,102 @@ models, or user configuration belong in this repository.
   answer in the configured provider/privacy lane. It is never shown, copied,
   or pasted unless the user presses **Go Deeper**; one background job at a time
   prevents local-model contention when selections change quickly.
+- **M8 smart copy:** after a normal Cmd-C, **Control+Option+C** (configurable
+  `smart_copy_trigger`, settings row included) asks MICE to enrich the copied
+  content. The agent reads the pasteboard once — never continuously — and
+  sends a typed `clipboard.captured` notification. Copied HTML tables and
+  plain Markdown tables rebuild deterministically, with no model call, into
+  TSV plain text (real grids in Numbers/Sheets), a semantic HTML table, and a
+  Markdown RTF form. Column-like text and other rich text fall back to the
+  configured local model only — clipboard content never routes to a cloud
+  provider regardless of privacy mode. The IPC payload and rewritten clipboard
+  are frame-bounded: an over-limit capture reports a typed error without
+  disconnecting MICE, and an over-limit result leaves the original clipboard
+  intact. Local model work is split only at lossless semantic boundaries and
+  must preserve every visible token in order before a rewrite is accepted.
+  Tables expand `colspan`/`rowspan` into a rectangular grid; an existing PNG
+  remains independent and is never interpreted. If a copy contains TIFF,
+  file URLs, custom formats, multiple pasteboard items, or a PNG too large to
+  preserve, MICE declines enrichment rather than clearing any representation.
+  Rich-text cleanup preserves and verifies link destinations. Supported
+  triggers are explicitly validated as `ctrl+alt+c` or `ctrl+alt+x`. A linked
+  HTML table is deliberately left untouched until MICE can preserve its anchor
+  destinations in every generated table representation.
+- **M9 `mice tidy`:** a privacy-first folder organizer, dry-run by default.
+  The metadata scan uses no model: a bounded walk (2,000 files, depth 6,
+  symlinks never followed, hidden/system directories skipped),
+  size-then-SHA-256 duplicate sets (with a 512 MiB aggregate hashing budget), and Spotlight last-used dates only for
+  files whose filesystem timestamps already look stale. It prints the
+  headline report ("N files; M unopened >6 months; K duplicate sets") and the
+  proposed keep/move/trash actions. `--apply` opens a review screen where
+  trash suggestions start as *keep* — a file is trashed only when its row is
+  individually switched to trash — and a final confirmation applies the run.
+  A bounded local-model labeling pass (≤25 files, ≤2 KB each, skipped with
+  `--no-label` or when Ollama is down) annotates the review list; file
+  contents never reach a cloud provider in any privacy mode, enforced in
+  code. Deletes only ever move files to the Trash, nothing is overwritten,
+  the undo log is preflighted before a rename, and every applied rename is
+  persisted under a lock (or immediately rolled back if that write fails).
+  `mice tidy --undo` reverses the last run (unrevertable entries are kept for
+  a later retry). Moves reserve the destination with an atomic hard link
+  before removing the source, so neither a collision nor a TOCTOU race can
+  replace an existing file; cross-volume moves fail safely.
+- **M10 `mice file`:** smart filing into registered roots.
+  `mice file --add-root ~/github` indexes a root's visible subfolders (two
+  levels, bounded) with cached one-line local-model descriptions from a
+  README excerpt or entry listing when Ollama is available. `mice file
+  <path>` ranks the top three destinations — deterministic name-token scoring
+  always, with the local model reordering a bounded shortlist by candidate
+  number only (validated; a model can never introduce its own path) — then
+  asks the user to pick and confirm before one safe, never-overwriting move
+  that is recorded in the shared tidy undo log. The selected destination is
+  revalidated as a real directory within a registered root immediately before
+  moving. The source must be a regular non-symlink file, and concurrent root
+  registrations use a stale-recoverable index lock.
+- **Native vision (`mice see`):** `mice see [--display] "<question>"` answers
+  a question about the user's own screen. The default captures only the
+  frontmost eligible window; no eligible window is a refusal, never an
+  implicit display capture. `--display` explicitly captures the display under
+  the mouse via ScreenCaptureKit with correct
+  Cocoa↔CG multi-display coordinate mapping, flashes a cyan frame over
+  exactly what it captured, refuses credential/password-manager apps by
+  bundle ID, and never persists a capture. `local_only` sends only on-device
+  OCR text to the local model — pixels never leave the machine; cloud modes
+  send one bounded PNG to OpenAI vision when a key is present and fall back
+  to the local OCR lane otherwise. The typed `screen.capture`/`screen.captured`
+  IPC reports refusals as data instead of breaking the stream, and a
+  20-second capture deadline stops a hung one-shot agent safely.
+- **M16 MCP client:** `[[mcp.servers]]` entries with `enabled = true` are the
+  only external MCP servers MICE will spawn. Servers run with a scrubbed
+  environment (PATH/HOME/LANG/TMPDIR only — provider keys can never leak),
+  line-delimited JSON-RPC over stdio, a hard per-request read/write timeout,
+  64 KiB pre-parse line limit, and kill-on-drop. `mice mcp list` discovers tools; `mice mcp call` invokes one
+  explicitly. When a granted server exists, results offer a **Fetch Links**
+  button that queries the first search-style tool with a bounded prefix of
+  the selection. Imported tools surface only as sanitized, bounded text:
+  they have no route into MICE's browser bridge, tool registry, clipboard,
+  or any mutation surface, and links are rendered, never followed.
+- **Platform hardening:** `mice status` reports Input Monitoring alongside
+  the other capabilities. One-shot commands (`mice ask`, `mice see`) use an
+  overlay-only agent mode that creates no event tap — no Input Monitoring
+  grant needed, no input observed — and hold the result panel open until
+  dismissed. Region capture follows the mouse to the correct display.
+  Overlay streaming is coalesced (~512 B / 80 ms batches) so a fast provider
+  can no longer stall behind the agent's stdin pipe; very long results keep
+  a bounded live tail in the panel with the full text still on the
+  clipboard. RTF output escapes non-ASCII as UTF-16 `\uN?` units so accents
+  and emoji survive rich-text pastes. `mice start`/`mice doctor` print
+  non-fatal config warnings (unknown models, unsupported triggers,
+  out-of-range timings, malformed MCP entries).
+- **Packaging:** `scripts/package-macos.sh` builds release binaries, wraps
+  them in `MICE.app` (agent beside the CLI; the CLI prefers its sibling
+  agent so upgrades never mix versions), ad-hoc signs for local use, and
+  produces a checksummed zip and DMG. Developer-ID signing (hardened
+  runtime + entitlements) and notarization activate automatically when
+  `MICE_SIGNING_IDENTITY` / `MICE_NOTARY_PROFILE` are set; a notary profile
+  specifically requires a named `Developer ID Application:` identity, so an
+  ad-hoc/development-signed bundle is never submitted. User state lives
+  in `~/Library/Application Support/MICE` and survives app replacement.
 - **Phase 3 local MCP server:** `mice mcp-server` provides stdio JSON-RPC MCP
   tools for `summarize_text`, `summarize_file`, `explain_code`, `define_word`,
   and `quick_answer`. These use only the configured local Ollama model; MICE
@@ -81,19 +180,37 @@ models, or user configuration belong in this repository.
   M7's structural chunk-and-reduce flow.
 - **Execution manager (M13/M15, v8 multipliers):** `mice tools` exposes a
   deterministic-first registry for Git, repository search, GitHub (`gh-axi`
-  with `gh` fallback), Chrome AXI, and quota inspection. Results have a
-  bounded return contract with an artifact reference; read-only results cache
-  by tool arguments plus repository state. `mice do` runs bounded local tool
+  with `gh` fallback), Chrome AXI, and quota inspection. Repository-state
+  results have a bounded return contract with an `artifact:<key>` reference;
+  live browser, quota, and remote results deliberately have no persistent
+  reference. Read-only repository results cache by tool arguments plus
+  repository state only inside Git worktrees; non-Git directories never reuse
+  a repository artifact or workflow macro. Git fingerprints skip symlinks and
+  special files and bound untracked-file reads. `mice do` runs bounded local tool
   loops on capable machines, while `mice mcp-server` exposes `run_tool`,
   `delegate_task`, `git_summary`, `repo_grep`, `memory_note`, `memory_query`,
   and `team_status` to every MCP-compatible harness. The shared file-backed
   memory store records bi-temporal events, derived facts/digests, artifacts,
   macro workflows, overlap warnings, and the `mice savings` ledger. Tool
-  subprocesses receive a scrubbed environment without provider API keys.
-- **M13 safety/cache repair (2026-07-18):** raw browser mutations are no
-  longer exposed to MCP or the local tool loop; they fail closed until a
-  fresh-snapshot, target-validation, per-action-confirmation executor is
-  available. Browser snapshots, quota, and remote GitHub results are never
+  subprocesses receive a scrubbed environment without provider API keys and,
+  on timeout, their process group is killed without waiting forever for a
+  descendant-held output pipe.
+- **M13/M14 safety (2026-07-18):** raw browser mutations remain unavailable
+  to MCP and generic tool loops. `mice autopilot --engine axi <goal>` is the
+  only supported mutation path; the legacy extension engine is retired. AXI
+  observes through AXI, shows one proposed action with the target's current
+  label/context,
+  requires a human confirmation, re-observes, validates the exact current UID,
+  and rejects a changed target context before invoking that one action. AXI
+  fills additionally require a trusted safe input type in the current snapshot;
+  opaque, password/code/OTP/payment, submit/confirm, sign-in, transfer,
+  file-return, untrusted-form buttons, and unknown-form Enter actions fail
+  closed. The legacy native-bridge start message and Goal Guide's former
+  **Do it** action fail closed with an AXI handoff, so an old extension cannot
+  bypass those checks. A generic button without trusted form context also
+  hands off pending AXI form-enrichment coverage. A stale target gets one safe re-observe/replan attempt;
+  a repeat or Chrome loss pauses with the last safe history rather than acting.
+  Browser snapshots, quota, and remote GitHub results are never
   persisted in the artifact cache; only repository-fingerprinted read-only
   results can cache, and those artifacts retain only bounded distilled text
   and token metadata—not raw captures or output. Artifact/macro names use
@@ -126,11 +243,23 @@ models, or user configuration belong in this repository.
 
 - Resolved: Go Deeper now uses the bounded M7 selection route; `mice stop`
   cleanly requests shutdown through the owner-only bridge socket.
-- Open: cloud-provider requests still put API keys in `curl` arguments. The
-  planned curl-to-`ureq` migration must move authorization into HTTP headers.
+- Resolved: all OpenAI and Groq provider paths now use in-process `ureq`
+  requests. Authorization stays in HTTP headers rather than `curl` arguments,
+  so provider API keys are not visible through process listings.
 - Open: Phase 4 will add explicitly granted external MCP clients (such as web
   search). AXI command-line tools remain separate, opt-in integrations so they
   cannot bypass MICE's browser-consent and sensitive-control safeguards.
+- Resolved: deterministic tool subprocesses have a 45-second kill timeout;
+  `repo.grep` inserts `--` before its pattern and permits only relative paths
+  within the current repository. Cache and macro keys include the canonical
+  repository path and content-sensitive worktree fingerprint, so dirty edits
+  and different repositories cannot reuse each other's result. Stale shared
+  memory locks are reclaimed after two minutes and malformed/torn JSONL lines
+  are skipped during recovery.
+- Resolved: local AXI tool-loop selection verifies both a reachable Ollama
+  server and the configured installed model through `/api/tags`; quota routing
+  reads quota-axi JSON (or explicit `MICE_QUOTA_PERCENT`) once per five-minute
+  window when available.
 
 ## Product polish — Phase 1 (interactive overlay)
 
@@ -266,22 +395,18 @@ models, or user configuration belong in this repository.
 
 ## Active backlog
 
-0. M8 smart clipboard observer in `plan/mice_planv3_files_smartcopy_agents.md`;
-   refine Guide follow-on UX and browser highlight presentation from real-world
-   feedback.
-1. Extend the M12 browser-only screenshot path to native-app ScreenCaptureKit
-   vision and add multi-viewport spreadsheet reading.
-2. Remove API keys from curl argument lists, preferably by moving provider HTTP
-   calls to a Rust client.
-3. Add input-monitoring status, correct multi-display capture, and a
-   lightweight/overlay-only mode for one-shot commands.
-4. Address prompt/agent backpressure, stream error-body reporting, Unicode RTF,
-   settings validation, and long-result overlay presentation.
-5. Add a non-persistent native clipboard observer after user Cmd-C, then build
-   the confirmation-gated task-planning interface.
-6. Package/sign/notarize the macOS release when a Developer ID is available;
-   defer PipeWire/portal/AT-SPI/libei implementation until Apple refinement is
-   complete.
+0. Refine Guide follow-on UX and browser highlight presentation from
+   real-world feedback; later, the M10 follow-on Finder-selection filing
+   gesture (AX/osascript) so filing works without the terminal.
+1. Multi-viewport spreadsheet reading on top of the new `mice see` native
+   capture; overlay link rows as tappable elements (Fetch Links currently
+   renders links as text).
+2. Build the confirmation-gated task-planning interface (the non-persistent
+   post-Cmd-C clipboard capture landed with M8 smart copy).
+3. Run the signed/notarized packaging path once a Developer ID is available
+   (`MICE_SIGNING_IDENTITY` / `MICE_NOTARY_PROFILE` on
+   `scripts/package-macos.sh`); defer PipeWire/portal/AT-SPI/libei
+   implementation until Apple refinement is complete.
 
 ## Manual acceptance still useful
 
@@ -293,6 +418,33 @@ models, or user configuration belong in this repository.
   confirm the summary appears and replaces the clipboard only after completion.
   Select a table and press Control+Option+I; confirm the PNG infographic opens
   and is on the clipboard. Test the empty-selection hint too.
+- M8: copy a styled table from a Chrome page, press Control+Option+C, paste
+  into Numbers/Google Sheets (expect a real grid via TSV) and into Notes
+  (expect a clean table via HTML). Include a merged-cell table to confirm its
+  rectangular geometry is preserved. Copy plain prose and confirm the "left
+  as copied" notice with the clipboard untouched; stop Ollama and confirm a
+  tabular-text enrichment fails without altering the clipboard. Copy a very
+  large document and confirm MICE reports the safe size limit without losing
+  its connection or changing the original clipboard.
+- `mice see`: with two displays, run `mice see --display "what is on screen?"`
+  on each display and confirm the cyan flash frames the correct one; run
+  `mice see` over a password manager window and confirm the refusal; in
+  `local_only`, confirm the answer cites OCR text and no network vision call
+  is made.
+- M16: grant a real web-search MCP server, select text, press Fetch Links,
+  and confirm links render as plain text without being opened; verify `ps e`
+  on the server process shows no provider API keys.
+- Packaging: install `dist/MICE.app` on a second Mac, grant permissions to
+  the app, and verify gestures work and an app-bundle replacement keeps
+  config, undo log, and filing index.
+- M9: run `mice tidy` on a disposable folder seeded with old and duplicate
+  files; verify the dry-run report, that `--apply`'s review screen requires
+  individually switching a row to trash, that applied files land in category
+  folders and `~/.Trash`, and that `mice tidy --undo` restores everything.
+- M10: register two project roots, file a PDF and a code file, verify the
+  top-3 proposals are sane (with Ollama running, descriptions and ranking use
+  the local model; without it, name matching), and that `mice tidy --undo`
+  restores a filed move.
 - M6a: press Control+Option+Space, enter a harmless goal, revise the generated
   plan once, then accept it. Confirm no click, keystroke, or browser action is
   performed by MICE.

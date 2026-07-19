@@ -32,8 +32,8 @@ Done:
   auto-detection routes a single word / short phrase to a dictionary-style
   answer on the same summarize gesture.
 
-Not built (this plan): Phase 4 (MICE MCP client),
-Phase 5 (M8–M10), and the curl→ureq migration. Phase 2b and the bounded Go
+Not built (this plan): Phase 4 (MICE MCP client) and
+Phase 5 (M8–M10). The curl→ureq migration, Phase 2b, and the bounded Go
 Deeper / `mice stop` review fixes are complete.
 
 ## Review findings to fold in
@@ -43,10 +43,10 @@ Deeper / `mice stop` review fixes are complete.
    `Action::Explain` on the full cached text. It now reuses
    `route_selection_summary` and local chunk-map-reduce, preserving the Go
    Deeper prompt for the final response.
-2. **API keys still passed on the curl argv.** 9 `Command::new("curl")` sites in
-   `mice-cli/src/main.rs` put `Authorization: Bearer <key>` in argv (visible via
-   `ps`). The `ureq` dep from M7 makes the fix cheap — see the cross-cutting
-   task.
+2. **Resolved — API keys no longer ride on argv.** All OpenAI and Groq provider
+   paths now use in-process `ureq` requests with explicit Rustls TLS and root
+   certificates. Authorization is an HTTP header, so it is absent from process
+   listings and the runtime no longer depends on `curl`.
 3. **Resolved — `mice stop`.** The subcommand connects to the owner-only bridge
    socket, sends a shutdown control frame, waits for acknowledgement, and lets
    the daemon close its native-agent IPC cleanly.

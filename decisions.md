@@ -250,6 +250,202 @@ captures.
   native child receives closed IPC and exits with it. No process-name or PID
   kill is used.
 
+## M8 — smart copy (explicit gesture, enrich after native Cmd-C)
+
+- Smart copy never intercepts selection, dragging, or Cmd-C itself. The user
+  copies normally, then presses an explicit gesture (`smart_copy_trigger`,
+  default Ctrl+Option+C); only then does the agent read the pasteboard once
+  and send a typed `clipboard.captured` notification. There is no persistent
+  pasteboard observer.
+- Enrichment is deterministic first. Clipboard HTML containing a `<table>` —
+  or plain text that is already a Markdown table — is rebuilt without any
+  model into three representations: TSV as the plain-text flavor (spreadsheets
+  paste it as a real grid), a semantic HTML table, and a Markdown RTF form.
+  The extractor is a small quote-aware scanner in `mice-core` rather than an
+  HTML-parser dependency; source apps write well-formed table markup even when
+  the surrounding document is noisy.
+- The model fallback (column-like text → Markdown table; other rich text →
+  clean Markdown) always uses the configured local model, regardless of the
+  privacy mode. Clipboard content is sensitive and never goes to a cloud
+  provider; a future explicit opt-in may relax this, not a default.
+- The pasteboard is rewritten only after a fully successful enrichment. A
+  model failure, an unusable model response, or content with nothing to enrich
+  leaves the clipboard exactly as the user's Cmd-C wrote it and says so in the
+  overlay.
+- Reliability hardening: clipboard notifications and writes are checked against
+  the shared 16 MiB IPC frame budget before sending. A capture that cannot fit
+  sends a typed `captureError` notification instead of breaking the agent/core
+  connection. Oversized rich-text cleanup is chunked only on semantic source
+  boundaries, never truncated; every model chunk and the joined result must
+  retain the source's visible words in the same order. Unsupported smart-copy
+  triggers are rejected on config load/save rather than silently doing nothing.
+- Representation policy: deterministic table rebuilds expand HTML
+  `colspan`/`rowspan` into explicit blank covered cells so TSV stays
+  rectangular. MICE preserves an already-present PNG alongside rebuilt text
+  but does not reinterpret or relabel image bytes. RTF-only and image-only
+  copies are left untouched; standard generated RTF is used only after a
+  successful table rebuild.
+- Further safety repair: Smart Copy declines any pasteboard containing
+  unsupported representations or multiple items; it never clears a clipboard
+  it cannot fully restore. Link destinations are kept in the compact HTML sent
+  to the local model and verified in its Markdown result. Table spans accept
+  exact `colspan`/`rowspan` attributes only and have strict row, column, and
+  span caps.
+- Browser automation is AXI-only. The old extension engine is no longer
+  selectable from `mice autopilot`; every action is confirmed individually
+  with target context, then re-observed and rejected if that context changed.
+  Unknown-form buttons fail closed, even when their label is neutral (such as
+  “Next”), because they may submit a sensitive enclosing form.
+
+## M9 `mice tidy` / M10 `mice file` — local file agents
+
+- Both features are propose-then-confirm and dry-run by default. `mice tidy`
+  changes nothing without `--apply`, and even then only through the review
+  screen plus a final confirmation. A proposed trash candidate starts as
+  *keep* in the review screen: a file reaches the Trash only when the user
+  individually switches that row to trash — that switch is the per-item
+  confirmation the product rules require. Deletes never bypass the Trash.
+- The metadata scan needs no model: a bounded walk (2,000 files, depth 6)
+  that never follows symlinks and skips hidden/system directories;
+  size-then-SHA-256 duplicate detection so most files are never read; and
+  Spotlight (`mdls`) last-used dates requested only for files whose
+  filesystem timestamps already look stale, falling back to modified time
+  when Spotlight has no answer. No new crate dependencies were added — the
+  walk is hand-rolled and hashing reuses the existing `sha2`.
+- The labeling and description passes are hard-wired to the local Ollama
+  lane in code, not configuration: they call the local streaming client
+  directly and no routing function, so file contents cannot reach a cloud
+  provider in any privacy mode. Both passes are bounded (25 labels, 30
+  descriptions per run, ~2 KB read per text file) and skipped gracefully
+  when `ollama_model_ready` fails.
+- Every applied rename is persisted to the shared undo manifest
+  (`~/Library/Application Support/MICE/tidy-log.json`, atomic writes) before
+  the run continues, so a crash mid-run still leaves a fully reversible log.
+  `mice tidy --undo` reverses the latest run in strict LIFO order; an entry
+  it cannot safely revert (missing file, occupied original path) is reported
+  and kept in the log for a later retry rather than guessed at. Destinations
+  are never overwritten — collisions get a ` (mice-N)` suffix — and
+  cross-volume moves fail with a clear message instead of a copy-delete.
+- `mice file` ranks destinations from a cached index of registered roots.
+  Deterministic name-token scoring always runs; the local model, when
+  available, only reorders a bounded shortlist and may answer solely with
+  candidate numbers that are validated against the list — a model can never
+  introduce a path of its own. The chosen move is confirmed, then recorded
+  in the same undo log as tidy.
+- The AXI lane-routing test now pins `MICE_QUOTA_PERCENT`: it previously
+  consulted the machine's live quota reading, so a machine near its quota
+  made the suite fail (and could touch the network from a test).
+- M9/M10 hardening: applied filesystem actions preflight the undo log and
+  serialize each read-modify-write with a stale-recoverable lock. If a log
+  write nevertheless fails after a rename, MICE immediately rolls that rename
+  back and reports the outcome. Scans stop traversing at the file cap rather
+  than merely ceasing collection. Tidy rejects symlinked category destinations;
+  filing re-canonicalizes the selected directory and requires it to remain
+  within a currently registered root. `mice tidy --undo` rejects unrelated
+  flags or a folder argument, and model reranking is padded with deterministic
+  candidates so the chooser receives up to three options.
+
+## Safety follow-up — browser and filesystem hardening
+
+- Browser mutation has one authoritative route: `mice autopilot --engine axi`.
+  The extension-era `autopilot.start` bridge request and Goal Guide's old
+  **Do it** controls now fail closed and direct people to AXI. Goal Guide
+  remains useful for planning and verified highlights, but never clicks or
+  fills a page. AXI keeps generic buttons without trusted form metadata as a
+  handoff until snapshot form enrichment and live coverage are available; it
+  is safer to omit an ordinary click than to submit an unknown enclosing form.
+- M9/M10 cannot use POSIX `rename` for a never-overwrite promise: it replaces
+  an existing target after a time-of-check/time-of-use race. Moves now reserve
+  a fresh path atomically with a hard link, then remove the source. That
+  limits moves to regular files on the same volume and makes cross-volume work
+  fail safely. Filing rejects source symlinks before canonicalization, and
+  registrations serialize index updates with a stale-recoverable lock.
+- Smart Copy must not present a table with an anchor rendered as ordinary
+  text. Until all generated table representations can preserve anchor targets,
+  a deterministic HTML table containing a link is left exactly as copied.
+- Repository artifacts/macros are never cached outside a Git worktree. Git
+  fingerprints include bounded regular-file state but skip symlinks, FIFOs,
+  and other special files. Tidy duplicate hashing has a 512 MiB aggregate I/O
+  budget. Timed-out external tools use a dedicated Unix process group and the
+  caller does not join pipe readers on the timeout path, preventing a spawned
+  descendant from turning the timeout into an indefinite stall.
+
+## Native vision (`mice see`) and platform hardening
+
+- Native capture is command-scoped, never ambient: one `screen.capture`
+  request produces one capture, the captured window/display is flashed with a
+  cyan frame so the person always sees what MICE looked at, and nothing is
+  persisted. Credential and password-manager apps are refused by bundle-ID
+  prefix before any capture happens.
+- Privacy routing is structural, not configurational: in `local_only` the
+  image never leaves the machine — only Apple-Vision OCR text goes to the
+  local model. Cloud modes send one dimension-bounded PNG to OpenAI vision
+  and fall back to the local OCR lane when no key is present.
+- Multi-display correctness is one explicit conversion (`cocoaToCG`) plus
+  display-under-point selection; the previous first-display assumption
+  produced wrong regions on any secondary display.
+- One-shot commands run an overlay-only agent (`MICE_OVERLAY_ONLY=1`) that
+  never creates an event tap: `mice ask`/`mice see` need no Input Monitoring
+  grant and observe no input. The result panel is held open until dismissed
+  instead of dying with the process.
+- Overlay streaming is coalesced (~512 bytes or 80 ms per IPC frame) because
+  per-token frames could fill the agent's stdin pipe and block the provider
+  stream behind a pipe write. Long results keep a bounded tail in the panel;
+  the clipboard still receives the full text. RTF now escapes all non-ASCII
+  as signed UTF-16 `\uN?` units (surrogate pairs for emoji).
+- Config problems that degrade one feature are warnings printed at
+  `mice start`/`mice doctor`, not load failures; only the smart-copy trigger
+  remains a hard validation because a wrong value could consume input.
+
+## M16 — external MCP client (Phase 4)
+
+- Grants are explicit and doubly gated: a server must appear in
+  `[[mcp.servers]]` *and* set `enabled = true`. MICE never discovers,
+  auto-connects, or auto-sends content; `mice mcp call` and the Fetch Links
+  button are both direct user invocations, and Fetch Links sends only a
+  bounded prefix of the already-selected text.
+- Server processes get a scrubbed environment (PATH/HOME/LANG/TMPDIR only),
+  line-delimited JSON-RPC over stdio, a hard 20-second per-request timeout,
+  and kill-on-drop. A silent or crashed server degrades to one clear error.
+- Imported tools are deliberately capability-poor inside MICE: their output
+  is sanitized (control sequences stripped), bounded, and rendered as text.
+  There is no code path from an MCP result to the browser bridge, the tool
+  registry, the clipboard writer, or any other mutation surface, and links
+  are displayed, never fetched. This is the permission boundary that keeps
+  an imported tool from bypassing MICE's browser-consent and privacy rules.
+
+## Release packaging
+
+### Safety follow-up
+
+- `mice see` defaults strictly to the frontmost eligible window. If no window
+  exists it reports that fact; it never widens a window request to a display.
+  Full-display capture requires the explicit `--display` flag. The one-shot
+  capture response also has a 20-second deadline; a timeout closes the agent
+  rather than leaving its overlay resident.
+- MCP stdio is bounded at the transport boundary: each response line is
+  limited to 64 KiB before JSON parsing, tool text is appended only up to the
+  display cap, and both writes and reads share the request deadline. Imported
+  tool names and server-supplied errors are sanitized before any terminal or
+  overlay rendering.
+- Repository command stdout/stderr and Git fingerprint path lists are bounded
+  while drained. A fingerprint path list that exceeds its budget disables the
+  repository artifact/macro cache rather than risking memory pressure or a
+  stale key. A notarization profile without a Developer ID identity is a
+  configuration error, not an ad-hoc signing attempt.
+
+- `scripts/package-macos.sh` is credential-gated rather than credential-
+  dependent: without a Developer ID it produces an ad-hoc-signed
+  `MICE.app` (plus DMG/zip with SHA-256 checksums) that works locally and
+  gives TCC grants a stable bundle identity; setting
+  `MICE_SIGNING_IDENTITY`/`MICE_NOTARY_PROFILE` upgrades the same run to
+  hardened-runtime signing and `notarytool` notarization with stapling.
+- The CLI resolves its agent beside its own executable first
+  (`MICE.app/Contents/MacOS`), so an upgraded bundle can never pair a new
+  CLI with a stale agent; the workspace debug path remains the development
+  fallback. User state stays in `~/Library/Application Support/MICE`,
+  making app replacement the entire upgrade procedure.
+
 ## Linux preparation
 
 - `agent-linux/` is a Rust scaffold that sends the shared IPC initialization
