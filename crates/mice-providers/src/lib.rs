@@ -438,6 +438,26 @@ pub fn stream_ollama_chat(
     Ok(())
 }
 
+/// Verify both the local Ollama service and a named model before selecting a
+/// local tool-loop lane. A binary on PATH alone does not guarantee either.
+pub fn ollama_model_ready(endpoint: &str, model: &str) -> Result<(), OllamaError> {
+    let endpoint = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+    let response = ureq::get(&endpoint).call().map_err(ollama_request_error)?;
+    let body: serde_json::Value = serde_json::from_reader(response.into_reader())?;
+    let installed = body["models"].as_array().is_some_and(|models| {
+        models.iter().any(|entry| {
+            entry["name"].as_str() == Some(model) || entry["model"].as_str() == Some(model)
+        })
+    });
+    if installed {
+        Ok(())
+    } else {
+        Err(OllamaError::Service(format!(
+            "Ollama is running but model `{model}` is not installed"
+        )))
+    }
+}
+
 /// Strict structured output for the M6a planning/review flow. Plans are
 /// advisory: the schema only permits textual instructions and a sensitivity
 /// marker, never executable actions or selectors.
@@ -549,6 +569,27 @@ pub fn agent_loop_payload_with_image_and_persona(
                 "value":{"type":["string","null"]}, "done_summary":{"type":["string","null"]}, "question":{"type":["string","null"]}
             }
         }}}
+    })
+}
+
+/// A one-shot "answer a question about this screen" vision request. The OCR
+/// text rides along so the model can quote exact strings the image renders
+/// small; the caller bounds both before building the payload.
+pub fn openai_vision_answer_payload(
+    model: &str,
+    question: &str,
+    ocr_text: &str,
+    image_data_url: &str,
+) -> serde_json::Value {
+    let text = format!(
+        "Answer the question about the attached screenshot of the user's own screen. Be concrete and concise; if the answer is not visible, say so plainly.\n\nQuestion: {question}\n\nText extracted from the screenshot by OCR (may contain errors):\n{ocr_text}"
+    );
+    serde_json::json!({
+        "model": model,
+        "input": [{"role":"user", "content":[
+            {"type":"input_text", "text":text},
+            {"type":"input_image", "image_url":image_data_url}
+        ]}]
     })
 }
 
@@ -667,6 +708,23 @@ mod tests {
         sync::mpsc,
         thread,
     };
+
+    #[test]
+    fn vision_answer_payload_carries_question_ocr_and_image() {
+        let payload = openai_vision_answer_payload(
+            "gpt-5.6-sol",
+            "What error is shown?",
+            "Error: disk full",
+            "data:image/png;base64,QUJD",
+        );
+        assert_eq!(payload["model"], "gpt-5.6-sol");
+        let content = payload["input"][0]["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("What error is shown?"));
+        assert!(text.contains("Error: disk full"));
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,QUJD");
+    }
 
     fn summary_request(privacy_mode: PrivacyMode, preferences: ModelPreferences) -> RouteRequest {
         RouteRequest {

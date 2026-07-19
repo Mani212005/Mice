@@ -24,6 +24,7 @@ fn initialize_request() -> RpcRequest {
                 overlay: false,
                 local_ocr: false,
                 browser_bridge: false,
+                input_monitoring: false,
             },
         })
         .expect("initialize parameters are serializable"),

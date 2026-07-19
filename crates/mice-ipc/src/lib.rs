@@ -17,6 +17,10 @@ pub struct Capabilities {
     pub overlay: bool,
     pub local_ocr: bool,
     pub browser_bridge: bool,
+    /// Whether the OS has granted global input observation. Defaults so older
+    /// agents that predate this field still deserialize.
+    #[serde(default)]
+    pub input_monitoring: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +90,58 @@ pub enum SelectionSource {
 pub enum SelectionAction {
     Summarize,
     Image,
+}
+
+/// Pasteboard representations captured after the user's own Cmd-C, sent only
+/// when the explicit smart-copy gesture fires. The agent never observes the
+/// pasteboard continuously; the core decides whether anything can be enriched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardCaptured {
+    pub session_id: String,
+    /// The platform could not safely send the captured representations inside
+    /// the bounded IPC frame. The core must leave the pasteboard untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtf_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub png_base64: Option<String>,
+}
+
+/// The scope of a native screen capture the core may request. The agent owns
+/// the actual capture, permissions, and display/window resolution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenCaptureScope {
+    /// The frontmost window of the frontmost application.
+    FrontWindow,
+    /// The entire display currently under the mouse pointer.
+    DisplayUnderMouse,
+}
+
+/// A native screen capture produced only in response to an explicit
+/// `screen.capture` request. Captures are never persisted; `capture_error`
+/// reports a refusal (missing permission, sensitive app) without breaking
+/// the IPC stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenCaptured {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub png_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
 }
 
 /// Text submitted by a native prompt owned by the platform agent. The core
@@ -200,6 +256,13 @@ pub enum AgentCommand {
         sensitive: bool,
         browser_capable: bool,
     },
+    /// Ask the platform agent for one native screen capture. The agent
+    /// answers with a `screen.captured` notification carrying the same
+    /// session ID (or a typed refusal).
+    ScreenCapture {
+        session_id: String,
+        scope: ScreenCaptureScope,
+    },
     ClipboardSet {
         contents: ClipboardContents,
     },
@@ -266,6 +329,10 @@ impl AgentCommand {
                     "sensitive": sensitive,
                     "browserCapable": browser_capable,
                 }),
+            ),
+            Self::ScreenCapture { session_id, scope } => (
+                "screen.capture",
+                json!({ "sessionId": session_id, "scope": scope }),
             ),
             Self::ClipboardSet { contents } => (
                 "clipboard.set",
@@ -455,6 +522,80 @@ mod tests {
                 "html": "<p>A selected paragraph</p>",
                 "source": "clipboard",
                 "action": "summarize"
+            })
+        );
+    }
+
+    #[test]
+    fn clipboard_captured_omits_absent_representations() {
+        let captured = ClipboardCaptured {
+            session_id: "smart-copy-1".into(),
+            capture_error: None,
+            text: Some("Name\tScore".into()),
+            html: Some("<table><tr><td>Name</td></tr></table>".into()),
+            rtf_base64: None,
+            png_base64: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&captured).unwrap(),
+            json!({
+                "sessionId": "smart-copy-1",
+                "text": "Name\tScore",
+                "html": "<table><tr><td>Name</td></tr></table>",
+            })
+        );
+        let round_trip: ClipboardCaptured =
+            serde_json::from_value(json!({"sessionId": "smart-copy-1"})).unwrap();
+        assert_eq!(round_trip.session_id, "smart-copy-1");
+        assert!(round_trip.text.is_none());
+    }
+
+    #[test]
+    fn clipboard_captured_reports_a_bounded_capture_failure() {
+        let captured = ClipboardCaptured {
+            session_id: "smart-copy-1".into(),
+            capture_error: Some("Copied content is too large".into()),
+            text: None,
+            html: None,
+            rtf_base64: None,
+            png_base64: None,
+        };
+        assert_eq!(
+            serde_json::to_value(captured).unwrap(),
+            json!({
+                "sessionId": "smart-copy-1",
+                "captureError": "Copied content is too large"
+            })
+        );
+    }
+
+    #[test]
+    fn screen_capture_request_and_reply_share_a_stable_wire_shape() {
+        let command = AgentCommand::ScreenCapture {
+            session_id: "see-1".into(),
+            scope: ScreenCaptureScope::FrontWindow,
+        };
+        assert_eq!(
+            command.notification(),
+            RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: "screen.capture".into(),
+                params: json!({ "sessionId": "see-1", "scope": "front_window" }),
+            }
+        );
+        let refusal = ScreenCaptured {
+            session_id: "see-1".into(),
+            capture_error: Some("Screen Recording permission is not granted".into()),
+            png_base64: None,
+            ocr_text: None,
+            app_name: None,
+            window_title: None,
+        };
+        assert_eq!(
+            serde_json::to_value(refusal).unwrap(),
+            json!({
+                "sessionId": "see-1",
+                "captureError": "Screen Recording permission is not granted",
             })
         );
     }

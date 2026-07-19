@@ -17,3 +17,7 @@ ratatui = "0.29"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# `tls` is required because all OpenAI and Groq endpoints are HTTPS. Keep the
+# feature explicit so a future default-feature change cannot silently disable
+# cloud provider transport.
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
