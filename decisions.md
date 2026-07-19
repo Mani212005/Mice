@@ -433,6 +433,11 @@ captures.
   repository artifact/macro cache rather than risking memory pressure or a
   stale key. A notarization profile without a Developer ID identity is a
   configuration error, not an ad-hoc signing attempt.
+- Finder filing stays user-driven: `mice file --finder` asks the macOS agent
+  once for the frontmost Finder selection, requires exactly one file, and then
+  uses the existing ranked and confirmed file flow. External MCP URLs are
+  tappable only as standard AppKit links after the user explicitly requested
+  Fetch Links; MICE does not open them itself.
 
 - `scripts/package-macos.sh` is credential-gated rather than credential-
   dependent: without a Developer ID it produces an ad-hoc-signed
@@ -445,6 +450,92 @@ captures.
   CLI with a stale agent; the workspace debug path remains the development
   fallback. User state stays in `~/Library/Application Support/MICE`,
   making app replacement the entire upgrade procedure.
+
+## Review fixes — Finder filing, links, MCP cleanup (2026-07-19)
+
+- `mice file --finder` no longer requires Finder to be frontmost: invoking
+  the CLI necessarily makes the terminal frontmost, so that check rejected
+  every normal use. Finder must merely be running; the confirmation prompt
+  still names the exact file before anything moves.
+- Finder paths are forwarded exactly as reported. Trailing whitespace and
+  newlines are legal in macOS filenames, and trimming them could silently
+  move a *different* existing file with the trimmed name.
+- The Finder capture has a 60-second deadline (generous because the first
+  use can show an Automation permission prompt) and the CLI enforces the
+  exactly-one-path protocol — a malformed or incompatible agent response is
+  an error, never a guess at the first path.
+- Result-panel links are attributed by MICE itself and restricted to
+  HTTP/HTTPS. Foundation's automatic detection was wrong for this surface:
+  it also linkifies file:, mailto:, and custom URL schemes.
+- MCP servers run as their own process-group leaders and cleanup kills the
+  group, so a shell-spawned descendant can no longer outlive the timeout,
+  hold the stdio pipes, and keep the detached reader thread blocked. A
+  regression test spawns a real grandchild and asserts it dies.
+
+## M14 — safe form-context enrichment for generic buttons
+
+- A button with no `form=` metadata of its own now inherits a page-level
+  form context derived read-only from the same AXI snapshot: if the snapshot
+  shows at least one enumerable input and every visible input is positively
+  safe (trusted text-like type, no sensitive/code-like label, no sensitive
+  autocomplete), a neutral button click is allowed after the usual
+  confirmation. A page with any sensitive-looking input blocks with a
+  sensitive-page reason, and a snapshot with no visible inputs proves
+  nothing and stays fail-closed exactly as before. Sensitive click labels
+  (pay, sign in, submit…) remain blocked regardless of page context.
+
+## Native vision — `--sheet` multi-viewport reading
+
+- `mice see --sheet` captures the front window at native pixel resolution
+  and runs OCR viewport by viewport in reading order, because Vision cannot
+  recognize spreadsheet-sized text on a 1600-px downscale. The
+  full-resolution image exists only for the on-device OCR pass; every image
+  that leaves the agent remains the same bounded downscale as before, in
+  every privacy mode.
+
+## Highlight visual language
+
+- Guide highlights and the capture flash share one panel style: rounded
+  cyan frame with a soft glow, a dark pill label floating above the target,
+  and a gentle opacity pulse for guide targets (the capture flash does not
+  pulse — it reports, it does not ask for attention). One constructor owns
+  the styling so future refinements apply everywhere at once.
+
+## Developer-ID readiness
+
+- `scripts/package-macos.sh --check` reports exactly which signing and
+  notarization prerequisites this machine still lacks (Developer ID
+  Application identity, notarytool keychain profile, tooling) with the
+  one-time commands to create them; the packaging run itself now validates a
+  notarized bundle with `stapler validate` and the same `spctl --assess`
+  Gatekeeper check a recipient's Mac performs. On this machine the check
+  currently reports the identity and notary profile as missing; ad-hoc
+  packaging remains fully functional.
+
+## Review fixes — capture targeting, snapshot trust, cleanup ordering (2026-07-19)
+
+- Front-window capture excludes MICE and the shell/terminal chain that
+  launched the command: the CLI walks its ancestor pids and passes them to
+  the agent, which picks the frontmost eligible window owned by none of
+  them. Running `mice see` from a terminal necessarily makes that terminal
+  frontmost, so "capture the frontmost app" was structurally wrong for a
+  CLI-invoked feature. The sensitive-app refusal now applies to the window
+  actually chosen, not the frontmost app.
+- AXI snapshot lines mix trusted structure with a page-controlled accessible
+  label. Structural facts — uids and `type`/`autocomplete`/`form`
+  attributes — are now parsed only from the unquoted remainder of the line,
+  so a label like `"Continue type=search uid=g9:fake"` can neither pass the
+  trusted-input check nor register a target. An unterminated quote discards
+  the rest of the line, which is the fail-closed direction.
+- `--sheet` capture applies one uniform fit factor under the pixel cap, so a
+  wide-or-tall window is scaled, never stretched: aspect distortion had
+  quietly undermined the native-resolution OCR claim.
+- MCP `terminate()` (the write-timeout path) now performs the same
+  process-group kill as drop — before the leader is reaped, since a reaped
+  pid may be recycled — and drop no longer re-kills a terminated server. The
+  descendant-cleanup test checks liveness with `ps -p`, because `kill -0`
+  reports EPERM for a live-but-unsignalable process and the old test could
+  pass while the guarantee failed.
 
 ## Linux preparation
 

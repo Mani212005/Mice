@@ -22,6 +22,53 @@ DIST="$ROOT/dist"
 APP="$DIST/MICE.app"
 BUNDLE_ID="com.mice.app"
 
+# `--check`: report exactly what the Developer-ID signing/notarization path
+# still needs on this machine, without building anything.
+if [[ "${1:-}" == "--check" ]]; then
+    status=0
+    echo "==> Developer-ID packaging prerequisites"
+    identities="$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' || true)"
+    if [[ -n "$identities" ]]; then
+        echo "ok   Developer ID Application identity present:"
+        echo "$identities" | sed 's/^/       /'
+    else
+        echo "MISSING  No 'Developer ID Application' identity in the keychain."
+        echo "         Enroll at developer.apple.com, create a Developer ID Application"
+        echo "         certificate in Xcode (Settings > Accounts > Manage Certificates)"
+        echo "         or the developer portal, and install it in the login keychain."
+        status=1
+    fi
+    if xcrun --find notarytool >/dev/null 2>&1; then
+        echo "ok   notarytool available: $(xcrun --find notarytool)"
+    else
+        echo "MISSING  notarytool (install Xcode or Command Line Tools)."
+        status=1
+    fi
+    if xcrun --find stapler >/dev/null 2>&1; then
+        echo "ok   stapler available: $(xcrun --find stapler)"
+    else
+        echo "MISSING  stapler (install Xcode or Command Line Tools)."
+        status=1
+    fi
+    profile="${MICE_NOTARY_PROFILE:-mice-notary}"
+    if xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1; then
+        echo "ok   notarytool keychain profile '$profile' works."
+    else
+        echo "MISSING  notarytool keychain profile '$profile'."
+        echo "         Create it once with an App Store Connect API key or app-specific"
+        echo "         password:  xcrun notarytool store-credentials $profile \\"
+        echo "                      --apple-id <appleid> --team-id <TEAMID> --password <app-specific>"
+        status=1
+    fi
+    if [[ $status -eq 0 ]]; then
+        echo "All prerequisites present. Run:"
+        echo "  MICE_SIGNING_IDENTITY=\"Developer ID Application: …\" MICE_NOTARY_PROFILE=$profile scripts/package-macos.sh"
+    else
+        echo "Prerequisites missing (see above). Unsigned/ad-hoc packaging still works: scripts/package-macos.sh"
+    fi
+    exit $status
+fi
+
 echo "==> Building release binaries (v$VERSION)"
 (cd "$ROOT" && cargo build --release -p mice-cli)
 (cd "$ROOT/agent-macos" && swift build -c release)
@@ -86,6 +133,10 @@ if [[ -n "${MICE_NOTARY_PROFILE:-}" ]]; then
         --keychain-profile "$MICE_NOTARY_PROFILE" --wait
     xcrun stapler staple "$APP"
     rm -f "$DIST/MICE-notarize.zip"
+    echo "==> Validating the notarized bundle"
+    xcrun stapler validate "$APP"
+    # The Gatekeeper assessment a recipient's Mac will perform.
+    spctl --assess --type execute --verbose "$APP"
 elif [[ -n "${MICE_SIGNING_IDENTITY:-}" ]]; then
     echo "==> Skipping notarization (set MICE_NOTARY_PROFILE to enable)"
 fi

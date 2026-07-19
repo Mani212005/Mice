@@ -29,7 +29,7 @@ models, or user configuration belong in this repository.
 | M11 Guide-me that acts | Superseded for mutation: Goal Guide is highlight/explain-only; AXI is the sole confirmed browser-action path. |
 | M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
 | M13/M15 execution manager | Implemented: deterministic CLI registry, local tool loop, MCP delegation surface, shared memory/artifact cache, workflow macros, capability advertisement, and savings ledger. |
-| M14 AXI browser guide | Review-first implementation: AXI observes, proposes one action with target context, re-observes after confirmation, validates the current UID, then acts. Controls without trusted form metadata deliberately hand off; form enrichment/live coverage remains. |
+| M14 AXI browser guide | Review-first implementation: AXI observes, proposes one action with target context, re-observes after confirmation, validates the current UID, then acts. Generic buttons use safe snapshot-derived form-context enrichment: a click is allowed only when every visible input is positively safe; sensitive or unknown pages still hand off. Structural parsing (uids, type/form/autocomplete attributes) reads only the unquoted portion of each snapshot line, so page-controlled accessible labels cannot forge safe input types or targets. |
 | Product polish (interactive UI, selection intelligence, MCP, M7–M10) | Phases 1, 2a, 3 (local MCP server), M7 file-scale summarization, M8 smart copy, M9 `mice tidy`, and M10 `mice file` are complete; manual acceptance for M8–M10 remains. |
 | M16 MCP client (Phase 4) | Implemented: user-granted stdio servers, scrubbed environment, timeouts, `mice mcp list/call`, overlay Fetch Links; imported tools are text-only and cannot reach mutation surfaces. |
 | Native vision & platform hardening | Implemented: `mice see` window/display capture with OCR/vision privacy routing, multi-display fixes, overlay-only one-shot mode, Input Monitoring status, stream backpressure, Unicode RTF, config warnings, long-result trimming. |
@@ -128,11 +128,29 @@ models, or user configuration belong in this repository.
   that is recorded in the shared tidy undo log. The selected destination is
   revalidated as a real directory within a registered root immediately before
   moving. The source must be a regular non-symlink file, and concurrent root
-  registrations use a stale-recoverable index lock.
-- **Native vision (`mice see`):** `mice see [--display] "<question>"` answers
-  a question about the user's own screen. The default captures only the
-  frontmost eligible window; no eligible window is a refusal, never an
-  implicit display capture. `--display` explicitly captures the display under
+  registrations use a stale-recoverable index lock. `mice file --finder`
+  reads one explicitly selected Finder file through the macOS agent, then
+  follows the same ranking and confirmation flow; it never observes Finder
+  continuously or moves a file without confirmation. Finder does not need to
+  be frontmost (running the command necessarily makes the terminal frontmost;
+  the confirmation prompt still names the exact file). Paths are forwarded
+  exactly as Finder reports them — filenames legally ending in whitespace or
+  newlines are never trimmed into a different file. The CLI enforces the
+  exactly-one-path protocol and applies a 60-second deadline so an
+  Automation-permission prompt or stuck agent cannot hang the command.
+- **Native vision (`mice see`):** `mice see [--display|--sheet] "<question>"`
+  answers a question about the user's own screen. The default captures the
+  frontmost eligible window *excluding MICE and the shell/terminal chain that
+  launched the command* (the CLI passes its ancestor pids to the agent), so
+  the capture reads the app the person is asking about rather than the
+  terminal that is necessarily frontmost; the sensitive-app refusal applies
+  to the window actually being captured. No eligible window is a refusal,
+  never an implicit display capture. `--sheet` reads dense small text (spreadsheets):
+  the window is captured at native pixel resolution (uniformly scaled under
+  one cap, so the aspect ratio is never distorted) and OCR runs viewport by
+  viewport in reading order, while the image sent to any model remains the
+  same bounded downscale — full-resolution pixels never leave the machine.
+  `--display` explicitly captures the display under
   the mouse via ScreenCaptureKit with correct
   Cocoa↔CG multi-display coordinate mapping, flashes a cyan frame over
   exactly what it captured, refuses credential/password-manager apps by
@@ -151,7 +169,12 @@ models, or user configuration belong in this repository.
   button that queries the first search-style tool with a bounded prefix of
   the selection. Imported tools surface only as sanitized, bounded text:
   they have no route into MICE's browser bridge, tool registry, clipboard,
-  or any mutation surface, and links are rendered, never followed.
+  or any mutation surface. MICE applies link attribution itself, restricted
+  to HTTP/HTTPS URLs (automatic AppKit detection is disabled because it also
+  linkifies file:, mailto:, and custom schemes); a link opens only after the
+  person clicks it. Timeout/drop cleanup kills the server's whole process
+  group, so shell-spawned descendants cannot keep the stdio pipes and reader
+  thread alive.
 - **Platform hardening:** `mice status` reports Input Monitoring alongside
   the other capabilities. One-shot commands (`mice ask`, `mice see`) use an
   overlay-only agent mode that creates no event tap — no Input Monitoring
@@ -395,17 +418,14 @@ models, or user configuration belong in this repository.
 
 ## Active backlog
 
-0. Refine Guide follow-on UX and browser highlight presentation from
-   real-world feedback; later, the M10 follow-on Finder-selection filing
-   gesture (AX/osascript) so filing works without the terminal.
-1. Multi-viewport spreadsheet reading on top of the new `mice see` native
-   capture; overlay link rows as tappable elements (Fetch Links currently
-   renders links as text).
-2. Build the confirmation-gated task-planning interface (the non-persistent
+0. Tune the refreshed highlight visuals (pulse, pill labels) and Guide
+   follow-on UX from real-world feedback.
+1. Build the confirmation-gated task-planning interface (the non-persistent
    post-Cmd-C clipboard capture landed with M8 smart copy).
-3. Run the signed/notarized packaging path once a Developer ID is available
-   (`MICE_SIGNING_IDENTITY` / `MICE_NOTARY_PROFILE` on
-   `scripts/package-macos.sh`); defer PipeWire/portal/AT-SPI/libei
+2. Run the signed/notarized packaging path once a Developer ID is available:
+   `scripts/package-macos.sh --check` reports the exact prerequisites still
+   missing; the same script then signs, notarizes, staples, and validates
+   (`stapler validate`, `spctl --assess`). Defer PipeWire/portal/AT-SPI/libei
    implementation until Apple refinement is complete.
 
 ## Manual acceptance still useful
@@ -430,10 +450,22 @@ models, or user configuration belong in this repository.
   on each display and confirm the cyan flash frames the correct one; run
   `mice see` over a password manager window and confirm the refusal; in
   `local_only`, confirm the answer cites OCR text and no network vision call
-  is made.
+  is made. Open a dense spreadsheet and compare `mice see` with
+  `mice see --sheet "what is in column C?"` — the sheet mode should read
+  small cell text the default mode misses.
+- `mice file --finder`: select a file in Finder, switch to the terminal, and
+  confirm the command still reads the selection (Finder need not be
+  frontmost); create a file whose name ends in a space and confirm it files
+  under its exact name; deny the Automation prompt once and confirm the
+  command errors out within 60 seconds instead of hanging.
+- M14 enrichment: on a page with only a search box, confirm a neutral
+  "Next"-style button is now clickable after confirmation; on a page with a
+  code/OTP field, confirm the same button still hands off.
 - M16: grant a real web-search MCP server, select text, press Fetch Links,
-  and confirm links render as plain text without being opened; verify `ps e`
-  on the server process shows no provider API keys.
+  and confirm only http(s) URLs become clickable (a file: or mailto: string
+  stays plain text); verify `ps e` on the server process shows no provider
+  API keys, and that killing a hung server also removes its shell
+  descendants.
 - Packaging: install `dist/MICE.app` on a second Mac, grant permissions to
   the app, and verify gestures work and an app-bundle replacement keeps
   config, undo log, and filing index.
