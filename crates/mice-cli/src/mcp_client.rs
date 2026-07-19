@@ -16,6 +16,7 @@
 
 use std::{
     io::{BufReader, Read, Write},
+    os::unix::process::CommandExt,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -49,8 +50,11 @@ pub struct McpServerProcess {
 
 impl Drop for McpServerProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // `terminate` already reaped the tree; running the group kill again
+        // here would signal a freed (possibly recycled) process-group id.
+        if !self.terminated {
+            self.terminate();
+        }
     }
 }
 
@@ -73,6 +77,9 @@ impl McpServerProcess {
                     .iter()
                     .filter_map(|key| std::env::var_os(key).map(|value| (*key, value))),
             )
+            // A dedicated process group makes timeout/drop cleanup reach the
+            // whole descendant tree, not just the direct child.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -260,8 +267,19 @@ impl McpServerProcess {
         }
     }
 
+    /// End the server and everything it spawned. The child is its own
+    /// process-group leader, so signalling the negative group id (before the
+    /// leader is reaped and its pid freed) reaches shell-spawned descendants
+    /// that would otherwise keep the stdio pipes open and the detached
+    /// reader/writer threads blocked. Used by both the timeout path and drop.
     fn terminate(&mut self) {
         self.terminated = true;
+        // `--` is required: without it a negative group id parses as an
+        // option list instead of a target.
+        let _ = Command::new("/bin/kill")
+            .args(["-9", "--", &format!("-{}", self.child.id())])
+            .stderr(Stdio::null())
+            .status();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -444,6 +462,40 @@ mod tests {
             .call_tool("web_search", json!({"query": "example"}))
             .unwrap();
         assert_eq!(answer, "1. Example — https://example.com");
+    }
+
+    #[test]
+    fn timeout_cleanup_kills_the_whole_process_tree() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "mice-mcp-tree-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        // The shell spawns a background grandchild, records its pid, then
+        // goes silent so initialize times out.
+        let script = format!("sleep 30 & echo $! > '{}'; read line", pid_file.display());
+        let error =
+            McpServerProcess::spawn_with_timeout(&mock_config(script), Duration::from_millis(300))
+                .err();
+        assert!(error.is_some());
+        thread::sleep(Duration::from_millis(200));
+        let grandchild = std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        assert!(!grandchild.is_empty(), "grandchild pid was not recorded");
+        // `ps -p` succeeds only for a live process; `kill -0` would also
+        // fail with EPERM for a live process we cannot signal, which must
+        // not count as proof of death.
+        let alive = Command::new("/bin/ps")
+            .args(["-p", &grandchild])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(!alive, "grandchild process survived MCP cleanup");
+        let _ = std::fs::remove_file(&pid_file);
     }
 
     #[test]
