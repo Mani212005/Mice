@@ -153,8 +153,9 @@ models, or user configuration belong in this repository.
   `--display` explicitly captures the display under
   the mouse via ScreenCaptureKit with correct
   Cocoa↔CG multi-display coordinate mapping, flashes a cyan frame over
-  exactly what it captured, refuses credential/password-manager apps by
-  bundle ID, and never persists a capture. `local_only` sends only on-device
+  exactly what it captured, refuses a display when any visible
+  credential/password-manager window is present (not merely when that app is
+  frontmost), and never persists a capture. `local_only` sends only on-device
   OCR text to the local model — pixels never leave the machine; cloud modes
   send one bounded PNG to OpenAI vision when a key is present and fall back
   to the local OCR lane otherwise. The typed `screen.capture`/`screen.captured`
@@ -173,8 +174,8 @@ models, or user configuration belong in this repository.
   to HTTP/HTTPS URLs (automatic AppKit detection is disabled because it also
   linkifies file:, mailto:, and custom schemes); a link opens only after the
   person clicks it. Timeout/drop cleanup kills the server's whole process
-  group, so shell-spawned descendants cannot keep the stdio pipes and reader
-  thread alive.
+  group immediately on either a read or write failure, so shell-spawned
+  descendants cannot keep the stdio pipes and reader thread alive.
 - **Platform hardening:** `mice status` reports Input Monitoring alongside
   the other capabilities. One-shot commands (`mice ask`, `mice see`) use an
   overlay-only agent mode that creates no event tap — no Input Monitoring

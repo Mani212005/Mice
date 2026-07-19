@@ -537,6 +537,23 @@ captures.
   reports EPERM for a live-but-unsignalable process and the old test could
   pass while the guarantee failed.
 
+## Follow-up review fixes — explicit display privacy and retained servers (2026-07-19)
+
+- An explicit `mice see --display` capture now checks every on-screen window
+  intersecting the display before taking pixels. If any is owned by a known
+  credential/password-manager bundle, MICE refuses the whole capture; checking
+  only the terminal-frontmost application was insufficient.
+- Front-window capture also excludes known terminal hosts by bundle ID, even
+  when the invoking shell is detached from the terminal process tree. The CLI
+  passes the relevant VS Code/JetBrains host based on `TERM_PROGRAM`, so an
+  integrated terminal is excluded without trying to infer its window title.
+- AXI's quoted-label stripping treats backslash-escaped quotes as label text.
+  Page-controlled `\"` can no longer reopen the structural part of a snapshot
+  line to forge a trusted type or UID.
+- An MCP read timeout or malformed read now terminates the process group
+  immediately, not only later when the process object is dropped. This keeps
+  the server object safe even if its caller retains it after the error.
+
 ## Linux preparation
 
 - `agent-linux/` is a Rust scaffold that sends the shared IPC initialization
