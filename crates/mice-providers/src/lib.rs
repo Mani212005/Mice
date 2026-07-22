@@ -2,12 +2,35 @@
 //! behind the provider clients so the router remains deterministic and testable.
 
 use std::io::{BufRead, BufReader};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const DEFAULT_LOCAL_MODEL: &str = "gemma3:4b";
 pub const DEFAULT_CLOUD_MODEL: &str = "gpt-5.6-luna";
+/// Keep a daemon's local model resident without changing routing behavior.
+pub const OLLAMA_KEEP_ALIVE: &str = "30m";
+/// Fail quickly while establishing a connection, but never impose a total
+/// deadline on a streaming generation. A healthy local model can legitimately
+/// take longer than 45 seconds for a large summary or a goal plan; a total
+/// `ureq` timeout would cut that response off mid-stream.
+pub const OLLAMA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn ollama_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(OLLAMA_CONNECT_TIMEOUT)
+        .build()
+}
+
+/// Probes are non-streaming and must remain bounded. Keep their deadline
+/// separate from the stream agent so startup checks cannot change generation
+/// behavior.
+fn ollama_probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(OLLAMA_CONNECT_TIMEOUT)
+        .build()
+}
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -390,9 +413,30 @@ pub fn ollama_chat_payload(
     serde_json::json!({
         "model": model,
         "stream": true,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "messages": [{"role": "user", "content": content}],
         "options": {"num_ctx": num_ctx},
     })
+}
+
+/// Minimal non-streaming request for daemon startup. Failure is deliberately
+/// non-fatal because cloud-only MICE does not require a local service.
+pub fn ollama_warmup_payload(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "options": {"num_ctx": 256},
+    })
+}
+
+pub fn warm_ollama_model(endpoint: &str, model: &str) -> Result<(), OllamaError> {
+    ollama_probe_agent()
+        .post(endpoint)
+        .send_json(ollama_warmup_payload(model))
+        .map_err(ollama_request_error)?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,7 +463,8 @@ pub fn stream_ollama_chat(
     num_ctx: usize,
     mut on_chunk: impl FnMut(&str) -> Result<(), OllamaError>,
 ) -> Result<(), OllamaError> {
-    let response = ureq::post(endpoint)
+    let response = ollama_agent()
+        .post(endpoint)
         .send_json(ollama_chat_payload(model, instruction, text, num_ctx))
         .map_err(ollama_request_error)?;
     for line in BufReader::new(response.into_reader()).lines() {
@@ -442,7 +487,10 @@ pub fn stream_ollama_chat(
 /// local tool-loop lane. A binary on PATH alone does not guarantee either.
 pub fn ollama_model_ready(endpoint: &str, model: &str) -> Result<(), OllamaError> {
     let endpoint = format!("{}/api/tags", endpoint.trim_end_matches('/'));
-    let response = ureq::get(&endpoint).call().map_err(ollama_request_error)?;
+    let response = ollama_probe_agent()
+        .get(&endpoint)
+        .call()
+        .map_err(ollama_request_error)?;
     let body: serde_json::Value = serde_json::from_reader(response.into_reader())?;
     let installed = body["models"].as_array().is_some_and(|models| {
         models.iter().any(|entry| {
@@ -506,6 +554,58 @@ pub fn groq_goal_plan_payload(model: &str, goal: &str) -> serde_json::Value {
                 "content": "Return only JSON: {\"steps\":[{\"instruction\":string,\"app_hint\":string,\"sensitive\":boolean}]}. Give 3-8 practical advisory steps. MICE never clicks, types, submits forms, logs in, or handles credentials. Mark steps involving personal data, logins, payments, or account setup as sensitive."
             },
             {"role": "user", "content": format!("Create a plan for: {goal}")}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0
+    })
+}
+
+/// Strict task-graph output used by Mission Control. The model proposes only
+/// bounded metadata; the portable core validates every ID, dependency, and
+/// path before a task can be assigned or launched.
+pub fn structured_mission_plan_payload(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "input": prompt,
+        "text": {"format": {
+            "type": "json_schema",
+            "name": "mission_task_graph",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tasks"],
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 24,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["id", "title", "acceptance", "dependencies", "predicted_paths", "preferred_agent"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "title": {"type": "string"},
+                                "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                                "dependencies": {"type": "array", "items": {"type": "string"}},
+                                "predicted_paths": {"type": "array", "items": {"type": "string"}},
+                                "preferred_agent": {"type": ["string", "null"], "enum": ["codex", "claude", "antigravity", null]}
+                            }
+                        }
+                    }
+                }
+            }
+        }}
+    })
+}
+
+pub fn groq_mission_plan_payload(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Return exactly one JSON object matching the user's Mission Control task-graph contract. Never include Markdown or prose."},
+            {"role": "user", "content": prompt}
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0
@@ -869,6 +969,17 @@ mod tests {
     }
 
     #[test]
+    fn ollama_payloads_keep_the_daemon_model_warm() {
+        let chat = ollama_chat_payload("gemma3:4b", "Summarize", Some("text"), 4096);
+        assert_eq!(chat["keep_alive"], OLLAMA_KEEP_ALIVE);
+        let warmup = ollama_warmup_payload("gemma3:4b");
+        assert_eq!(warmup["model"], "gemma3:4b");
+        assert_eq!(warmup["stream"], false);
+        assert_eq!(warmup["keep_alive"], OLLAMA_KEEP_ALIVE);
+        assert_eq!(warmup["options"]["num_ctx"], 256);
+    }
+
+    #[test]
     fn ollama_http_errors_include_the_server_message() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1000,6 +1111,23 @@ mod tests {
             8
         );
         assert!(payload["input"].as_str().unwrap().contains("sensitive"));
+    }
+
+    #[test]
+    fn mission_plan_payload_is_strict_and_bounded() {
+        let payload = structured_mission_plan_payload("gpt-5.6-sol", "Make tasks");
+        assert_eq!(payload["text"]["format"]["strict"], true);
+        assert_eq!(
+            payload["text"]["format"]["schema"]["properties"]["tasks"]["maxItems"],
+            24
+        );
+        assert_eq!(
+            payload["text"]["format"]["schema"]["properties"]["tasks"]["items"]["properties"]["preferred_agent"]
+                ["enum"],
+            serde_json::json!(["codex", "claude", "antigravity", null])
+        );
+        let groq = groq_mission_plan_payload("llama-3.3-70b-versatile", "Make tasks");
+        assert_eq!(groq["response_format"]["type"], "json_object");
     }
     #[test]
     fn local_only_uses_gemma_for_vision() {
