@@ -2087,17 +2087,16 @@ private final class OverlayController: NSObject {
             guidePanel?.dismissFromGlobalEscape()
             guidePanel = nil
         }
-        // The plan-review surface is neither a palette request nor a guide
-        // panel. Its Cancel action owns the transient GoalSession cleanup in
-        // core, so Escape must send the same action before discarding the UI.
+        // The plan-review surface hides on Escape so the person can resume it
+        // later using Ctrl+Shift+Space or MICE Home. Only the explicit Cancel
+        // button action discards the session in core memory.
         if panelWasVisible,
            !paletteWasVisible,
            !guideWasVisible,
-           let reviewSession {
+           let _ = reviewSession {
             reviewSessionId = nil
             currentSessionId = nil
             clearButtons()
-            MiceMacAgent.sendOverlayAction(sessionID: reviewSession, actionID: "goal.cancel")
         }
         showHighlights([])
         homePanel?.orderOut(nil)
