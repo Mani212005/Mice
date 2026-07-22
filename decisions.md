@@ -25,6 +25,33 @@ captures.
 - Normal global input is pass-through. MICE only consumes an explicit,
   confirmed gesture.
 
+## Mission Control
+
+- Mission Control treats a Markdown file under `plan/` as the reviewable
+  source of work. It derives tasks conservatively and supports explicit,
+  deterministic `mice:` heading metadata for task IDs, paths, and
+  dependencies. The portable core rejects cycles, unsafe paths, and
+  overlapping scopes that could otherwise run in parallel.
+- The terminal UI is a review boundary: agent assignment, Git overlap risk,
+  and base-worktree cleanliness are visible before any branch, worktree, or
+  terminal is created. A red same-file overlap or a dirty base prevents launch.
+- MICE creates branches and worktrees only inside owner-only application
+  support storage. It retains operational lifecycle metadata only (task ID,
+  agent, branch, PID, and worktree path), never provider credentials, prompts,
+  agent output, captures, clipboard data, or model weights.
+- Codex, Claude Code, and Antigravity CLI (`agy`) are launched through their
+  documented command lines with their own permission policies intact. MICE
+  never supplies a permission-bypass flag. A process exit is not success:
+  the agent reports readiness from its owned worktree, and a person explicitly
+  verifies Git evidence before dependent work becomes launchable.
+- `mice mission watch` provides a live terminal view. When the resident
+  `mice start` daemon is running, lifecycle transitions are delivered over its
+  owner-only local bridge to a short native overlay; Swift renders the overlay
+  and Rust remains responsible for task state.
+- MICE MCP's `mission_status` exposes bounded task ownership, lifecycle, and
+  overlap facts to an assigned agent without revealing another agent's checkout
+  path, PID, transcript, or private configuration.
+
 ## Hover explanation
 
 - Hover context is resolved from the current Accessibility element rather than
@@ -553,6 +580,92 @@ captures.
 - An MCP read timeout or malformed read now terminates the process group
   immediately, not only later when the process object is dropped. This keeps
   the server object safe even if its caller retains it after the error.
+
+## Goal Guide panel and reviewed-plan confirmation (2026-07-20)
+
+- A generated plan is no longer accepted by leaving a modal prompt blank. The
+  result surface presents **Start guide**, **Revise**, and **Cancel** as
+  explicit actions; revision uses a focused follow-up prompt and cancellation
+  ends the session before any guide state is created.
+- `OverlayGuideStep.presentation = "panel"` is an opt-in shared IPC field.
+  Older agents retain the alert fallback, while current macOS agents use a
+  rounded non-activating panel. It keeps the foreground app usable and sends
+  only an explicit Where?/Back/Next/Quit decision to the Rust core.
+- Guide highlights use a restrained macOS-style blue → violet → pink → amber
+  gradient with rounded corners. The color draws attention, not authority:
+  MICE still only reads and highlights targets; it never clicks, types, or
+  submits from Goal Guide.
+
+## Palette and history privacy follow-up (2026-07-20)
+
+- The palette shortcut is a palette-only gesture, not a screen-capture alias.
+  Palette activation reads a selection once, after the explicit shortcut, then
+  sends only that one submitted request to the core.
+- Personal history stores an event label for selection summaries and a bounded
+  application name for `mice see`; it never records selected source text,
+  clipboard content, pixels, or a window/document title. Goal plan/session
+  data is likewise removed from the daemon as soon as the guide ends.
+- Palette requests use small byte-bounded IPC inputs and a session-bound,
+  coalesced 12,000-character output stream. Late provider output is ignored by
+  a newly opened palette rather than being attached to the wrong request.
+- `define term` is an explicit intent: its typed term wins over any selection
+  and the core uses the typed `Define` action instead of summary heuristics.
+  The Goal gesture is a daemon-only shorthand for opening the palette with
+  `plan ` already entered.
+
+## Desktop launcher, private setup, and harness integration (2026-07-20)
+
+- The macOS product installs as a self-contained `MICE.app` in the user's
+  Applications directory and exposes a `~/.local/bin/mice` launcher. Bare
+  `mice` is the friendly non-blocking entry point; `mice start` remains the
+  foreground diagnostic path so terminal troubleshooting stays available.
+- Local Only setup may start Ollama automatically. It reuses an already
+  running service and records a PID only for a server MICE itself spawned, so
+  `mice stop` cannot terminate another app's Ollama instance. Automatic model
+  download is intentionally limited to `gemma3:4b` with an 8 GiB free-space
+  guard; larger or alternate models remain explicit choices.
+- Codex and Claude Code are connected through the existing stdio
+  `mice mcp-server`, never a cloud bridge. `mice connect` is user-scoped and
+  confirmation-gated, uses each harness's own MCP command, and refuses to
+  overwrite an existing `mice` entry automatically.
+
+## Local Goal Guide reliability and plan recall (2026-07-20)
+
+- Goal Guide uses the routed local Ollama model in Local Only mode. Its parser
+  accepts a complete JSON object inside a Markdown code fence because the
+  configured `gemma3:4b` emits exactly that otherwise-valid form. A reachable
+  local model whose output remains malformed gets a small advisory starter
+  plan; a missing Ollama server or model remains an explicit error and never
+  becomes a pretend-success.
+- A typed goal and its bounded advisory plan are intentional, owner-only local
+  memory. They are stored as `goal_plan` history events, surfaced as the two
+  most recent goals in MICE Home, and fully reviewable with `mice plans`.
+  This does not relax the privacy rule for captures, clipboard data, or text
+  selections, which still are never stored as source material.
+- MICE Home can run as a display-only helper beside the resident daemon. Its
+  **Plan a goal** control therefore replays the daemon's configured Goal
+  gesture instead of sending IPC into its own unread stdout. That lets the
+  control reliably open or resume the actual plan session.
+
+## Provider credentials in macOS Keychain (2026-07-20)
+
+- Cloud keys are a user-owned operating-system secret, not configuration.
+  `mice keys set groq` and `mice keys set openai` collect visible normal-line
+  terminal input and send it to `/usr/bin/security` over stdin. Raw hidden
+  input was deliberately removed because bracketed-paste markers could become
+  part of a pasted key. No key reaches the TOML file, shell history,
+  repository, or a command argument. Runtime provider lookup
+  prefers an explicit environment override, then the login Keychain, so the
+  resident MICE app can use a saved key even when launched from Finder.
+
+## Settings must describe routing, not just configuration (2026-07-20)
+
+- `cloud_allowed` is not synonymous with “everything uses cloud”: routine
+  text, hover, and selection work stays on the configured local model, while
+  Goal Guide, browser, and image-capable work use the configured cloud lane.
+  The settings TUI now renders that active outcome alongside one-time local
+  model and provider-key availability checks, so a missing Groq key is visible
+  before a Goal Guide request fails.
 
 ## Linux preparation
 

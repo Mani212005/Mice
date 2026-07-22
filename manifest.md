@@ -25,14 +25,88 @@ models, or user configuration belong in this repository.
 | M3 hover and browser guide-me | Functionally accepted; visual highlight polish deferred. |
 | M4 packaging and Linux preparation | macOS packaging pipeline complete (`scripts/package-macos.sh`: app bundle, ad-hoc or Developer-ID signing, credential-gated notarization, DMG/zip). Linux handshake scaffold exists; desktop implementation deferred. |
 | M5 selection actions (summarize / infographic gestures) | Implemented; manual acceptance remains. |
-| M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. |
+| M6 Goal Guide (goal popup → plan → step-by-step guidance) | M6a–M6c implemented; browser transport is superseded by M11a native messaging. Plan review now requires an explicit Start guide, Revise, or Cancel decision; active steps use a non-blocking native panel. |
 | M11 Guide-me that acts | Superseded for mutation: Goal Guide is highlight/explain-only; AXI is the sole confirmed browser-action path. |
 | M12 Web Autopilot & Companion | Implemented; **parked** pending an OpenAI key for vision. See `plan/mice_m12_review.md`. |
 | M13/M15 execution manager | Implemented: deterministic CLI registry, local tool loop, MCP delegation surface, shared memory/artifact cache, workflow macros, capability advertisement, and savings ledger. |
 | M14 AXI browser guide | Review-first implementation: AXI observes, proposes one action with target context, re-observes after confirmation, validates the current UID, then acts. Generic buttons use safe snapshot-derived form-context enrichment: a click is allowed only when every visible input is positively safe; sensitive or unknown pages still hand off. Structural parsing (uids, type/form/autocomplete attributes) reads only the unquoted portion of each snapshot line, so page-controlled accessible labels cannot forge safe input types or targets. |
 | Product polish (interactive UI, selection intelligence, MCP, M7–M10) | Phases 1, 2a, 3 (local MCP server), M7 file-scale summarization, M8 smart copy, M9 `mice tidy`, and M10 `mice file` are complete; manual acceptance for M8–M10 remains. |
 | M16 MCP client (Phase 4) | Implemented: user-granted stdio servers, scrubbed environment, timeouts, `mice mcp list/call`, overlay Fetch Links; imported tools are text-only and cannot reach mutation surfaces. |
+| M17 Mission Control | Implemented: plan-to-task review TUI, owned Git worktrees, Codex/Claude Code/Antigravity (`agy`) launch lanes, bounded shared lifecycle context, live overlap scanning, explicit report/verify handoff, native completion notices, and read-only `mission_status` MCP access. |
 | Native vision & platform hardening | Implemented: `mice see` window/display capture with OCR/vision privacy routing, multi-display fixes, overlay-only one-shot mode, Input Monitoring status, stream backpressure, Unicode RTF, config warnings, long-result trimming. |
+
+### Current v9 UI and history hardening
+
+- The configured palette shortcut opens the native palette rather than screen
+  capture. It supports questions, `plan`, `summarize`, `define`, `remember`,
+  and `history`; unsupported CLI-only verbs explain their current boundary.
+- Palette input is bounded before IPC (32 KiB prompt, 256 KiB captured
+  selection), and model output is coalesced and capped at 12,000 characters.
+  Every append, finish, and Escape dismissal is session-bound; Escape reports
+  `palette.dismissed` to the core and the native panel has a 90-second
+  dead-daemon watchdog, so a stale result cannot affect a newer request or
+  leave the input disabled indefinitely.
+- Selection summaries store only the generic event label, never the selected
+  source text. `mice see` history stores a bounded app name at most, never a
+  window/document title. The history store also bounds all optional app context.
+- Empty plan revisions restore the explicit review choices; they never accept a
+  plan. Failed, completed, quit, and cancelled Goal Guide sessions remove
+  their transient plans and goals from the resident daemon, so a failed plan
+  cannot suppress later hover explanations. Escape also quits the active Guide
+  panel and clears its highlights.
+- A reviewed Goal Guide plan is resumable: changing apps or dismissing its
+  overlay only hides it. Press the Goal shortcut again, or use **Plan a goal**
+  in MICE Home, to reopen the same plan and choose Start guide, Revise, or
+  Cancel without regenerating it.
+- Goal planning works on the local Ollama lane as well as cloud providers.
+  Local fenced/embedded JSON is accepted; if a reachable local model produces
+  malformed formatting, MICE presents a bounded advisory starter plan rather
+  than leaving the Goal UI blank. An unavailable Ollama service or missing
+  model still reports a clear error instead of silently falling back.
+- Successful typed goals and their bounded advisory plans are saved only in
+  the owner-only local history store. MICE Home shows the two most recent
+  goals and `mice plans` displays their stored plans. Scheduling/reminders are
+  intentionally not implemented yet.
+- The Goal shortcut opens a fresh planning prompt when no reviewed plan is
+  waiting. In the palette, `plan <goal>` is always explicit, while unmistakable
+  multi-step tasks (for example, “go to Canva and start a design”) can enter
+  the same reviewed planning flow; ordinary questions remain questions.
+  Palette gestures are enabled only in the resident daemon, and terminal Guide
+  actions explicitly clear the target highlight.
+
+### Single-command desktop launch and local setup
+
+- A packaged `MICE.app` can now install itself into `~/Applications` with a
+  user-owned `~/.local/bin/mice` launcher. After that one-time install, bare
+  `mice` starts/reuses the background daemon from any folder and opens the
+  native MICE Home reference panel; `mice start` remains the foreground
+  diagnostic command.
+- MICE Home's **Open Palette** button forwards the configured palette gesture
+  to the resident daemon, so the short-lived Home helper never creates a
+  second request loop or leaves the Home window hidden without a palette.
+- MICE Home now uses the approved premium native layout: a glass hero with a
+  multicolor Ask MICE control, focused action cards, and a compact privacy /
+  model / shortcut panel rather than a static command reference page.
+- Cloud provider credentials can be stored once in the macOS login Keychain:
+  `mice keys set groq` or `mice keys set openai`. The one-time prompt is
+  intentionally visible for reliable terminal pasting; MICE reads the Keychain
+  only at runtime when a provider is selected, and keys are never written to
+  MICE config, history, the repository, shell startup files, or command
+  arguments.
+- `mice settings` includes an **Active routing** panel: it states whether the
+  current privacy mode sends each major feature to the local or cloud lane,
+  names the selected model/provider, and shows local-model/key availability.
+  The availability checks run only when settings opens so the TUI stays
+  responsive.
+- `mice setup` and `local_only` startup reuse a running Ollama service or
+  start one automatically. MICE auto-downloads only the default
+  `gemma3:4b`, requiring at least 8 GiB free on the Ollama model volume;
+  setup prepares this default even when routing remains cloud-allowed.
+  Alternate and heavy model pulls stay explicit. `mice stop` only terminates
+  an Ollama process recorded as MICE-owned, never a pre-existing user service.
+- `mice connect codex|claude|all` registers MICE's existing local-only MCP
+  server at user scope after one explicit confirmation; `mice integrations`
+  reports connection state and `mice disconnect …` removes only that entry.
 
 ## Current capabilities
 
@@ -252,8 +326,11 @@ models, or user configuration belong in this repository.
   review, revise, or accept a 3–8 step advisory plan. Plans flag login,
   payment, account-setup, and personal-data steps as user-only. The flow has
   no automation, screen targeting, or step advancement yet.
-- **Goal Guide (M6b):** accepting a plan opens a manual step dialog with
-  **Next**, **Back**, and **Quit**. Before each step it performs a read-only
+- **Goal Guide (M6b):** accepting a reviewed plan opens a manual, non-blocking
+  step panel with **Where?**, **Back**, **Do it**, **Next**, and **Quit**.
+  **Do it** preserves the safety boundary by explaining that Goal Guide only
+  highlights; AXI remains the confirmed browser-action path. Before each
+  step it performs a read-only
   AX label search in the focused native app and highlights a best-effort match.
   No match simply leaves the step unhighlighted; MICE never invokes the target.
 - **Goal Guide (M6c):** browser-hinted steps publish only the current guide
@@ -481,8 +558,14 @@ models, or user configuration belong in this repository.
 - M6a: press Control+Option+Space, enter a harmless goal, revise the generated
   plan once, then accept it. Confirm no click, keystroke, or browser action is
   performed by MICE.
-- M6b: after accepting, use Back and Next through the guide. Confirm a familiar
-  native button can receive a cyan best-effort highlight and that Quit ends the
+- M6a local-plan recovery: with `mice settings` set to Local Only and
+  `ollama serve` available, enter `plan go to Canva and start a design`.
+  Confirm a reviewable 3–8 step plan appears; close it with Esc, press
+  Control+Option+Space to reopen it, then run `mice plans` and confirm the
+  saved plan is listed.
+- M6b: after accepting, use Where?, Back, and Next through the guide. Confirm a
+  familiar native button can receive a rounded multicolor best-effort highlight
+  and that Quit ends the
   guide without acting on the target.
 - M12: run `mice setup-browser`, load `browser-ext` once, then run
   `mice autopilot "search Canva and open a portrait"`. Approve the goal and,
