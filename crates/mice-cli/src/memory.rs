@@ -14,6 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use mice_core::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -214,6 +215,91 @@ impl UserHistory {
 
     fn lock(&self) -> Result<MemoryLock, std::io::Error> {
         lock_at(&self.root, "MICE history")
+    }
+}
+
+/// Local store for scheduled tasks and background reminders.
+#[derive(Debug, Clone)]
+pub struct ScheduleStore {
+    root: PathBuf,
+}
+
+impl ScheduleStore {
+    pub fn at(root: PathBuf) -> Result<Self, std::io::Error> {
+        fs::create_dir_all(&root)?;
+        restrict_directory_to_user(&root)?;
+        Ok(Self { root })
+    }
+
+    pub fn default_path() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/MICE/schedule"))
+    }
+
+    pub fn add(&self, task: ScheduledTask) -> Result<(), std::io::Error> {
+        let _lock = self.lock()?;
+        let mut tasks = self.list_internal()?;
+        tasks.retain(|existing| existing.id != task.id);
+        tasks.push(task);
+        self.save(&tasks)
+    }
+
+    pub fn list(&self) -> Result<Vec<ScheduledTask>, std::io::Error> {
+        let _lock = self.lock()?;
+        self.list_internal()
+    }
+
+    fn list_internal(&self) -> Result<Vec<ScheduledTask>, std::io::Error> {
+        read_jsonl(&self.root.join("schedules.jsonl"))
+    }
+
+    pub fn cancel(&self, id: &str) -> Result<bool, std::io::Error> {
+        let _lock = self.lock()?;
+        let mut tasks = self.list_internal()?;
+        let len = tasks.len();
+        tasks.retain(|task| task.id != id);
+        if tasks.len() != len {
+            self.save(&tasks)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn due_tasks(&self, now_ts: u64) -> Result<Vec<ScheduledTask>, std::io::Error> {
+        let tasks = self.list()?;
+        Ok(tasks
+            .into_iter()
+            .filter(|task| !task.triggered && task.trigger_at <= now_ts)
+            .collect())
+    }
+
+    pub fn mark_triggered(&self, id: &str) -> Result<(), std::io::Error> {
+        let _lock = self.lock()?;
+        let mut tasks = self.list_internal()?;
+        for task in &mut tasks {
+            if task.id == id {
+                task.triggered = true;
+            }
+        }
+        self.save(&tasks)
+    }
+
+    fn save(&self, tasks: &[ScheduledTask]) -> Result<(), std::io::Error> {
+        let body = tasks
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(std::io::Error::other)?
+            .join("\n");
+        atomic_write(
+            &self.root.join("schedules.jsonl"),
+            format!("{body}\n").as_bytes(),
+        )
+    }
+
+    fn lock(&self) -> Result<MemoryLock, std::io::Error> {
+        lock_at(&self.root, "MICE schedule")
     }
 }
 
@@ -546,7 +632,7 @@ fn read_jsonl<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<Vec<T>, std::io
     Ok(events)
 }
 
-fn digest_name(value: &str) -> String {
+pub(crate) fn digest_name(value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(value.as_bytes());
     format!("{:x}", digest.finalize())
@@ -729,6 +815,37 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(store.events().unwrap().len(), 8);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schedule_store_persists_and_manages_due_tasks() {
+        use mice_core::ScheduleAction;
+        let root = std::env::temp_dir().join(format!("mice-schedule-test-{}", now()));
+        let store = ScheduleStore::at(root.clone()).unwrap();
+        let task = ScheduledTask {
+            id: "test-1".into(),
+            created_at: 100,
+            trigger_at: 200,
+            cron_expression: None,
+            action: ScheduleAction::Reminder {
+                message: "Check build".into(),
+            },
+            triggered: false,
+        };
+        store.add(task.clone()).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        assert!(store.due_tasks(150).unwrap().is_empty());
+        let due = store.due_tasks(250).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "test-1");
+
+        store.mark_triggered("test-1").unwrap();
+        assert!(store.due_tasks(250).unwrap().is_empty());
+
+        assert!(store.cancel("test-1").unwrap());
+        assert!(store.list().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }

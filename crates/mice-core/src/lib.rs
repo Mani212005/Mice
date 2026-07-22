@@ -869,6 +869,68 @@ impl Default for GoalSession {
     }
 }
 
+/// Action to perform when a scheduled task or reminder triggers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleAction {
+    Reminder { message: String },
+    ExecuteGoal { goal: String, plan: Option<String> },
+}
+
+/// A background task or reminder scheduled for execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledTask {
+    pub id: String,
+    pub created_at: u64,
+    pub trigger_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_expression: Option<String>,
+    pub action: ScheduleAction,
+    pub triggered: bool,
+}
+
+pub fn parse_schedule_time(input: &str, relative_from: u64) -> Result<u64, String> {
+    let mut input = input.trim().to_lowercase();
+    if input.is_empty() {
+        return Err("Schedule time specification cannot be empty.".into());
+    }
+    if let Some(rest) = input.strip_prefix("in ") {
+        input = rest.trim().to_owned();
+    }
+
+    let (num_str, unit) = input
+        .char_indices()
+        .find(|(_, c)| c.is_alphabetic())
+        .map_or((input.as_str(), ""), |(idx, _)| {
+            (&input[..idx], &input[idx..])
+        });
+
+    let num_str = num_str.trim();
+    if let Ok(val) = num_str.parse::<u64>() {
+        let seconds = match unit.trim() {
+            "s" | "sec" | "secs" | "second" | "seconds" => val,
+            "m" | "min" | "mins" | "minute" | "minutes" => val * 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => val * 3600,
+            "d" | "day" | "days" => val * 86400,
+            "" => {
+                if val > 1_600_000_000 {
+                    return Ok(val);
+                } else {
+                    val * 60
+                }
+            }
+            _ => return Err(format!("Unknown time unit `{unit}` in `{input}`.")),
+        };
+        return Ok(relative_from + seconds);
+    }
+
+    if input == "tomorrow" {
+        return Ok(relative_from + 86400);
+    }
+
+    Err(format!("Could not parse schedule time `{input}`."))
+}
+
 /// Deterministic command-palette interpretation. A leading verb is always an
 /// explicit user request; otherwise the entire entry is an ordinary question.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,6 +945,8 @@ pub enum PaletteIntent {
     File(String),
     Remember(String),
     History(String),
+    Schedule(String),
+    Remind(String),
 }
 
 pub fn parse_palette_intent(input: &str) -> PaletteIntent {
@@ -901,6 +965,8 @@ pub fn parse_palette_intent(input: &str) -> PaletteIntent {
         "file" => PaletteIntent::File(rest),
         "remember" => PaletteIntent::Remember(rest),
         "history" => PaletteIntent::History(rest),
+        "schedule" => PaletteIntent::Schedule(rest),
+        "remind" => PaletteIntent::Remind(rest),
         _ => PaletteIntent::Ask(full),
     }
 }
@@ -3405,5 +3471,23 @@ mod tests {
         );
         assert_eq!(MissionAgentKind::Antigravity.id(), "antigravity");
         assert!(MissionAgentKind::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn schedule_time_parsing_and_palette_intent() {
+        let base = 1_000_000;
+        assert_eq!(parse_schedule_time("10m", base).unwrap(), base + 600);
+        assert_eq!(parse_schedule_time("in 2h", base).unwrap(), base + 7200);
+        assert_eq!(parse_schedule_time("30s", base).unwrap(), base + 30);
+        assert_eq!(parse_schedule_time("tomorrow", base).unwrap(), base + 86400);
+
+        assert_eq!(
+            parse_palette_intent("schedule check build in 10m"),
+            PaletteIntent::Schedule("check build in 10m".into())
+        );
+        assert_eq!(
+            parse_palette_intent("remind me in 30m to review PR"),
+            PaletteIntent::Remind("me in 30m to review PR".into())
+        );
     }
 }
