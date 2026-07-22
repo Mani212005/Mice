@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -6,6 +7,10 @@ use std::{
 use mice_providers::{Action, CostPolicy, DEFAULT_CLOUD_MODEL, DEFAULT_LOCAL_MODEL, PrivacyMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Model-backed planners may produce a task graph, but the portable core
+/// keeps that proposal bounded before it can become a launchable mission.
+pub const MAX_MISSION_TASKS: usize = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -78,6 +83,333 @@ impl Default for Config {
             mcp: McpConfig::default(),
         }
     }
+}
+
+/// Harnesses Mission Control can reason about. An adapter is still required
+/// before any harness can be launched; this enum deliberately does not imply
+/// a shell command or permission to start a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionAgentKind {
+    Codex,
+    Claude,
+    Antigravity,
+}
+
+impl MissionAgentKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "claude" | "claude-code" | "claude_code" => Some(Self::Claude),
+            "antigravity" => Some(Self::Antigravity),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Antigravity => "Antigravity",
+        }
+    }
+}
+
+/// A probe result, not an execution grant. The controller may show these
+/// fields in a dry run but must require an explicit launch adapter later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAgentCapability {
+    pub agent: MissionAgentKind,
+    pub installed: bool,
+    pub mcp_available: bool,
+    pub launch_ready: bool,
+    pub detail: String,
+}
+
+/// Metadata-only identity for a mission. `repo_id` and `plan_fingerprint` are
+/// hashes; the plan body and user configuration are not copied into MICE's
+/// coordination state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionIdentity {
+    pub repo_id: String,
+    pub mission_id: String,
+    pub plan_fingerprint: String,
+}
+
+/// A validated work unit proposed from a repository plan. The M0 parser may
+/// populate conservative candidates from headings; later model planners must
+/// still pass this deterministic validation before a task can be assigned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTask {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub predicted_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTaskGraph {
+    #[serde(default)]
+    pub tasks: Vec<MissionTask>,
+}
+
+/// Lifecycle facts MICE can safely retain for a launched task. A process
+/// exiting is deliberately not a success state: completion must later be
+/// backed by an explicit report and verification evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTaskState {
+    Proposed,
+    Running,
+    ExitedUnreported,
+    ReportedReady,
+    VerifiedReady,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTaskRuntime {
+    pub task_id: String,
+    pub agent: MissionAgentKind,
+    pub state: MissionTaskState,
+    pub branch: String,
+    /// A worktree checkout path is operational metadata, never repository
+    /// source or an agent transcript. Mission storage itself stays outside the
+    /// Git working tree with owner-only permissions.
+    pub worktree_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
+    /// The adapter runner's bounded process exit code, when it could be
+    /// recovered. This is lifecycle evidence only; MICE never stores worker
+    /// output or transcripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Git-derived changed paths from the isolated worktree. This is bounded
+    /// operational context, not a diff or an agent transcript.
+    #[serde(default)]
+    pub observed_paths: Vec<String>,
+    /// Short, explicit coordination notes. MICE bounds and redacts these
+    /// before persistence; they are never a channel for full agent output.
+    #[serde(default)]
+    pub coordination_notes: Vec<String>,
+    /// A timestamp means MICE has verified basic Git evidence for this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<u64>,
+    pub started_at: u64,
+}
+
+/// An approved task-to-harness mapping. This is persisted with the validated
+/// graph so later lifecycle commands cannot silently re-plan a live mission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTaskAssignment {
+    pub task_id: String,
+    pub agent: MissionAgentKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionRecord {
+    pub identity: MissionIdentity,
+    pub updated_at: u64,
+    /// The graph that passed validation at the first launch boundary. Older
+    /// records deserialize to an empty graph and retain their legacy parser
+    /// fallback instead of becoming unreadable.
+    #[serde(default)]
+    pub graph: MissionTaskGraph,
+    #[serde(default)]
+    pub assignments: Vec<MissionTaskAssignment>,
+    #[serde(default)]
+    pub tasks: Vec<MissionTaskRuntime>,
+}
+
+impl MissionTaskGraph {
+    /// Ensure task proposals are complete and safe to schedule. This is
+    /// intentionally model-independent: invalid JSON from a planner must not
+    /// become a launchable mission merely because it looks plausible.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tasks.is_empty() {
+            return Err("A mission needs at least one task.".into());
+        }
+        if self.tasks.len() > MAX_MISSION_TASKS {
+            return Err(format!(
+                "A mission supports at most {MAX_MISSION_TASKS} tasks in one review."
+            ));
+        }
+        let mut task_ids = BTreeSet::new();
+        for task in &self.tasks {
+            if !is_valid_mission_id(&task.id) {
+                return Err(format!("Task ID `{}` is invalid.", task.id));
+            }
+            if !task_ids.insert(task.id.as_str()) {
+                return Err(format!("Task ID `{}` appears more than once.", task.id));
+            }
+            if task.title.trim().is_empty() || task.title.chars().count() > 160 {
+                return Err(format!(
+                    "Task `{}` needs a title of at most 160 characters.",
+                    task.id
+                ));
+            }
+            if task.acceptance.iter().all(|item| item.trim().is_empty()) {
+                return Err(format!(
+                    "Task `{}` needs at least one acceptance check.",
+                    task.id
+                ));
+            }
+            let mut dependencies = BTreeSet::new();
+            for dependency in &task.dependencies {
+                if dependency == &task.id {
+                    return Err(format!("Task `{}` cannot depend on itself.", task.id));
+                }
+                if !dependencies.insert(dependency.as_str()) {
+                    return Err(format!(
+                        "Task `{}` lists dependency `{dependency}` more than once.",
+                        task.id
+                    ));
+                }
+            }
+            for path in &task.predicted_paths {
+                if !is_safe_predicted_path(path) {
+                    return Err(format!(
+                        "Task `{}` has an unsafe predicted path `{path}`.",
+                        task.id
+                    ));
+                }
+            }
+        }
+        let known = task_ids;
+        for task in &self.tasks {
+            for dependency in &task.dependencies {
+                if !known.contains(dependency.as_str()) {
+                    return Err(format!(
+                        "Task `{}` depends on unknown task `{dependency}`.",
+                        task.id
+                    ));
+                }
+            }
+        }
+        let mut remaining = self
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id.as_str(),
+                    task.dependencies.iter().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut scheduled = BTreeSet::new();
+        while let Some(next) = remaining
+            .iter()
+            .find_map(|(id, dependencies)| dependencies.is_empty().then_some(*id))
+        {
+            remaining.remove(next);
+            scheduled.insert(next);
+            for dependencies in remaining.values_mut() {
+                dependencies.retain(|dependency| *dependency != next);
+            }
+        }
+        if scheduled.len() != self.tasks.len() {
+            return Err("Mission task dependencies contain a cycle.".into());
+        }
+        for (left_index, left) in self.tasks.iter().enumerate() {
+            for right in self.tasks.iter().skip(left_index + 1) {
+                // A dependency chain makes the tasks serial, so the shared
+                // scope is safe. Otherwise they may be given to separate
+                // agents concurrently and must not claim the same file (or
+                // a file beneath a claimed directory).
+                if task_depends_on(&self.tasks, &left.id, &right.id)
+                    || task_depends_on(&self.tasks, &right.id, &left.id)
+                {
+                    continue;
+                }
+                if let Some((left_path, right_path)) = left
+                    .predicted_paths
+                    .iter()
+                    .flat_map(|left_path| {
+                        right
+                            .predicted_paths
+                            .iter()
+                            .map(move |right_path| (left_path, right_path))
+                    })
+                    .find(|(left_path, right_path)| predicted_paths_overlap(left_path, right_path))
+                {
+                    return Err(format!(
+                        "Tasks `{}` and `{}` have overlapping predicted paths `{left_path}` and `{right_path}` without a dependency.",
+                        left.id, right.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn task_depends_on(tasks: &[MissionTask], task_id: &str, predecessor: &str) -> bool {
+    let mut pending = tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .into_iter()
+        .flat_map(|task| task.dependencies.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(next) = pending.pop() {
+        if next == predecessor {
+            return true;
+        }
+        if !visited.insert(next) {
+            continue;
+        }
+        if let Some(task) = tasks.iter().find(|task| task.id == next) {
+            pending.extend(task.dependencies.iter().map(String::as_str));
+        }
+    }
+    false
+}
+
+fn is_valid_mission_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn is_safe_predicted_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('\0')
+        && !value.starts_with('/')
+        && !value.starts_with('~')
+        && !value.contains('\\')
+        && !starts_with_windows_drive(value)
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn starts_with_windows_drive(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn predicted_paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 /// Machine capability controls which execution lanes are trustworthy. A light
@@ -207,6 +539,8 @@ pub struct GestureConfig {
     pub goal_trigger: String,
     #[serde(default = "default_smart_copy_trigger")]
     pub smart_copy_trigger: String,
+    #[serde(default = "default_palette_trigger")]
+    pub palette_trigger: String,
 }
 fn default_trigger() -> String {
     "ctrl+shift+space".into()
@@ -229,6 +563,9 @@ fn default_goal_trigger() -> String {
 fn default_smart_copy_trigger() -> String {
     "ctrl+alt+c".into()
 }
+fn default_palette_trigger() -> String {
+    "ctrl+shift+space".into()
+}
 impl Default for GestureConfig {
     fn default() -> Self {
         Self {
@@ -239,6 +576,7 @@ impl Default for GestureConfig {
             infographic_selection_trigger: default_infographic_selection_trigger(),
             goal_trigger: default_goal_trigger(),
             smart_copy_trigger: default_smart_copy_trigger(),
+            palette_trigger: default_palette_trigger(),
         }
     }
 }
@@ -306,7 +644,7 @@ pub fn config_warnings(config: &Config) -> Vec<String> {
             ));
         }
     }
-    let supported: [(&str, &String, &[&str]); 4] = [
+    let supported: [(&str, &String, &[&str]); 5] = [
         (
             "gesture.trigger",
             &config.gesture.trigger,
@@ -326,6 +664,11 @@ pub fn config_warnings(config: &Config) -> Vec<String> {
             "gesture.goal_trigger",
             &config.gesture.goal_trigger,
             &["ctrl+alt+space"],
+        ),
+        (
+            "gesture.palette_trigger",
+            &config.gesture.palette_trigger,
+            &["ctrl+shift+space", "ctrl+alt+space", "cmd+shift+space"],
         ),
     ];
     for (field, value, options) in supported {
@@ -354,6 +697,19 @@ pub fn config_warnings(config: &Config) -> Vec<String> {
             config.routing.quota_bias_percent
         ));
     }
+    if config.gesture.palette_trigger == config.gesture.goal_trigger {
+        warnings.push(
+            "gesture.palette_trigger conflicts with goal_trigger; the Goal shortcut takes precedence and opens the palette prefilled with `plan `"
+                .into(),
+        );
+    } else if config.gesture.palette_trigger == config.gesture.trigger
+        && config.gesture.palette_trigger != "ctrl+shift+space"
+    {
+        warnings.push(
+            "gesture.palette_trigger conflicts with the legacy capture trigger; the palette takes precedence"
+                .into(),
+        );
+    }
     let mut seen_servers = std::collections::BTreeSet::new();
     for server in &config.mcp.servers {
         if server.name.trim().is_empty() || server.command.trim().is_empty() {
@@ -370,8 +726,53 @@ pub fn config_warnings(config: &Config) -> Vec<String> {
     warnings
 }
 
-pub fn default_config_toml() -> &'static str {
-    "privacy_mode = \"cloud_allowed\"\ncost_policy = \"cheapest\"\ncloud_model = \"gpt-5.6-luna\"\n# Safe default: gemma3:4b. Alternatives: phi4-mini, gpt-oss:20b (heavy opt-in only).\nlocal_model = \"gemma3:4b\"\n# Tool-loop model; light machines automatically keep this lane disabled.\ntool_model = \"phi4-mini\"\nmachine_profile = \"light\"\n\n[routing]\ndeterministic = true\nlocal = true\ncheap_cloud = true\nfrontier = true\n# Bias away from paid lanes once quota-axi reports this percent of a window used.\nquota_bias_percent = 80\n\n[autopilot]\npersona = \"patient\"\n# The first completed goal confirms each safe action, then this turns off automatically.\nfirst_run = true\n# Set true to keep per-action confirmation for every future goal.\ncareful_mode = false\n\n[gesture]\ntrigger = \"ctrl+shift+space\"\nchord_window_ms = 120\nhold_threshold_ms = 350\nsummarize_selection_trigger = \"ctrl-double-tap\"\ninfographic_selection_trigger = \"ctrl+alt+i\"\ngoal_trigger = \"ctrl+alt+space\"\n# After a normal Cmd-C, this gesture asks MICE to enrich the copied content.\nsmart_copy_trigger = \"ctrl+alt+c\"\n\n# External MCP servers require an explicit grant: add an entry AND set\n# enabled = true. MICE spawns them with a scrubbed environment (no provider\n# keys) and treats their output as untrusted text.\n# [[mcp.servers]]\n# name = \"web-search\"\n# command = \"/usr/local/bin/my-search-mcp\"\n# args = []\n# enabled = false\n"
+pub fn default_config_toml() -> String {
+    r#"privacy_mode = "cloud_allowed"
+cost_policy = "cheapest"
+cloud_model = "gpt-5.6-luna"
+# Safe default: gemma3:4b. Alternatives: phi4-mini, gpt-oss:20b (heavy opt-in only).
+local_model = "gemma3:4b"
+# Tool-loop model; light machines automatically keep this lane disabled.
+tool_model = "phi4-mini"
+machine_profile = "light"
+
+[routing]
+deterministic = true
+local = true
+cheap_cloud = true
+frontier = true
+# Bias away from paid lanes once quota-axi reports this percent of a window used.
+quota_bias_percent = 80
+
+[autopilot]
+persona = "patient"
+# The first completed goal confirms each safe action, then this turns off automatically.
+first_run = true
+# Set true to keep per-action confirmation for every future goal.
+careful_mode = false
+
+[gesture]
+trigger = "ctrl+shift+space"
+chord_window_ms = 120
+hold_threshold_ms = 350
+summarize_selection_trigger = "ctrl-double-tap"
+infographic_selection_trigger = "ctrl+alt+i"
+goal_trigger = "ctrl+alt+space"
+# After a normal Cmd-C, this gesture asks MICE to enrich the copied content.
+smart_copy_trigger = "ctrl+alt+c"
+# Unified command palette (daemon mode).
+palette_trigger = "ctrl+shift+space"
+
+# External MCP servers require an explicit grant: add an entry AND set
+# enabled = true. MICE spawns them with a scrubbed environment (no provider
+# keys) and treats their output as untrusted text.
+# [[mcp.servers]]
+# name = "web-search"
+# command = "/usr/local/bin/my-search-mcp"
+# args = []
+# enabled = false
+"#
+    .into()
 }
 
 /// Portable, side-effect-free state for the first Goal Guide stage. Platform
@@ -443,6 +844,20 @@ impl GoalSession {
         Ok(())
     }
 
+    /// End a goal before it starts. Cancellation is deliberately available
+    /// only before acceptance so an active guide always has an explicit Quit
+    /// control instead of silently changing its planning state.
+    pub fn cancel(&mut self) -> Result<(), &'static str> {
+        if !matches!(
+            self.state,
+            GoalState::AwaitingGoal | GoalState::Reviewing { .. }
+        ) {
+            return Err("This goal session cannot be cancelled at this stage.");
+        }
+        self.state = GoalState::Cancelled;
+        Ok(())
+    }
+
     pub fn state(&self) -> &GoalState {
         &self.state
     }
@@ -451,6 +866,69 @@ impl GoalSession {
 impl Default for GoalSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Deterministic command-palette interpretation. A leading verb is always an
+/// explicit user request; otherwise the entire entry is an ordinary question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteIntent {
+    Ask(String),
+    See(String),
+    Sheet(String),
+    Summarize(String),
+    Define(String),
+    Plan(String),
+    Tidy(String),
+    File(String),
+    Remember(String),
+    History(String),
+}
+
+pub fn parse_palette_intent(input: &str) -> PaletteIntent {
+    let full = input.trim().to_owned();
+    let mut parts = full.splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let rest = parts.next().unwrap_or_default().trim().to_owned();
+    match verb.as_str() {
+        "ask" => PaletteIntent::Ask(rest),
+        "see" => PaletteIntent::See(rest),
+        "sheet" => PaletteIntent::Sheet(rest),
+        "summarize" | "summary" => PaletteIntent::Summarize(rest),
+        "define" => PaletteIntent::Define(rest),
+        "plan" => PaletteIntent::Plan(rest),
+        "tidy" => PaletteIntent::Tidy(rest),
+        "file" => PaletteIntent::File(rest),
+        "remember" => PaletteIntent::Remember(rest),
+        "history" => PaletteIntent::History(rest),
+        _ => PaletteIntent::Ask(full),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuideControl {
+    Back,
+    Next,
+    Quit,
+    DoIt,
+}
+
+pub fn guide_control_from_action(action: &str) -> Option<GuideControl> {
+    match action {
+        "back" => Some(GuideControl::Back),
+        "next" => Some(GuideControl::Next),
+        "quit" => Some(GuideControl::Quit),
+        "do-it" | "do_it" => Some(GuideControl::DoIt),
+        _ => None,
+    }
+}
+
+pub fn apply_preferences(instruction: &str, preamble: Option<&str>) -> String {
+    match preamble.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(preamble) if !instruction.starts_with(preamble) => {
+            format!("{preamble}\n\n{instruction}")
+        }
+        _ => instruction.into(),
     }
 }
 
@@ -2293,6 +2771,19 @@ mod tests {
     }
 
     #[test]
+    fn goal_session_allows_review_cancellation_but_not_active_guide_cancellation() {
+        let mut session = GoalSession::new();
+        assert!(session.cancel().is_ok());
+        assert!(matches!(session.state(), GoalState::Cancelled));
+
+        let mut accepted = GoalSession::new();
+        accepted.submit_goal("Make a budget".into()).unwrap();
+        accepted.review("1. Open Numbers".into()).unwrap();
+        accepted.accept().unwrap();
+        assert!(accepted.cancel().is_err());
+    }
+
+    #[test]
     fn agent_loop_pauses_handoffs_and_enforces_its_action_budget() {
         let mut loop_state = AgentLoop::new("Open Canva".into(), AgentMode::Autopilot, 1);
         let click = AgentDecision {
@@ -2801,5 +3292,118 @@ mod tests {
         let batches = summary_reduce_batches(&summaries, 900);
         assert!(batches.len() >= 2);
         assert_eq!(batches.concat(), summaries);
+    }
+
+    #[test]
+    fn palette_verbs_are_explicit_and_preferences_are_once_only() {
+        assert_eq!(
+            parse_palette_intent("define entropy"),
+            PaletteIntent::Define("entropy".into())
+        );
+        assert_eq!(
+            parse_palette_intent("ask define a trait"),
+            PaletteIntent::Ask("define a trait".into())
+        );
+        assert_eq!(
+            parse_palette_intent("ordinary question"),
+            PaletteIntent::Ask("ordinary question".into())
+        );
+        assert_eq!(guide_control_from_action("do-it"), Some(GuideControl::DoIt));
+        assert_eq!(guide_control_from_action("unknown"), None);
+        let preamble = "The user prefers: bullets.";
+        let applied = apply_preferences("Summarize this.", Some(preamble));
+        assert!(applied.starts_with(preamble));
+        assert_eq!(apply_preferences(&applied, Some(preamble)), applied);
+        assert_eq!(apply_preferences("Ask", None), "Ask");
+    }
+
+    #[test]
+    fn default_config_documents_the_palette_trigger() {
+        assert!(default_config_toml().contains(
+            "# Unified command palette (daemon mode).\npalette_trigger = \"ctrl+shift+space\""
+        ));
+    }
+
+    #[test]
+    fn mission_graph_requires_complete_acyclic_safe_tasks() {
+        let graph = MissionTaskGraph {
+            tasks: vec![
+                MissionTask {
+                    id: "core".into(),
+                    title: "Build the core".into(),
+                    acceptance: vec!["cargo test -p mice-core".into()],
+                    dependencies: vec![],
+                    predicted_paths: vec!["crates/mice-core/src/lib.rs".into()],
+                },
+                MissionTask {
+                    id: "cli".into(),
+                    title: "Wire the CLI".into(),
+                    acceptance: vec!["cargo test -p mice-cli".into()],
+                    dependencies: vec!["core".into()],
+                    predicted_paths: vec!["crates/mice-cli/src/main.rs".into()],
+                },
+            ],
+        };
+        assert!(graph.validate().is_ok());
+
+        let mut parallel_overlap = graph.clone();
+        parallel_overlap.tasks[1].dependencies.clear();
+        parallel_overlap.tasks[1].predicted_paths = vec!["crates/mice-core/src/lib.rs".into()];
+        assert!(
+            parallel_overlap
+                .validate()
+                .unwrap_err()
+                .contains("overlapping predicted paths")
+        );
+
+        let mut serialized_overlap = graph.clone();
+        serialized_overlap.tasks[1].predicted_paths = vec!["crates/mice-core/src/lib.rs".into()];
+        assert!(serialized_overlap.validate().is_ok());
+
+        let mut cycle = graph.clone();
+        cycle.tasks[0].dependencies.push("cli".into());
+        assert!(cycle.validate().unwrap_err().contains("cycle"));
+
+        let mut unsafe_path = graph;
+        unsafe_path.tasks[0].predicted_paths = vec!["../outside".into()];
+        assert!(unsafe_path.validate().unwrap_err().contains("unsafe"));
+
+        for unsafe_path in ["C:/Windows/System32", "~/.ssh/id_rsa", "src\0hidden"] {
+            let mut graph = MissionTaskGraph {
+                tasks: vec![MissionTask {
+                    id: "core".into(),
+                    title: "Build the core".into(),
+                    acceptance: vec!["cargo test -p mice-core".into()],
+                    dependencies: vec![],
+                    predicted_paths: vec![unsafe_path.into()],
+                }],
+            };
+            assert!(graph.validate().unwrap_err().contains("unsafe"));
+            graph.tasks[0].predicted_paths = vec!["crates/mice-core".into()];
+            assert!(graph.validate().is_ok());
+        }
+
+        let oversized = MissionTaskGraph {
+            tasks: (0..=MAX_MISSION_TASKS)
+                .map(|index| MissionTask {
+                    id: format!("task-{index}"),
+                    title: format!("Task {index}"),
+                    acceptance: vec!["test".into()],
+                    dependencies: vec![],
+                    predicted_paths: vec![format!("src/{index}.rs")],
+                })
+                .collect(),
+        };
+        assert!(oversized.validate().unwrap_err().contains("at most"));
+    }
+
+    #[test]
+    fn mission_agent_names_have_stable_cli_forms() {
+        assert_eq!(
+            MissionAgentKind::parse("claude-code"),
+            Some(MissionAgentKind::Claude)
+        );
+        assert_eq!(MissionAgentKind::Antigravity.id(), "antigravity");
+        assert!(MissionAgentKind::parse("unknown").is_none());
     }
 }

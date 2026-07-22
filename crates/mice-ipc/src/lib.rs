@@ -59,6 +59,11 @@ pub struct AxSnapshot {
 pub struct HoverCaptured {
     pub session_id: String,
     pub ax: Option<AxSnapshot>,
+    /// The currently active native application, captured once with the AX
+    /// node. It lets the core turn generic platform labels such as Terminal's
+    /// “shell text field” into an accurate user-facing explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
     pub text: Option<String>,
     pub pixels: Option<String>,
     pub bounds: Option<ScreenRect>,
@@ -89,6 +94,9 @@ pub enum SelectionSource {
 #[serde(rename_all = "snake_case")]
 pub enum SelectionAction {
     Summarize,
+    /// An explicit definition request. Unlike the summarize gesture it never
+    /// infers intent from selection length.
+    Define,
     Image,
 }
 
@@ -168,6 +176,28 @@ pub struct PromptSubmitted {
     pub text: String,
 }
 
+/// Text submitted through MICE's daemon-only command palette. Selection and
+/// front-app context are captured once at submit time, never observed later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteSubmitted {
+    pub session_id: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub front_app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_text: Option<String>,
+}
+
+/// Escape dismisses exactly one palette request. The core treats this as an
+/// explicit cancellation boundary, so a late response can never affect a
+/// newer palette session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteDismissed {
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HighlightBox {
@@ -230,6 +260,12 @@ impl RpcResponse {
 /// re-declare protocol shapes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentCommand {
+    /// A native, keyboard-accessible reference surface. Unlike a result
+    /// overlay it is intentionally centered and remains visible until the
+    /// person dismisses it, so first-run help is never mistaken for output.
+    HomeShow {
+        text: String,
+    },
     OverlayShow {
         text: String,
     },
@@ -262,6 +298,23 @@ pub enum AgentCommand {
         placeholder: String,
         context: Option<String>,
     },
+    PaletteShow {
+        session_id: String,
+        prefill: Option<String>,
+    },
+    PaletteAppendResult {
+        session_id: String,
+        chunk: String,
+    },
+    PaletteFinishResult {
+        session_id: String,
+        text: Option<String>,
+    },
+    /// Hide the palette for one specific session, so a stale request that
+    /// finishes late can never dismiss a newer palette presentation.
+    PaletteDismiss {
+        session_id: String,
+    },
     OverlayGuideStep {
         session_id: String,
         step_index: usize,
@@ -270,6 +323,9 @@ pub enum AgentCommand {
         app_hint: String,
         sensitive: bool,
         browser_capable: bool,
+        /// `panel` opts into MICE's non-blocking guide surface. Absent keeps
+        /// older platform agents compatible with the original native alert.
+        presentation: Option<String>,
     },
     /// Ask the platform agent for one native screen capture. The agent
     /// answers with a `screen.captured` notification carrying the same
@@ -296,6 +352,7 @@ pub enum AgentCommand {
 impl AgentCommand {
     pub fn notification(&self) -> RpcNotification {
         let (method, params) = match self {
+            Self::HomeShow { text } => ("home.show", json!({ "text": text })),
             Self::OverlayShow { text } => ("overlay.show", json!({ "text": text })),
             Self::OverlayUpdate { text } => ("overlay.update", json!({ "text": text })),
             Self::OverlayAppendResult { chunk } => {
@@ -338,6 +395,7 @@ impl AgentCommand {
                 app_hint,
                 sensitive,
                 browser_capable,
+                presentation,
             } => (
                 "overlay.guideStep",
                 json!({
@@ -348,8 +406,27 @@ impl AgentCommand {
                     "appHint": app_hint,
                     "sensitive": sensitive,
                     "browserCapable": browser_capable,
+                    "presentation": presentation,
                 }),
             ),
+            Self::PaletteShow {
+                session_id,
+                prefill,
+            } => (
+                "palette.show",
+                json!({ "sessionId": session_id, "prefill": prefill }),
+            ),
+            Self::PaletteAppendResult { session_id, chunk } => (
+                "palette.result.append",
+                json!({ "sessionId": session_id, "chunk": chunk }),
+            ),
+            Self::PaletteFinishResult { session_id, text } => (
+                "palette.result.finish",
+                json!({ "sessionId": session_id, "text": text }),
+            ),
+            Self::PaletteDismiss { session_id } => {
+                ("palette.hide", json!({ "sessionId": session_id }))
+            }
             Self::ScreenCapture { session_id, scope } => (
                 "screen.capture",
                 json!({ "sessionId": session_id, "scope": scope }),
@@ -480,6 +557,21 @@ mod tests {
                 jsonrpc: "2.0".into(),
                 method: "clipboard.paste".into(),
                 params: json!({}),
+            }
+        );
+    }
+
+    #[test]
+    fn home_surface_uses_the_shared_agent_protocol() {
+        assert_eq!(
+            AgentCommand::HomeShow {
+                text: "MICE Home".into(),
+            }
+            .notification(),
+            RpcNotification {
+                jsonrpc: "2.0".into(),
+                method: "home.show".into(),
+                params: json!({"text": "MICE Home"}),
             }
         );
     }
@@ -644,5 +736,67 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn palette_messages_have_distinct_stable_shapes() {
+        let submitted = PaletteSubmitted {
+            session_id: "palette-1".into(),
+            text: "summarize".into(),
+            front_app_name: Some("Notes".into()),
+            selection_text: Some("Selected text".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(submitted).unwrap(),
+            json!({"sessionId":"palette-1", "text":"summarize", "frontAppName":"Notes", "selectionText":"Selected text"})
+        );
+        assert_eq!(
+            AgentCommand::PaletteShow {
+                session_id: "palette-1".into(),
+                prefill: Some("plan ".into())
+            }
+            .notification()
+            .method,
+            "palette.show"
+        );
+        assert_eq!(
+            AgentCommand::PaletteAppendResult {
+                session_id: "palette-1".into(),
+                chunk: "hi".into()
+            }
+            .notification()
+            .method,
+            "palette.result.append"
+        );
+        let dismiss = AgentCommand::PaletteDismiss {
+            session_id: "palette-1".into(),
+        }
+        .notification();
+        assert_eq!(dismiss.method, "palette.hide");
+        assert_eq!(dismiss.params["sessionId"], "palette-1");
+        assert_eq!(
+            serde_json::to_value(PaletteDismissed {
+                session_id: "palette-1".into(),
+            })
+            .unwrap(),
+            json!({"sessionId": "palette-1"})
+        );
+    }
+
+    #[test]
+    fn guide_panel_presentation_is_opt_in_and_on_the_shared_wire() {
+        let notification = AgentCommand::OverlayGuideStep {
+            session_id: "goal-1".into(),
+            step_index: 0,
+            total_steps: 3,
+            instruction: "Open Notes.".into(),
+            app_hint: "Notes".into(),
+            sensitive: false,
+            browser_capable: false,
+            presentation: Some("panel".into()),
+        }
+        .notification();
+        assert_eq!(notification.method, "overlay.guideStep");
+        assert_eq!(notification.params["presentation"], "panel");
     }
 }
