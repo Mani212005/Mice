@@ -6567,18 +6567,28 @@ fn generate_goal_plan(
     };
     let selected = route(&request)?.model;
     let raw = if selected.locality == mice_providers::Locality::Local {
-        mice_providers::ollama_model_ready("http://127.0.0.1:11434", selected.id)?;
-        let mut response = String::new();
-        stream_ollama(
-            selected.id,
-            "Return only JSON with 3-8 advisory steps. Each step needs instruction, app_hint, and sensitive boolean.",
-            Some(planning_input),
-            |chunk| {
-                response.push_str(chunk);
-                Ok(())
-            },
-        )?;
-        response
+        let _ = ensure_ollama_server();
+        if mice_providers::ollama_model_ready("http://127.0.0.1:11434", selected.id).is_ok() {
+            let mut response = String::new();
+            if stream_ollama(
+                selected.id,
+                "Return only JSON with 3-8 advisory steps. Each step needs instruction, app_hint, and sensitive boolean.",
+                Some(planning_input),
+                |chunk| {
+                    response.push_str(chunk);
+                    Ok(())
+                },
+            )
+            .is_ok()
+                && !response.trim().is_empty()
+            {
+                response
+            } else {
+                return Ok(local_goal_plan_recovery(planning_input));
+            }
+        } else {
+            return Ok(local_goal_plan_recovery(planning_input));
+        }
     } else if is_groq_model(selected.id) {
         call_groq_goal_plan(selected.id, planning_input)?
     } else {
