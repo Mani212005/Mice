@@ -58,7 +58,7 @@ type ModelTaskGraph = (MissionTaskGraph, PreferredAssignments);
 
 pub fn command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.first().map(String::as_str) {
-        Some("plan") => plan_command(arguments),
+        Some("plan") | Some("synthesize") => plan_command(arguments),
         Some("status") => mission_status(arguments.get(1).map(String::as_str)),
         Some("watch") => mission_watch(arguments.get(1).map(String::as_str)),
         Some("report") => mission_report(
@@ -85,7 +85,11 @@ fn plan_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let snapshot = coordination::discover(&cwd)
         .map_err(|error| format!("Mission Control requires a Git worktree: {error}"))?;
     let worktree_root = current_worktree_root(&snapshot, &cwd)?;
-    let plan = load_plan(&worktree_root, &options.plan_path)?;
+    let plan = if let Some(goal) = &options.goal {
+        synthesize_plan_file(goal, &worktree_root, &options)?
+    } else {
+        load_plan(&worktree_root, &options.plan_path)?
+    };
     let agents = options
         .agents
         .iter()
@@ -255,6 +259,7 @@ fn print_preflight(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MissionOptions {
     plan_path: PathBuf,
+    goal: Option<String>,
     agents: Vec<MissionAgentKind>,
     dry_run: bool,
     review_only: bool,
@@ -275,12 +280,22 @@ impl MissionOptions {
         let Some(command) = arguments.first().map(String::as_str) else {
             return Err(usage().into());
         };
-        if command != "plan" {
+        if command != "plan" && command != "synthesize" {
             return Err(usage().into());
         }
-        let Some(plan_path) = arguments.get(1) else {
-            return Err(usage().into());
-        };
+
+        let mut plan_path = PathBuf::new();
+        let mut goal = None;
+        let mut index = 1;
+
+        if command == "plan" {
+            let path_opt = arguments.get(1).filter(|p| !p.starts_with("--"));
+            if let Some(path_str) = path_opt {
+                plan_path = PathBuf::from(path_str);
+                index = 2;
+            }
+        }
+
         let mut agents = None;
         let mut dry_run = false;
         let mut review_only = false;
@@ -288,9 +303,13 @@ impl MissionOptions {
         let mut yes = false;
         let mut planner = MissionPlannerMode::Auto;
         let mut allow_cloud = false;
-        let mut index = 2;
+
         while index < arguments.len() {
             match arguments[index].as_str() {
+                "--goal" if index + 1 < arguments.len() => {
+                    goal = Some(arguments[index + 1].clone());
+                    index += 2;
+                }
                 "--agents" if index + 1 < arguments.len() => {
                     if agents.is_some() {
                         return Err("Specify `--agents` only once.".into());
@@ -334,10 +353,18 @@ impl MissionOptions {
                 _ => return Err(usage().into()),
             }
         }
+
+        if goal.is_none() && plan_path.as_os_str().is_empty() {
+            return Err(
+                "Mission Control requires either a plan file path or `--goal \"...\"`.".into(),
+            );
+        }
+
         let agents =
             agents.ok_or("Mission Control requires `--agents codex,claude,antigravity`.")?;
         Ok(Self {
-            plan_path: PathBuf::from(plan_path),
+            plan_path,
+            goal,
             agents,
             dry_run,
             review_only,
@@ -350,7 +377,7 @@ impl MissionOptions {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  mice mission plan <plan-file-under-plan/> --agents <codex,claude,antigravity> [--planner auto|markdown] [--allow-cloud] [--review|--dry-run|--launch --yes]\n  mice mission status <plan-file-under-plan/>\n  mice mission watch <plan-file-under-plan/>\n  mice mission report <plan-file-under-plan/> <task-id>\n  mice mission note <plan-file-under-plan/> <task-id> <decision-or-blocker>\n  mice mission verify <plan-file-under-plan/> <task-id> --yes"
+    "Usage:\n  mice mission plan <plan-file-under-plan/> --agents <codex,claude,antigravity> [--goal \"...\"] [--planner auto|markdown] [--allow-cloud] [--review|--dry-run|--launch --yes]\n  mice mission synthesize --goal \"...\" --agents <codex,claude,antigravity> [--allow-cloud] [--review|--dry-run|--launch --yes]\n  mice mission status <plan-file-under-plan/>\n  mice mission watch <plan-file-under-plan/>\n  mice mission report <plan-file-under-plan/> <task-id>\n  mice mission note <plan-file-under-plan/> <task-id> <decision-or-blocker>\n  mice mission verify <plan-file-under-plan/> <task-id> --yes"
 }
 
 fn parse_agents(value: &str) -> Result<Vec<MissionAgentKind>, Box<dyn std::error::Error>> {
@@ -728,6 +755,79 @@ fn planner_plan_excerpt(contents: &str) -> String {
     } else {
         excerpt
     }
+}
+
+fn synthesize_plan_file(
+    goal: &str,
+    worktree_root: &Path,
+    options: &MissionOptions,
+) -> Result<LoadedPlan, Box<dyn std::error::Error>> {
+    let path_index = tracked_path_index(worktree_root).unwrap_or_default();
+    let dummy_plan = LoadedPlan {
+        contents: format!("# Goal: {goal}\n"),
+        relative_path: PathBuf::from("plan/synthetic.md"),
+        display_name: slug(goal),
+        fingerprint: digest(goal),
+    };
+    let prompt = mission_planner_prompt(&dummy_plan, &path_index, &options.agents);
+    let (graph, _assignments) = match crate::mission_planner_response(&prompt, options.allow_cloud)
+        .and_then(|response| model_mission_proposal(&response, &options.agents))
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let task = MissionTask {
+                id: format!("task-01-{}", slug(goal)),
+                title: goal.to_owned(),
+                acceptance: vec![format!("Complete `{goal}`")],
+                dependencies: vec![],
+                predicted_paths: vec![],
+            };
+            let graph = MissionTaskGraph { tasks: vec![task] };
+            graph
+                .validate()
+                .map_err(|e| format!("Synthetic graph validation: {e}"))?;
+            (graph, std::collections::BTreeMap::new())
+        }
+    };
+
+    let slug_name = slug(goal);
+    let plan_dir = worktree_root.join("plan");
+    fs::create_dir_all(&plan_dir)?;
+    let file_name = format!("synthesized-{slug_name}.md");
+    let target_path = plan_dir.join(&file_name);
+
+    let mut md = format!("# Mission: {goal}\n\n## Tasks\n\n");
+    for task in &graph.tasks {
+        md.push_str(&format!("### {}\n\n", task.title));
+        md.push_str(&format!("- mice:id: {}\n", task.id));
+        if !task.dependencies.is_empty() {
+            md.push_str(&format!(
+                "- mice:depends: {}\n",
+                task.dependencies.join(", ")
+            ));
+        }
+        if !task.predicted_paths.is_empty() {
+            md.push_str(&format!(
+                "- mice:paths: {}\n",
+                task.predicted_paths.join(", ")
+            ));
+        }
+        md.push_str("\nAcceptance:\n");
+        for check in &task.acceptance {
+            md.push_str(&format!("- [ ] {check}\n"));
+        }
+        md.push('\n');
+    }
+
+    fs::write(&target_path, &md)?;
+    let relative_path = PathBuf::from("plan").join(&file_name);
+
+    Ok(LoadedPlan {
+        fingerprint: digest(&md),
+        contents: md,
+        relative_path,
+        display_name: format!("synthesized-{slug_name}"),
+    })
 }
 
 fn tracked_path_index(worktree_root: &Path) -> Result<String, String> {
