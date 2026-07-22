@@ -1352,6 +1352,7 @@ private final class PalettePanel: NSPanel, NSTextFieldDelegate {
         backgroundColor = .clear
         hasShadow = true
         level = .floating
+        hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let material = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
@@ -1581,6 +1582,7 @@ private final class HomePanel: NSPanel, NSWindowDelegate {
         title = "MICE Home"
         isFloatingPanel = true
         level = .floating
+        hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isReleasedWhenClosed = false
         delegate = self
@@ -1838,6 +1840,7 @@ private final class OverlayController: NSObject {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.nonactivatingPanel, .titled, .closable], backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .floating
+        panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.title = "MICE"
 
@@ -2353,6 +2356,7 @@ private final class OverlayController: NSObject {
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.level = .floating
+        panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let border = NSView(

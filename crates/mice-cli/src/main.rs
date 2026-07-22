@@ -4491,9 +4491,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    let mut goal_sessions = HashMap::<String, GoalSession>::new();
-    let mut goal_plans = HashMap::<String, GoalPlanResult>::new();
-    let mut active_guides = HashMap::<String, ActiveGuide>::new();
+    let goal_sessions = Arc::new(Mutex::new(HashMap::<String, GoalSession>::new()));
+    let goal_plans = Arc::new(Mutex::new(HashMap::<String, GoalPlanResult>::new()));
+    let active_guides = Arc::new(Mutex::new(HashMap::<String, ActiveGuide>::new()));
     let mut selection_cache: Option<SelectionCache> = None;
     // At most one speculative deeper explanation runs at once. This keeps a
     // local model responsive if someone makes several selections in a row.
@@ -4503,7 +4503,10 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             // Goal Guide is resumable. Losing focus or pressing Escape only
             // hides the native surface; the reviewed plan remains in core
             // state until the person starts, revises, or cancels it.
-            if resume_reviewed_goal(&mut agent_writer.lock().unwrap(), &goal_sessions)? {
+            if resume_reviewed_goal(
+                &mut agent_writer.lock().unwrap(),
+                &goal_sessions.lock().unwrap(),
+            )? {
                 continue;
             }
             let session_id = msg.params["sessionId"]
@@ -4524,34 +4527,28 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            let session_id = submission.session_id.clone();
-            let Some(session) = goal_sessions.get_mut(&session_id) else {
-                eprintln!("MICE received a prompt submission for an unknown session");
-                continue;
-            };
             if let Err(error) = handle_goal_submission(
-                &mut agent_writer.lock().unwrap(),
+                &agent_writer,
                 &config,
-                session,
-                &mut goal_plans,
-                &mut active_guides,
+                &goal_sessions,
+                &goal_plans,
+                &active_guides,
                 &browser_goal_directive,
                 submission,
             ) {
                 eprintln!("MICE goal planning failed: {error}");
-                // A failed provider call leaves the session in Planning.
-                // Remove every associated entry so it cannot suppress future
-                // hover explanations for the lifetime of the daemon.
-                goal_sessions.remove(&session_id);
-                goal_plans.remove(&session_id);
-                active_guides.remove(&session_id);
-                clear_browser_goal_directive(&browser_goal_directive);
             }
         } else if msg.method == "prompt.cancelled" {
             if let Some(session_id) = msg.params["sessionId"].as_str() {
-                goal_sessions.remove(session_id);
-                goal_plans.remove(session_id);
-                active_guides.remove(session_id);
+                if let Ok(mut sessions) = goal_sessions.lock() {
+                    sessions.remove(session_id);
+                }
+                if let Ok(mut plans) = goal_plans.lock() {
+                    plans.remove(session_id);
+                }
+                if let Ok(mut guides) = active_guides.lock() {
+                    guides.remove(session_id);
+                }
                 clear_browser_goal_directive(&browser_goal_directive);
             }
             let _ = send_command(
@@ -4568,17 +4565,22 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             let value = msg.params["value"].as_str();
+            let mut guides_guard = active_guides.lock().unwrap();
             match handle_guide_control(
                 &mut agent_writer.lock().unwrap(),
-                &mut active_guides,
+                &mut guides_guard,
                 &browser_goal_directive,
                 session_id,
                 action,
                 value,
             ) {
                 Ok(true) => {
-                    goal_sessions.remove(session_id);
-                    goal_plans.remove(session_id);
+                    if let Ok(mut sessions) = goal_sessions.lock() {
+                        sessions.remove(session_id);
+                    }
+                    if let Ok(mut plans) = goal_plans.lock() {
+                        plans.remove(session_id);
+                    }
                 }
                 Ok(false) => {}
                 Err(error) => eprintln!("MICE guide control failed: {error}"),
@@ -4594,9 +4596,15 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             // Palette session IDs are also used for plan sessions. Removing
             // them makes Escape a real cancellation boundary and ensures an
             // old plan cannot later own the guide UI.
-            goal_sessions.remove(&dismissed.session_id);
-            goal_plans.remove(&dismissed.session_id);
-            active_guides.remove(&dismissed.session_id);
+            if let Ok(mut sessions) = goal_sessions.lock() {
+                sessions.remove(&dismissed.session_id);
+            }
+            if let Ok(mut plans) = goal_plans.lock() {
+                plans.remove(&dismissed.session_id);
+            }
+            if let Ok(mut guides) = active_guides.lock() {
+                guides.remove(&dismissed.session_id);
+            }
             clear_browser_goal_directive(&browser_goal_directive);
         } else if msg.method == "palette.submitted" {
             let submission: PaletteSubmitted = match serde_json::from_value(msg.params) {
@@ -4608,24 +4616,25 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             };
             let palette_session = submission.session_id.clone();
             if let Err(error) = handle_palette_submission(
-                &mut agent_writer.lock().unwrap(),
+                &agent_writer,
                 &config,
-                &mut goal_sessions,
-                &mut goal_plans,
-                &mut active_guides,
+                &goal_sessions,
+                &goal_plans,
+                &active_guides,
                 &browser_goal_directive,
                 submission,
             ) {
                 eprintln!("MICE palette request failed: {error}");
-                // Palette task planning creates a GoalSession before the
-                // provider call. A failed call must not leave it Planning,
-                // because that would suppress all later hover explanations.
-                goal_sessions.remove(&palette_session);
-                goal_plans.remove(&palette_session);
-                active_guides.remove(&palette_session);
+                if let Ok(mut sessions) = goal_sessions.lock() {
+                    sessions.remove(&palette_session);
+                }
+                if let Ok(mut plans) = goal_plans.lock() {
+                    plans.remove(&palette_session);
+                }
+                if let Ok(mut guides) = active_guides.lock() {
+                    guides.remove(&palette_session);
+                }
                 clear_browser_goal_directive(&browser_goal_directive);
-                // The palette disabled its input at submit time; a failure
-                // must reach the panel or it stays stuck at "thinking".
                 let _ = send_command(
                     &mut agent_writer.lock().unwrap(),
                     AgentCommand::PaletteFinishResult {
@@ -4690,9 +4699,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             let result = if goal_action {
                 handle_goal_review_action(
                     &mut agent_writer.lock().unwrap(),
-                    &mut goal_sessions,
-                    &mut goal_plans,
-                    &mut active_guides,
+                    &mut goal_sessions.lock().unwrap(),
+                    &mut goal_plans.lock().unwrap(),
+                    &mut active_guides.lock().unwrap(),
                     &browser_goal_directive,
                     &session_id,
                     &action_id,
@@ -4848,7 +4857,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             // A reviewed plan owns the visible guidance surface. Hover events
             // captured just before the palette was submitted must not replace
             // its Planning/Review panel after the model returns.
-            if goal_sessions.values().any(|session| {
+            if goal_sessions.lock().unwrap().values().any(|session| {
                 matches!(
                     session.state(),
                     GoalState::Planning { .. }
@@ -5831,84 +5840,123 @@ fn handle_selection_action(
 }
 
 fn handle_goal_submission(
-    writer: &mut ChildStdin,
+    agent_writer: &Arc<Mutex<ChildStdin>>,
     config: &mice_core::Config,
-    session: &mut GoalSession,
-    goal_plans: &mut HashMap<String, GoalPlanResult>,
-    _active_guides: &mut HashMap<String, ActiveGuide>,
-    _browser_goal_directive: &NativeBridge,
+    goal_sessions: &Arc<Mutex<HashMap<String, GoalSession>>>,
+    goal_plans: &Arc<Mutex<HashMap<String, GoalPlanResult>>>,
+    active_guides: &Arc<Mutex<HashMap<String, ActiveGuide>>>,
+    browser_goal_directive: &NativeBridge,
     submission: PromptSubmitted,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let planning_input = match session.state() {
-        GoalState::AwaitingGoal => {
-            session.submit_goal(submission.text.clone())?;
-            submission.text
+    let session_id = submission.session_id.clone();
+    let planning_input = {
+        let mut sessions = goal_sessions
+            .lock()
+            .map_err(|_| "goal sessions lock failed")?;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or("MICE received a goal prompt for an unknown session.")?;
+        match session.state() {
+            GoalState::AwaitingGoal => {
+                session.submit_goal(submission.text.clone())?;
+                submission.text
+            }
+            GoalState::Reviewing { .. } if submission.text.trim().is_empty() => {
+                let mut writer = agent_writer
+                    .lock()
+                    .map_err(|_| "agent writer lock failed")?;
+                return send_command(
+                    &mut writer,
+                    AgentCommand::OverlayResult {
+                        session_id: submission.session_id,
+                        actions: goal_review_actions(),
+                    },
+                );
+            }
+            GoalState::Reviewing { .. } => session.begin_revision(submission.text)?,
+            GoalState::Planning { .. } => {
+                return Err("MICE is already generating this plan.".into());
+            }
+            GoalState::Accepted { .. } | GoalState::Cancelled => {
+                return Err("This goal session is already finished.".into());
+            }
         }
-        GoalState::Reviewing { .. } if submission.text.trim().is_empty() => {
-            // A blank revision must never double as consent. Restore the
-            // explicit review choices instead of accepting the plan.
-            return send_command(
-                writer,
+    };
+
+    if let Ok(mut writer) = agent_writer.lock() {
+        let _ = send_command(
+            &mut writer,
+            AgentCommand::OverlayShow {
+                text: "Planning your goal…".into(),
+            },
+        );
+    }
+
+    let config = config.clone();
+    let agent_writer = Arc::clone(agent_writer);
+    let goal_sessions = Arc::clone(goal_sessions);
+    let goal_plans = Arc::clone(goal_plans);
+    let active_guides = Arc::clone(active_guides);
+    let browser_goal_directive = Arc::clone(browser_goal_directive);
+
+    std::thread::spawn(move || {
+        let plan = match generate_goal_plan(&config, &planning_input) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let message = format!(
+                    "MICE could not make this plan: {error}\n\nCheck your selected provider in `mice settings`, then try again."
+                );
+                if let Ok(mut sessions) = goal_sessions.lock() {
+                    sessions.remove(&session_id);
+                }
+                if let Ok(mut plans) = goal_plans.lock() {
+                    plans.remove(&session_id);
+                }
+                if let Ok(mut guides) = active_guides.lock() {
+                    guides.remove(&session_id);
+                }
+                clear_browser_goal_directive(&browser_goal_directive);
+                if let Ok(mut writer) = agent_writer.lock() {
+                    let _ = send_command(
+                        &mut writer,
+                        AgentCommand::OverlayFinishResult {
+                            text: Some(message),
+                        },
+                    );
+                }
+                return;
+            }
+        };
+
+        let rendered = render_goal_plan(&plan);
+        if let Ok(mut sessions) = goal_sessions.lock()
+            && let Some(session) = sessions.get_mut(&session_id)
+        {
+            let _ = session.review(rendered.clone());
+        }
+        if let Ok(mut plans) = goal_plans.lock() {
+            plans.insert(session_id.clone(), plan);
+        }
+
+        record_user_history(
+            memory::HistoryKind::GoalPlan,
+            &planning_input,
+            &rendered,
+            None,
+        );
+
+        if let Ok(mut writer) = agent_writer.lock() {
+            let _ = send_command(&mut writer, AgentCommand::OverlayShow { text: rendered });
+            let _ = send_command(
+                &mut writer,
                 AgentCommand::OverlayResult {
-                    session_id: submission.session_id,
+                    session_id,
                     actions: goal_review_actions(),
                 },
             );
         }
-        GoalState::Reviewing { .. } => session.begin_revision(submission.text)?,
-        GoalState::Planning { .. } => return Err("MICE is already generating this plan.".into()),
-        GoalState::Accepted { .. } | GoalState::Cancelled => {
-            return Err("This goal session is already finished.".into());
-        }
-    };
+    });
 
-    send_command(
-        writer,
-        AgentCommand::OverlayShow {
-            text: "Planning your goal…".into(),
-        },
-    )?;
-    let plan = match generate_goal_plan(config, &planning_input) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let message = format!(
-                "MICE could not make this plan: {error}\n\nCheck your selected provider in `mice settings`, then try again."
-            );
-            let _ = send_command(
-                writer,
-                AgentCommand::OverlayFinishResult {
-                    text: Some(message),
-                },
-            );
-            return Err(error);
-        }
-    };
-    let rendered = render_goal_plan(&plan);
-    session.review(rendered.clone())?;
-    goal_plans.insert(submission.session_id.clone(), plan);
-    // A typed goal and its bounded, advisory plan are intentional personal
-    // memory. This lets Home and `mice plans` reopen the context after the
-    // person changes apps or restarts MICE. Never use this path for captures
-    // or selections, whose source content remains non-persistent.
-    record_user_history(
-        memory::HistoryKind::GoalPlan,
-        &planning_input,
-        &rendered,
-        None,
-    );
-    send_command(
-        writer,
-        AgentCommand::OverlayShow {
-            text: rendered.clone(),
-        },
-    )?;
-    send_command(
-        writer,
-        AgentCommand::OverlayResult {
-            session_id: submission.session_id,
-            actions: goal_review_actions(),
-        },
-    )?;
     Ok(())
 }
 
@@ -5916,11 +5964,11 @@ fn handle_goal_submission(
 /// same typed selection and goal flows as global gestures: the palette is a
 /// faster entry point, never a second decision-maker or a background observer.
 fn handle_palette_submission(
-    writer: &mut ChildStdin,
+    agent_writer: &Arc<Mutex<ChildStdin>>,
     config: &mice_core::Config,
-    sessions: &mut HashMap<String, GoalSession>,
-    goal_plans: &mut HashMap<String, GoalPlanResult>,
-    active_guides: &mut HashMap<String, ActiveGuide>,
+    sessions: &Arc<Mutex<HashMap<String, GoalSession>>>,
+    goal_plans: &Arc<Mutex<HashMap<String, GoalPlanResult>>>,
+    active_guides: &Arc<Mutex<HashMap<String, ActiveGuide>>>,
     browser_goal_directive: &NativeBridge,
     submission: PaletteSubmitted,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5939,33 +5987,40 @@ fn handle_palette_submission(
     };
     if let Some(goal) = plan_goal {
         if goal.trim().is_empty() {
-            return palette_finish(writer, &session_id, "Type a goal after `plan`.");
+            let mut writer = agent_writer
+                .lock()
+                .map_err(|_| "agent writer lock failed")?;
+            return palette_finish(&mut writer, &session_id, "Type a goal after `plan`.");
         }
         // Only one reviewed plan may be resumed by the Goal gesture. A new
         // palette plan intentionally supersedes an older unstarted review,
         // rather than allowing HashMap iteration order to choose a plan.
-        sessions.retain(|existing_id, session| {
-            let keep = !matches!(session.state(), GoalState::Reviewing { .. });
-            if !keep {
-                goal_plans.remove(existing_id);
-                active_guides.remove(existing_id);
-            }
-            keep
-        });
-        sessions.insert(session_id.clone(), GoalSession::new());
-        send_command(
-            writer,
-            AgentCommand::PaletteDismiss {
-                session_id: session_id.clone(),
-            },
-        )?;
-        let session = sessions
-            .get_mut(&session_id)
-            .ok_or("MICE could not create a goal session.")?;
+        {
+            let mut sessions_guard = sessions.lock().map_err(|_| "sessions lock failed")?;
+            let mut plans_guard = goal_plans.lock().map_err(|_| "plans lock failed")?;
+            let mut guides_guard = active_guides.lock().map_err(|_| "guides lock failed")?;
+            sessions_guard.retain(|existing_id, session| {
+                let keep = !matches!(session.state(), GoalState::Reviewing { .. });
+                if !keep {
+                    plans_guard.remove(existing_id);
+                    guides_guard.remove(existing_id);
+                }
+                keep
+            });
+            sessions_guard.insert(session_id.clone(), GoalSession::new());
+        }
+        if let Ok(mut writer) = agent_writer.lock() {
+            let _ = send_command(
+                &mut writer,
+                AgentCommand::PaletteDismiss {
+                    session_id: session_id.clone(),
+                },
+            );
+        }
         return handle_goal_submission(
-            writer,
+            agent_writer,
             config,
-            session,
+            sessions,
             goal_plans,
             active_guides,
             browser_goal_directive,
@@ -5975,6 +6030,10 @@ fn handle_palette_submission(
             },
         );
     }
+    let mut writer_guard = agent_writer
+        .lock()
+        .map_err(|_| "agent writer lock failed")?;
+    let writer = &mut *writer_guard;
     match intent {
         PaletteIntent::Plan(_) => unreachable!("handled before palette dispatch"),
         PaletteIntent::Summarize(_) => {
@@ -6390,22 +6449,31 @@ fn resume_reviewed_goal(
     writer: &mut ChildStdin,
     sessions: &HashMap<String, GoalSession>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some((session_id, plan)) = sessions.iter().find_map(|(session_id, session)| {
-        let GoalState::Reviewing { plan, .. } = session.state() else {
-            return None;
-        };
-        Some((session_id.clone(), plan.clone()))
-    }) else {
+    let Some((session_id, plan, is_planning)) =
+        sessions
+            .iter()
+            .find_map(|(session_id, session)| match session.state() {
+                GoalState::Reviewing { plan, .. } => {
+                    Some((session_id.clone(), plan.clone(), false))
+                }
+                GoalState::Planning { .. } => {
+                    Some((session_id.clone(), "Planning your goal…".to_string(), true))
+                }
+                _ => None,
+            })
+    else {
         return Ok(false);
     };
     send_command(writer, AgentCommand::OverlayShow { text: plan })?;
-    send_command(
-        writer,
-        AgentCommand::OverlayResult {
-            session_id,
-            actions: goal_review_actions(),
-        },
-    )?;
+    if !is_planning {
+        send_command(
+            writer,
+            AgentCommand::OverlayResult {
+                session_id,
+                actions: goal_review_actions(),
+            },
+        )?;
+    }
     Ok(true)
 }
 
