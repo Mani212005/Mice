@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MICE Coordination Mesh — product plan</title>
+<style>
+:root{color-scheme:dark;--bg:#101116;--panel:rgba(32,34,44,.76);--ink:#f4f5fa;--muted:#b4b8c8;--line:rgba(255,255,255,.12);--cyan:#61d6ff;--violet:#cf78ff;--yellow:#ffd47a;--green:#77e6b2;--red:#ff8d9f}*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;background:radial-gradient(900px 520px at 14% -10%,rgba(97,214,255,.14),transparent 62%),radial-gradient(700px 520px at 95% 3%,rgba(207,120,255,.13),transparent 60%),var(--bg)}main{max-width:1220px;margin:auto;padding:26px 20px 72px}a{color:var(--cyan)}a:hover{color:white}header,.section{border:1px solid var(--line);background:var(--panel);backdrop-filter:blur(20px);box-shadow:0 22px 60px rgba(0,0,0,.22)}header{padding:42px 30px 32px;border-radius:26px;background:linear-gradient(130deg,rgba(255,255,255,.095),rgba(255,255,255,.025))}.section{margin-top:32px;padding:28px;border-radius:22px}h1,h2,h3,p{margin-top:0}h1{max-width:900px;margin:10px 0 16px;font-size:clamp(2.35rem,6vw,4.85rem);line-height:.99;letter-spacing:-.06em}h2{font-size:1.52rem;letter-spacing:-.025em;margin-bottom:.55rem}h3{font-size:1.02rem;margin-bottom:.35rem}.eyebrow{color:var(--cyan);font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;font-weight:700}.lede{max-width:850px;color:#d9dce9;font-size:1.16rem}.intro,.small,.metric{color:var(--muted)}.small,.metric{font-size:.87rem}.verdict{display:grid;grid-template-columns:auto 1fr;gap:14px;max-width:940px;margin-top:25px;padding:16px 18px;border:1px solid rgba(119,230,178,.34);border-radius:16px;background:rgba(28,89,67,.22)}.verdict b{color:var(--green);white-space:nowrap}.grid{display:grid;gap:16px}.two{grid-template-columns:repeat(2,minmax(0,1fr))}.three{grid-template-columns:repeat(3,minmax(0,1fr))}.four{grid-template-columns:repeat(4,minmax(0,1fr))}.card{min-width:0;padding:17px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.16)}.card p:last-child{margin-bottom:0}.tag{display:inline-block;padding:3px 8px;border:1px solid rgba(97,214,255,.2);border-radius:999px;color:var(--cyan);background:rgba(97,214,255,.12);font-size:.74rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.tag.good{color:var(--green);border-color:rgba(119,230,178,.25);background:rgba(119,230,178,.1)}.tag.warn{color:var(--yellow);border-color:rgba(255,212,122,.25);background:rgba(255,212,122,.1)}.tag.danger{color:var(--red);border-color:rgba(255,141,159,.25);background:rgba(255,141,159,.12)}.big{display:block;margin:2px 0;color:white;font-size:1.4rem;font-weight:700;letter-spacing:-.035em}.comparison{overflow:auto;border:1px solid var(--line);border-radius:16px}table{width:100%;min-width:740px;border-collapse:collapse}th,td{padding:13px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}th{color:#e9ebf5;background:rgba(0,0,0,.2);font-size:.78rem;text-transform:uppercase;letter-spacing:.07em}td{color:var(--muted)}td:first-child{color:white;font-weight:650}tbody tr:last-child td{border-bottom:0}.mermaid{margin:18px auto 0;padding:8px;min-height:200px;overflow:auto;text-align:center;background:rgba(0,0,0,.12);border:1px solid var(--line);border-radius:16px}.steps{counter-reset:item;list-style:none;padding:0;margin:18px 0 0;display:grid;gap:11px}.steps li{counter-increment:item;position:relative;padding:13px 14px 13px 52px;border:1px solid var(--line);border-radius:14px;background:rgba(0,0,0,.14)}.steps li:before{content:counter(item);position:absolute;top:13px;left:14px;width:25px;height:25px;display:grid;place-items:center;border-radius:50%;color:#071015;background:linear-gradient(135deg,var(--cyan),var(--violet));font-size:.77rem;font-weight:800}.notice{padding:13px 15px;border-left:3px solid var(--yellow);border-radius:7px 12px 12px 7px;background:rgba(255,212,122,.08);color:#ebdfbd}.notice strong{color:var(--yellow)}.mock{border:1px solid rgba(97,214,255,.28);border-radius:18px;padding:17px;background:linear-gradient(145deg,rgba(33,42,58,.94),rgba(17,18,24,.98));box-shadow:inset 0 1px rgba(255,255,255,.08)}.mock-title{display:flex;justify-content:space-between;gap:12px;align-items:center;font-weight:750}.status-row{display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:8px;margin-top:12px}.status-row div{min-width:0;padding:9px;border-radius:9px;background:rgba(255,255,255,.055);font-size:.8rem}.code{margin:0;padding:14px;white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:13px;background:#151821;color:#dce9fa;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}.source-list{columns:2 360px;padding-left:20px;color:var(--muted)}.source-list li{break-inside:avoid;margin-bottom:8px}.rule{height:1px;margin:24px 0;background:var(--line)}@media(max-width:760px){main{padding:14px 12px 50px}header,.section{padding:21px 17px;border-radius:18px}.two,.three,.four,.status-row{grid-template-columns:1fr}.source-list{columns:1}.verdict{grid-template-columns:1fr;gap:4px}}
+</style>
+</head>
+<body><main>
+<div class="eyebrow">MICE product direction · 22 July 2026</div>
+<header>
+  <div class="eyebrow">Decision: build a coordination substrate, not another agent launcher</div>
+  <h1>Turn parallel worktrees into one aware team.</h1>
+  <p class="lede">MICE should help incompatible coding agents share only the context that matters: work intent, dependency state, live change surfaces, decisions, and verified completion evidence. It should predict merge risk before review—not pretend it can know product intent from a filename.</p>
+  <div class="verdict"><b>Recommendation</b><span>Proceed only with a narrow, measured wedge: <strong>cross-harness activity capture → hunk-aware conflict forecasting → one actionable completion handoff</strong>. Worktree creation and a status board alone are table stakes.</span></div>
+</header>
+
+<section class="section">
+<div class="eyebrow">Market reality</div><h2>This is not an empty market. The unclaimed piece is the bridge.</h2>
+<p class="intro">Codex, Claude Code, GitHub Copilot, Conductor, and Vibe Kanban already run agents in parallel with isolated worktrees. Claude teams and Copilot subagents also provide same-vendor task/messaging primitives. Vibe Kanban and Conductor handle conflicts after integration has begun. The opportunity is not “many agents”; it is trustworthy coordination across tools and branches before human merge work accumulates.</p>
+<div class="comparison"><table><thead><tr><th>Current product</th><th>What is already strong</th><th>Boundary MICE can address</th></tr></thead><tbody>
+<tr><td>Codex app</td><td>Parallel agents, project threads, built-in worktrees, review queue and skills.</td><td>Its worktrees isolate sessions; MICE must be useful across Codex <em>and</em> other harnesses, with a shared project-level coordination record.</td></tr>
+<tr><td>Claude Code</td><td>Worktree sessions; experimental agent teams with a shared task list, mailbox, dependencies and idle notifications.</td><td>Those team primitives are inside a Claude team. MICE must accept a Claude participant without requiring the rest of the team to be Claude.</td></tr>
+<tr><td>GitHub Copilot app</td><td>Parallel workspaces with worktrees/branches, cloud sandboxes, PR lifecycle and multi-agent communication.</td><td>Project-local Git facts can coordinate a Copilot branch with local Codex, Claude, Cursor or custom terminal agents.</td></tr>
+<tr><td>Conductor / Vibe Kanban</td><td>Agent-agnostic workspace orchestration, logs, review, PR flow, setup scripts; Vibe offers reactive rebase-conflict help.</td><td>Both rely on worktree separation and downstream review. MICE can warn on an overlapping edit surface while agents are still able to adapt.</td></tr>
+</tbody></table></div>
+<p class="small" style="margin-top:14px">Important correction to the earlier MICE research: “worktrees + status + shared task lists” is no longer a differentiator. The experiment must prove that MICE prevents integration work or saves human attention beyond these mature baselines.</p>
+</section>
+
+<section class="section">
+<div class="eyebrow">Use the base, do not confuse it for the finished product</div><h2>MICE already has a seed of this feature.</h2>
+<div class="grid four">
+<div class="card"><span class="tag good">Exists</span><span class="big">Local MCP server</span><p class="metric"><code>mice connect</code>, <code>mice mcp-server</code>, and agent-facing tools already provide an opt-in integration point.</p></div>
+<div class="card"><span class="tag good">Exists</span><span class="big">Shared event memory</span><p class="metric">Append-only local events, agent subspaces, a query tool and a basic <code>team_status</code> view already live outside the repository.</p></div>
+<div class="card"><span class="tag warn">Gap</span><span class="big">Automatic truth</span><p class="metric">Current overlap depends on agent-reported files, has no repository/worktree identity, no liveness model, and treats historical touches as active.</p></div>
+<div class="card"><span class="tag warn">Gap</span><span class="big">Actionable delivery</span><p class="metric">There is no worktree registry, hunk-level predictor, inbox/adapter contract, completion state machine, or native coordination notification.</p></div>
+</div>
+<p class="small" style="margin-top:16px">Verified in the current codebase: <code>crates/mice-cli/src/memory.rs</code> persists append-only events and reports file overlap; <code>main.rs</code> already exposes <code>memory_note</code>, <code>memory_query</code>, and <code>team_status</code> through MICE MCP. The next milestone must evolve these rather than create a duplicate store.</p>
+</section>
+
+<section class="section">
+<div class="eyebrow">The product model</div><h2>Shared project knowledge, private agent memory, scoped context cards.</h2>
+<p class="intro">“Everyone shares all memory” sounds attractive but creates context pollution, privacy problems and stale instructions. Instead, each agent keeps its own transcript/private context. MICE holds a small, repo-scoped, inspectable coordination ledger and constructs a bounded context card only when an agent joins, asks, hits a risk, or becomes newly available.</p>
+<div class="mermaid">
+flowchart TD
+  U[Developer] -->|starts or attaches task| R[MICE coordination core]
+  A[Codex / Claude / Cursor / custom agent] -->|optional adapter or MCP events| R
+  G[Read-only Git observer: worktrees, branches, diffs, checks] --> R
+  R --> L[Local coordination ledger: intent, status, decisions, file and hunk facts]
+  R --> C[Scoped context card and inbox]
+  C --> A
+  R --> P[Risk and readiness engine]
+  P --> N[Swift native notification and team surface]
+  P --> S[Safe next-task suggestion]
+  N --> U
+  S --> U
+  classDef core fill:#263c5a,stroke:#61d6ff,color:#fff
+  classDef edge fill:#3b2b55,stroke:#cf78ff,color:#fff
+  classDef safe fill:#1f4a3d,stroke:#77e6b2,color:#fff
+  class R,L,P core
+  class A,G,C edge
+  class N,S,U safe
+</div>
+<div class="grid three" style="margin-top:18px">
+<div class="card"><h3>1. Identity and lifecycle</h3><p>Register every worktree under its Git <em>common directory</em>, base ref and branch; record harness, parent agent, task, leases and heartbeats. A distinct clone/repository is <em>not</em> a merge domain.</p></div>
+<div class="card"><h3>2. Git is the source of truth</h3><p>Read Git status, merge base, tracked paths, rename state and zero-context diffs. Agent claims add intent; Git observations prevent a stale or dishonest claim becoming truth.</p></div>
+<div class="card"><h3>3. Deliver only what applies</h3><p>On every agent’s next MICE tool call, return its messages plus only relevant decisions, dependencies and change risks. Managed adapters may inject sooner; generic terminals cannot be truthfully “pushed” into.</p></div>
+</div></section>
+
+<section class="section">
+<div class="eyebrow">Core interaction</div><h2>The completion popup is a triage handoff, not a celebration.</h2>
+<div class="grid two" style="align-items:center"><div><ol class="steps">
+<li><strong>Launch or attach.</strong> <code>mice team workspace create</code> creates a named worktree/branch; <code>mice team attach</code> adopts an existing one. MICE never needs to own the agent process to observe Git.</li>
+<li><strong>Observe and announce.</strong> A filesystem/Git watcher updates active changes. A voluntary adapter reports intent, task state, summary, parent/child relation and checks.</li>
+<li><strong>Warn at the right precision.</strong> Same file is yellow only; intersecting changed line ranges against a shared merge base is red. Both agents receive a short, attributed risk message at the next supported delivery point.</li>
+<li><strong>Finish with evidence.</strong> “Ready” requires a managed-process exit or agent completion event <em>and</em> a clean state/declared checks. Otherwise label it “possibly idle,” never “finished.”</li>
+<li><strong>Offer one safe next action.</strong> Suggest an unclaimed, dependency-ready task with a declared or inferred disjoint surface. The human approves reassignment; MICE does not silently re-task an agent.</li>
+</ol></div>
+<div class="mock"><div class="mock-title"><span>Agent 4 is ready for review</span><span class="tag good">Verified</span></div><p class="metric" style="margin:8px 0 0">feat/search-index · 3 files · tests: 47 passed · branch is 2 commits ahead</p><div class="status-row"><div><b>Agent 1</b><br><span class="metric">coding · auth service</span></div><div><b>Agent 2</b><br><span class="metric">waiting on Agent 1</span></div><div><b>Agent 3</b><br><span class="metric">reviewing · no risk</span></div></div><div class="notice" style="margin-top:12px"><strong>Suggested:</strong> Agent 4 can take docs task #9. Its declared surface is disjoint; it does not depend on active work.</div><p class="small" style="margin:13px 0 0"><span class="tag">Actions</span> Review diff · Open team · Send next task · Snooze</p></div></div>
+</section>
+
+<section class="section">
+<div class="eyebrow">Merge intelligence</div><h2>Predict, explain, and only then resolve—under explicit control.</h2>
+<div class="grid two"><div class="card"><h3>Risk ladder</h3><p><span class="tag good">Green</span> distinct paths or only generated/lock-file churn (suppressed by policy).</p><p><span class="tag warn">Yellow</span> same file, but currently disjoint hunks or a rename/API dependency signal; show once, dedupe until the fact changes.</p><p><span class="tag danger">Red</span> changed line intervals overlap relative to the same merge base, or a read-only merge simulation finds a textual conflict. Include branches, intervals, author intent and the safest next move.</p></div>
+<div class="card"><h3>What MICE must never claim</h3><p>A file overlap is not automatically a merge conflict. A clean textual merge is not automatically a correct integration. Different repositories cannot have a Git merge conflict merely because paths match.</p><p>Automatic resolution is a separate, guarded operation: create a disposable integration worktree/branch, produce a proposed diff and test report, then require human confirmation before any target branch mutation.</p></div></div>
+<div class="grid two" style="margin-top:16px"><div class="card"><h3>Deterministic first pass</h3><pre class="code">base = merge-base(branch_a, branch_b)
+changes = diff(base → each worktree, including uncommitted)
+classify(path, renamed_path, hunk_intervals, generated_policy)
+if committed: read-only merge-tree simulation
+if red: durable risk event + deduplicated inbox notice</pre></div><div class="card"><h3>Semantic assistance is advisory</h3><p>After deterministic evidence says “red,” a model may summarize each side’s declared intent and draft resolution choices. It must cite live file ranges and never write its answer into persistent memory as source truth. Display relevant code ephemerally, not in MICE’s ledger.</p></div></div>
+</section>
+
+<section class="section">
+<div class="eyebrow">Portable contract</div><h2>Make adapters thin; make the coordination core vendor-neutral.</h2>
+<div class="grid two"><div class="card"><h3>Normalized agent event</h3><pre class="code">AgentEvent {
+  repo_id, worktree_id, agent_id, parent_agent_id?,
+  harness, branch, task_id?, lifecycle,
+  declared_surface?, summary?, checks?, observed_at,
+  delivery_capability
+}</pre><p class="small"><code>lifecycle</code>: attached · planning · working · blocked · awaiting_review · completed · idle_unknown · exited. Git facts are captured by MICE, not trusted from the adapter.</p></div>
+<div class="card"><h3>First MCP additions</h3><pre class="code">team_join          task_claim / task_release
+coordination_pull  activity_checkpoint
+report_completion  risk_acknowledge
+team_status_v2     prepare_merge_resolution</pre><p class="small">Retain current <code>memory_note</code>, <code>memory_query</code>, and <code>team_status</code> as backwards-compatible aliases while migrating their store/schema.</p></div></div>
+<div class="notice" style="margin-top:16px"><strong>Delivery truth:</strong> an adapter declares whether it can deliver a message at the next tool call, through managed stdin/session APIs, or not at all. With an unsupported agent, MICE alerts the human and puts the note in the context card for its next explicit interaction—no fake “told the agent” state.</div>
+</section>
+
+<section class="section">
+<div class="eyebrow">Delivery plan</div><h2>Build the proof before the command center.</h2>
+<div class="grid four">
+<div class="card"><span class="tag">P0 · 1–2 weeks</span><h3>Read-only shadow mode</h3><p>Repo/worktree registry, Git observer, baseline event schema and a local report. No popups, no agent messaging, no merge mutation.</p><p class="metric">Exit: reliable worktree discovery and labeled historical conflict dataset.</p></div>
+<div class="card"><span class="tag">P1 · 2–3 weeks</span><h3>Predictive pilot</h3><p>Hunk-aware risk engine, dedupe, activity context card and <code>team_status_v2</code>. Show risks in CLI/MCP only; compare predictions to real rebases/merges.</p><p class="metric">Exit: precision/recall threshold achieved in shadow data.</p></div>
+<div class="card"><span class="tag">P2 · 2 weeks</span><h3>Human attention loop</h3><p>New IPC notification type and Swift native completion/risk popups. Add task leases, dependencies and deterministic next-safe-task recommendation.</p><p class="metric">Exit: completion handoff reduces human polling, without alert fatigue.</p></div>
+<div class="card"><span class="tag">P3 · gated</span><h3>Adapters and resolution</h3><p>Codex/Claude connection adapters, delivery-capability UI, then an opt-in disposable integration-worktree resolution flow.</p><p class="metric">Exit: zero unsolicited branch mutations; successful proposals are reviewed and tested.</p></div>
+</div><div class="rule"></div><h3>Architecture ownership stays aligned with MICE</h3><div class="grid three"><div class="card"><b>Rust core</b><p class="metric">Registry, Git watcher/analysis, ledger, risk engine, task graph, MCP tools, and IPC commands. It owns facts and routing.</p></div><div class="card"><b>mice-ipc</b><p class="metric">New typed <code>coordination.notify</code>, <code>coordination.openTeam</code>, and action-response shapes—no duplicate Swift/Rust wire structs.</p></div><div class="card"><b>Swift macOS agent</b><p class="metric">Notification Center permission/state, compact native panel, review/open/snooze actions. It renders; it does not schedule or choose routing.</p></div></div>
+</section>
+
+<section class="section">
+<div class="eyebrow">The anti-gimmick test</div><h2>Success is less integration rework and less human coordination time—not more telemetry.</h2>
+<p class="intro">Run this as a within-subject study: identical task bundles, models, token budgets, base commits and harness mix; alternate baseline worktree tooling (Codex/Conductor/Vibe/CLI) with MICE enabled. Begin observationally, then enable one intervention at a time. Instrument no source text, credentials, captures or transcript bodies.</p>
+<div class="comparison"><table><thead><tr><th>Question</th><th>Metric and measurement</th><th>Go threshold</th><th>Stop / redesign signal</th></tr></thead><tbody>
+<tr><td>Does it speed integration?</td><td>Median time from task start to merged, green base; normalized by task bundle.</td><td>≥20% improvement <em>or</em> no slower delivery with meaningful attention saving.</td><td>Added coordination time exceeds benefit or test quality falls.</td></tr>
+<tr><td>Does it save the human?</td><td>Human minutes polling, relaying status, assigning follow-on work, and resolving integration per accepted change.</td><td>≥30% reduction; completion handoff has ≥4/5 usefulness.</td><td>People still open dashboards manually, or dismiss/snooze &gt;15% of notifications.</td></tr>
+<tr><td>Does it forecast conflicts?</td><td>Precision and recall of red alerts against later textual merge/rebase conflicts; warning lead time.</td><td>Precision ≥0.80, recall ≥0.85, median warning ≥60 seconds before first merge attempt.</td><td>File-level alert spam, or many conflicts arrive with no prior warning.</td></tr>
+<tr><td>Does shared context help?</td><td>Blinded handoff quiz: agent/user identifies owner, intended behavior, dependency and current state from its card.</td><td>≥25% accuracy gain; card stays ≤800 tokens / 3 seconds retrieval.</td><td>Context causes duplication, stale instructions or extra token cost without better decisions.</td></tr>
+<tr><td>Can it use idle capacity safely?</td><td>Verified-finished agent idle time turned into accepted, disjoint tasks; later overlap/rework rate.</td><td>≥25% of idle time is usefully redeployed; no material rework increase.</td><td>Suggested work causes collisions or users reject most suggestions.</td></tr>
+<tr><td>Is it safe and private?</td><td>Audit persistent ledger and command log; count false-complete states, unintended mutation and stored source/secrets.</td><td>0 stored source/secret/capture/transcript bodies; 0 unsolicited branch mutation; 0 false “verified complete.”</td><td>Any violation blocks P3.</td></tr>
+</tbody></table></div>
+<p class="small" style="margin-top:14px">Evaluate with at least 20 representative multi-agent task bundles across independent, same-file/disjoint-hunk, same-hunk, rename, generated-file, dependency, and intentionally semantic-conflict cases. Log every alert’s evidence and eventual ground truth to make the thresholds auditable.</p>
+</section>
+
+<section class="section">
+<div class="eyebrow">Hard product boundaries</div><h2>What keeps this useful instead of noisy or unsafe.</h2>
+<div class="grid three"><div class="card"><h3>Non-goal: clone Conductor</h3><p>MICE can create/attach worktrees, but should not lead with a kanban/PR product. Interoperate with those systems; own the cross-harness coordination facts.</p></div><div class="card"><h3>Non-goal: global transcript pooling</h3><p>Never persist raw diffs, commands, agent thought/transcripts, captures, clipboard or credentials in the coordination ledger. Use bounded summaries and Git-derived metadata with review/forget controls.</p></div><div class="card"><h3>Non-goal: autonomous merge authority</h3><p>Propose and test in a disposable integration worktree; only a human-confirmed action can alter a target branch. Keep evidence for every recommendation.</p></div></div>
+</section>
+
+<section class="section">
+<div class="eyebrow">Positioning</div><h2>The concise product promise</h2><p class="lede"><strong>MICE is the local coordination memory for a heterogeneous coding team.</strong> It sees the Git truth across worktrees, gives each agent the minimum useful context, warns before changes become merge work, and returns human attention to the highest-leverage moment.</p><div class="rule"></div><h3>Evidence reviewed</h3><ul class="source-list">
+<li><a href="https://openai.com/index/introducing-the-codex-app/">OpenAI — Introducing the Codex app</a>: parallel agents, project threads and built-in worktrees.</li>
+<li><a href="https://code.claude.com/docs/en/worktrees">Claude Code — Run parallel sessions with worktrees</a>: isolation and lifecycle.</li>
+<li><a href="https://code.claude.com/docs/en/agent-teams">Claude Code — Agent teams</a>: shared task list, mailbox, dependencies and idle notifications.</li>
+<li><a href="https://docs.github.com/en/copilot/concepts/agents/github-copilot-app">GitHub — Copilot app</a>: parallel workspaces, worktrees and PR lifecycle.</li>
+<li><a href="https://www.conductor.build/docs/concepts/parallel-agents">Conductor — Parallel agents</a>: independent-workspace versus shared-workspace trade-off.</li>
+<li><a href="https://vibekanban.com/docs/core-features/monitoring-task-execution">Vibe Kanban — Monitoring task execution</a>: isolated worktrees and real-time monitoring.</li>
+<li><a href="https://vibekanban.com/docs/core-features/resolving-rebase-conflicts">Vibe Kanban — Resolving rebase conflicts</a>: reactive agent-assisted conflict resolution.</li>
+</ul></section>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
+mermaid.initialize({startOnLoad:true,theme:"dark",securityLevel:"strict",themeVariables:{primaryColor:"#263c5a",primaryTextColor:"#fff",primaryBorderColor:"#61d6ff",lineColor:"#b4b8c8",secondaryColor:"#3b2b55",tertiaryColor:"#1f4a3d",fontFamily:"-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"}});
+</script>
+</body></html>

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en" data-theme="luxury">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MICE — guide & confirmation UX review</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+  <style>
+    *,*::before,*::after{box-sizing:border-box} :where(.grid,.flex)>*{min-width:0} p,h1,h2,h3,li{overflow-wrap:anywhere}
+    .cyan-glow{border-radius:1.5rem;box-shadow:0 0 0 2px color-mix(in oklab,var(--color-info) 80%,transparent),0 0 26px color-mix(in oklab,var(--color-info) 45%,transparent)}
+    .guide-frame{border:2px solid transparent;border-radius:1.25rem;background:linear-gradient(var(--color-base-200),var(--color-base-200)) padding-box,linear-gradient(125deg,#62d6ff 0%,#7d8dff 26%,#cf78ff 51%,#ff8fbc 74%,#ffd47b 100%) border-box;box-shadow:0 0 15px #62d6ff88,0 0 26px #cf78ff70,0 0 36px #ffbc6d55}
+    .guide-panel{border-radius:1.5rem;background:linear-gradient(145deg,color-mix(in oklab,var(--color-base-200) 90%,#11213a),var(--color-base-200));box-shadow:0 18px 55px #0009,0 0 0 1px #ffffff1a inset}
+    .mock-window{background:linear-gradient(140deg,color-mix(in oklab,var(--color-base-200) 88%,#07131a),var(--color-base-100))}
+    header h1{font-size:clamp(2.2rem,5.4vw,3.75rem);line-height:1.08;padding-bottom:.12em}
+    .stat{overflow:hidden;width:100%;padding:1rem;min-width:0}.stat-title,.stat-value,.stat-desc{white-space:normal;min-width:0}
+  </style>
+</head>
+<body class="bg-base-300 text-base-content min-h-screen">
+<main class="mx-auto max-w-6xl p-5 md:p-10 space-y-8">
+  <header class="hero rounded-box mock-window border border-base-content/10 overflow-hidden">
+    <div class="hero-content text-center py-12"><div>
+      <div class="badge badge-info badge-outline mb-4">MICE · PRODUCT POLISH</div>
+      <h1 class="font-bold tracking-tight">One calm place to ask,<br>plan, and keep moving.</h1>
+      <p class="mt-5 text-lg opacity-70 max-w-2xl">A command palette replaces modal prompts; a compact guide stays visible without taking over the screen; every action remains human-confirmed.</p>
+    </div></div>
+  </header>
+
+  <section class="grid md:grid-cols-3 gap-4">
+    <div class="stat bg-base-100 rounded-box border border-base-content/10"><div class="stat-title">Primary surface</div><div class="stat-value text-info">⌘?</div><div class="stat-desc">Ctrl + Shift + Space opens the palette</div></div>
+    <div class="stat bg-base-100 rounded-box border border-base-content/10"><div class="stat-title">Safety boundary</div><div class="stat-value text-info">1</div><div class="stat-desc">One proposed action, then one explicit confirmation</div></div>
+    <div class="stat bg-base-100 rounded-box border border-base-content/10"><div class="stat-title">Attention cost</div><div class="stat-value text-info">0</div><div class="stat-desc">No modal alert blocks the app behind it</div></div>
+  </section>
+
+  <section class="grid lg:grid-cols-2 gap-6 items-start">
+    <article class="card bg-base-100 card-border"><div class="card-body gap-5"><div><span class="badge badge-info badge-soft">01 · COMMAND PALETTE</span><h2 class="card-title text-2xl mt-3">Ask in place. Keep your context.</h2><p class="opacity-70">The palette captures the active app and current selection once, then becomes a normal key window. Esc restores focus.</p></div>
+      <div class="rounded-box mock-window border border-base-content/10 p-4 cyan-glow">
+        <div class="flex items-center gap-3 text-info mb-3"><span class="kbd">⌃</span><span class="kbd">⇧</span><span class="kbd">Space</span><span class="text-sm opacity-70">MICE</span></div>
+        <div class="input input-lg input-bordered input-info w-full flex items-center bg-base-200"> <span class="opacity-40">›</span><span class="ml-2">plan make a budget spreadsheet</span></div>
+        <div class="mt-3 text-sm opacity-60">ask · see · sheet · summarize · define · plan · remember · history</div>
+      </div>
+      <div class="alert alert-info alert-soft text-sm"><span><b>Selected text stays private:</b> only the submitted command and bounded result digest enter local history.</span></div>
+    </div></article>
+
+    <article class="card bg-base-100 card-border"><div class="card-body gap-5"><div><span class="badge badge-info badge-soft">02 · PLAN REVIEW</span><h2 class="card-title text-2xl mt-3">Review the route before MICE guides.</h2><p class="opacity-70">Plans are advisory. Accept begins guidance; Revise returns to the palette; Cancel discards the session.</p></div>
+      <div class="rounded-box border border-base-content/10 bg-base-200 p-4 space-y-3">
+        <div class="font-semibold">Plan · Create a budget spreadsheet</div>
+        <ol class="list-decimal ml-5 space-y-1 text-sm opacity-85"><li>Open your preferred spreadsheet app.</li><li>Create columns for income, fixed costs, and savings.</li><li>Enter your own numbers.</li><li>Review totals and adjust categories.</li></ol>
+        <div class="flex flex-wrap gap-2 pt-2"><button class="btn btn-info btn-sm">Accept plan</button><button class="btn btn-ghost btn-sm">Revise</button><button class="btn btn-ghost btn-sm">Cancel</button></div>
+      </div>
+    </div></article>
+  </section>
+
+  <section class="card bg-base-100 card-border"><div class="card-body"><div class="flex flex-wrap justify-between gap-3"><div><span class="badge badge-info badge-soft">03 · GUIDE PANEL</span><h2 class="card-title text-2xl mt-3">Small, persistent, and never mysterious.</h2></div><span class="badge badge-outline">Non-activating</span></div>
+    <div class="grid lg:grid-cols-[1fr_310px] gap-6 mt-4 items-center"><div class="rounded-box mock-window min-h-64 p-8 relative"><div class="guide-frame absolute left-[30%] top-[28%] w-52 h-12 rounded-lg"></div><span class="absolute left-[30%] top-[17%] badge badge-info">Income column</span><p class="opacity-45 text-center pt-16">Your app stays usable. MICE only highlights a target.</p></div>
+      <div class="guide-panel border border-base-content/10 p-5 space-y-3 shadow-xl"><div class="flex justify-between text-sm"><span class="badge badge-info">Step 2 of 4</span><button class="btn btn-ghost btn-xs">×</button></div><h3 class="font-bold">Add your income categories</h3><p class="text-sm opacity-70">Create rows for salary, freelance work, and any recurring income. Enter the amounts yourself.</p><div class="flex gap-2"><button class="btn btn-ghost btn-sm">Back</button><button class="btn btn-info btn-sm flex-1">Next</button><button class="btn btn-ghost btn-sm">Quit</button></div></div>
+    </div></div></section>
+
+  <section class="card bg-base-100 card-border"><div class="card-body"><span class="badge badge-info badge-soft w-fit">CONFIRMATION LADDER</span><h2 class="card-title text-2xl mt-3">Guidance is automatic. Actions are not.</h2>
+    <pre class="mermaid">
+flowchart TD
+  A[Palette command] --> B[Model creates advisory plan]
+  B --> C{Person accepts?}
+  C -- Revise / cancel --> A
+  C -- Accept --> D[Guide panel: highlight + explain]
+  D --> E{Person requests “Do it”?}
+  E -- No --> F[Person acts; presses Next]
+  E -- Yes --> G[Show target, label, and exact proposed action]
+  G --> H{Person confirms?}
+  H -- No --> D
+  H -- Yes, only safe verified action --> I[AXI performs one action]
+  I --> D
+    </pre>
+  </div></section>
+
+  <section class="card bg-base-100 card-border"><div class="card-body"><h2 class="card-title">Choose the visual emphasis</h2><p class="opacity-70">This choice guides the native panel’s animation and density. It does not change the safety model.</p>
+    <form data-lavish-question="guide-style" class="grid md:grid-cols-3 gap-3" onsubmit="event.preventDefault();const v=new FormData(event.currentTarget).get('style');if(v)window.lavish.queuePrompt('Use the '+v+' guide visual direction.',{tag:'ux-choice',text:'Guide visual direction: '+v,element:event.currentTarget,data:{style:v}});">
+      <label class="card card-border bg-base-200 cursor-pointer"><div class="card-body p-4"><input class="radio radio-info" type="radio" name="style" value="Calm (recommended)" checked><b>Calm</b><span class="text-sm opacity-70">Subtle cyan pulse, compact copy, low distraction.</span></div></label>
+      <label class="card card-border bg-base-200 cursor-pointer"><div class="card-body p-4"><input class="radio radio-info" type="radio" name="style" value="Teaching"><b>Teaching</b><span class="text-sm opacity-70">More explanation and stronger step labels.</span></div></label>
+      <label class="card card-border bg-base-200 cursor-pointer"><div class="card-body p-4"><input class="radio radio-info" type="radio" name="style" value="Minimal"><b>Minimal</b><span class="text-sm opacity-70">Only target frame and short next instruction.</span></div></label>
+      <div class="md:col-span-3"><button class="btn btn-info">Queue visual direction</button></div>
+    </form>
+  </div></section>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
+mermaid.initialize({startOnLoad:true,theme:"dark",securityLevel:"strict"});
+</script>
+</body></html>
