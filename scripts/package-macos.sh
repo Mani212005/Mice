@@ -151,8 +151,10 @@ echo "==> Checksums"
 cat <<NOTES
 
 Done: $APP
-Install: drag MICE.app to /Applications, then add the CLI to your shell:
-  alias mice="/Applications/MICE.app/Contents/MacOS/mice"
+Install once (no administrator password or shell-profile edit required):
+  "$APP/Contents/MacOS/mice" install
+Then, from any folder:
+  mice
 First run: grant Accessibility, Screen Recording, and Input Monitoring to
 MICE.app in System Settings > Privacy & Security when prompted.
 NOTES
