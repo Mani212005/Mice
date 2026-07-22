@@ -10,7 +10,10 @@ private struct GestureTrigger {
     let requiredFlags: CGEventFlags
 
     static func fromEnvironment() -> Self {
-        switch ProcessInfo.processInfo.environment["MICE_GESTURE_TRIGGER"] {
+        // Palette is the primary configurable shortcut. The legacy trigger
+        // remains a fallback for older daemon/core pairs during upgrades.
+        switch ProcessInfo.processInfo.environment["MICE_PALETTE_TRIGGER"]
+            ?? ProcessInfo.processInfo.environment["MICE_GESTURE_TRIGGER"] {
         case "ctrl+alt+space":
             return Self(requiredFlags: [.maskControl, .maskAlternate])
         case "cmd+shift+space":
@@ -27,6 +30,27 @@ private struct GestureTrigger {
 }
 
 private let gestureTrigger = GestureTrigger.fromEnvironment()
+/// Only the resident `mice start` agent owns the palette. Short-lived status
+/// probes and overlay-only commands must not consume a global shortcut.
+private let daemonMode = ProcessInfo.processInfo.environment["MICE_DAEMON"] == "1"
+
+private let paletteInputByteLimit = 32 * 1024
+private let paletteSelectionByteLimit = 256 * 1024
+
+/// Keep palette frames comfortably below the shared 16 MiB protocol ceiling
+/// without splitting a Unicode character. This is an input boundary, not a
+/// content observer: it runs only after the person explicitly invokes MICE.
+private func boundedPaletteText(_ value: String, maxUTF8Bytes: Int) -> String {
+    var used = 0
+    var output = String()
+    for character in value {
+        let bytes = String(character).utf8.count
+        guard used + bytes <= maxUTF8Bytes else { break }
+        output.append(character)
+        used += bytes
+    }
+    return output
+}
 
 private enum SelectionGesture {
     static let summarize = ProcessInfo.processInfo.environment[
@@ -83,6 +107,16 @@ private enum AutopilotStopGesture {
 /// never creates its global event tap, so `mice ask` works without an Input
 /// Monitoring grant and observes no input at all.
 private let overlayOnlyMode = ProcessInfo.processInfo.environment["MICE_OVERLAY_ONLY"] == "1"
+/// `mice home` launches a display-only helper. Closing its reference surface
+/// must also end that helper, while Esc in the resident daemon merely hides
+/// the panel and leaves gestures running.
+private let homeOnlyMode = ProcessInfo.processInfo.environment["MICE_HOME_ONLY"] == "1"
+/// A display-only Home helper receives this verified launch-time fact from
+/// the Rust core. It must never synthesize a global shortcut unless the
+/// resident daemon socket was reachable when Home opened.
+private let homeHasResidentDaemon = ProcessInfo.processInfo.environment[
+    "MICE_HOME_HAS_RESIDENT_DAEMON"
+] == "1"
 
 private struct ClipboardSnapshot {
     private let items: [[(type: NSPasteboard.PasteboardType, data: Data)]]
@@ -154,6 +188,12 @@ struct MiceMacAgent {
                         // the foreground app while dismissing only MICE.
                         return Unmanaged.passUnretained(event)
                     }
+                    // Palette typing is an explicit foreground interaction.
+                    // Do not let its normal modifier keys trigger a second
+                    // global capture surface underneath the text field.
+                    if OverlayController.isPaletteActive {
+                        return Unmanaged.passUnretained(event)
+                    }
                     if AutopilotStopGesture.matches(event) {
                         Task { @MainActor in
                             MiceMacAgent.cancelHover()
@@ -161,16 +201,21 @@ struct MiceMacAgent {
                         }
                         return nil
                     }
-                    if GoalGesture.matches(event) {
+                    if daemonMode && GoalGesture.matches(event) {
                         Task { @MainActor in
                             MiceMacAgent.cancelHover()
+                            // The core either reopens the outstanding reviewed
+                            // plan or asks the palette for a new one. This
+                            // makes Goal Guide recoverable after Esc/focus
+                            // changes without regenerating the plan.
                             MiceMacAgent.requestGoal()
                         }
                         return nil
                     }
-                    if gestureTrigger.matches(event) {
-                        Task {
-                            await MiceMacAgent.triggerCapture()
+                    if daemonMode && gestureTrigger.matches(event) {
+                        Task { @MainActor in
+                            MiceMacAgent.cancelHover()
+                            OverlayController.showPaletteActive()
                         }
                         return nil
                     }
@@ -190,6 +235,10 @@ struct MiceMacAgent {
                     }
                 }
                 if type == .mouseMoved {
+                    if OverlayController.isPaletteActive {
+                        Task { @MainActor in MiceMacAgent.cancelHover() }
+                        return Unmanaged.passUnretained(event)
+                    }
                     let point = event.location
                     Task { @MainActor in
                         if event.flags.contains(.maskControl)
@@ -201,6 +250,10 @@ struct MiceMacAgent {
                     }
                 }
                 if type == .flagsChanged {
+                    if OverlayController.isPaletteActive {
+                        Task { @MainActor in MiceMacAgent.cancelHover() }
+                        return Unmanaged.passUnretained(event)
+                    }
                     Task { @MainActor in
                         if MiceMacAgent.isControlKey(event),
                            event.flags.contains(.maskControl),
@@ -812,6 +865,68 @@ struct MiceMacAgent {
         writeFrame(data)
     }
 
+    /// Home is a display-only helper when a resident daemon already owns the
+    /// core/agent IPC loop. Forward its explicit Open Palette button through
+    /// the user's configured global gesture, which the resident agent already
+    /// owns. This avoids a second palette request loop and keeps the helper
+    /// from ever observing input on its own.
+    static func requestPaletteFromResidentDaemon() -> Bool {
+        guard homeHasResidentDaemon else { return false }
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: false) else { return false }
+        down.flags = gestureTrigger.requiredFlags
+        up.flags = gestureTrigger.requiredFlags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
+    /// The Home reference panel can be a short-lived display-only helper
+    /// while the resident daemon owns MICE's real IPC loop. Replaying the
+    /// configured Goal gesture reaches that daemon, which can either resume a
+    /// reviewed plan or open a fresh goal request. Writing `goal.request`
+    /// from the helper itself would only write to an unread stdout pipe.
+    static func requestGoalFromResidentDaemon() -> Bool {
+        guard homeHasResidentDaemon else { return false }
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: false) else { return false }
+        down.flags = [.maskControl, .maskAlternate]
+        up.flags = [.maskControl, .maskAlternate]
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
+    static func sendPaletteSubmitted(
+        sessionID: String,
+        text: String,
+        frontAppName: String?,
+        selectionText: String?
+    ) {
+        var params: [String: Any] = ["sessionId": sessionID, "text": text]
+        if let frontAppName, !frontAppName.isEmpty { params["frontAppName"] = frontAppName }
+        if let selectionText, !selectionText.isEmpty { params["selectionText"] = selectionText }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "palette.submitted",
+            "params": params,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        writeFrame(data)
+    }
+
+    static func sendPaletteDismissed(sessionID: String) {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "palette.dismissed",
+            "params": ["sessionId": sessionID],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        writeFrame(data)
+    }
+
     static func stopAutopilot() {
         let payload: [String: Any] = [
             "jsonrpc": "2.0",
@@ -950,21 +1065,24 @@ struct MiceMacAgent {
             .joined(separator: "\u{1F}")
         guard !fingerprint.isEmpty, fingerprint != lastHoverFingerprint else { return }
         lastHoverFingerprint = fingerprint
+        let appName = NSWorkspace.shared.frontmostApplication?.localizedName
+        var params: [String: Any] = [
+            "sessionId": UUID().uuidString,
+            "ax": [
+                "role": description.role ?? "",
+                "title": description.title ?? "",
+                "description": description.description ?? "",
+                "value": description.value ?? "",
+                "help": description.help ?? "",
+                "actions": description.actions,
+            ],
+            "text": text,
+        ]
+        if let appName, !appName.isEmpty { params["appName"] = appName }
         let payload: [String: Any] = [
             "jsonrpc": "2.0",
             "method": "hover.captured",
-            "params": [
-                "sessionId": UUID().uuidString,
-                "ax": [
-                    "role": description.role ?? "",
-                    "title": description.title ?? "",
-                    "description": description.description ?? "",
-                    "value": description.value ?? "",
-                    "help": description.help ?? "",
-                    "actions": description.actions,
-                ],
-                "text": text,
-            ],
+            "params": params,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         writeFrame(data)
@@ -1021,6 +1139,634 @@ struct MiceMacAgent {
     }
 }
 
+/// A deliberately non-activating control surface for the Goal Guide. It keeps
+/// the user's app in front of the keyboard focus chain while offering explicit
+/// next/back/quit choices. The core remains the owner of guide state.
+@MainActor
+private final class GuideStepPanel: NSPanel {
+    private let progressLabel = NSTextField(labelWithString: "")
+    private let appLabel = NSTextField(labelWithString: "")
+    private let instructionLabel = NSTextField(wrappingLabelWithString: "")
+    private let safetyLabel = NSTextField(wrappingLabelWithString: "")
+    private var sessionID = ""
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 244),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        isFloatingPanel = true
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let material = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
+        material.autoresizingMask = [.width, .height]
+        material.material = .hudWindow
+        material.blendingMode = .withinWindow
+        material.state = .active
+        material.wantsLayer = true
+        material.layer?.cornerRadius = 22
+        material.layer?.masksToBounds = true
+        contentView = material
+
+        let accent = CAGradientLayer()
+        accent.colors = OverlayController.miceAccentColors
+        accent.startPoint = CGPoint(x: 0, y: 0.5)
+        accent.endPoint = CGPoint(x: 1, y: 0.5)
+        accent.frame = NSRect(x: 20, y: 210, width: 420, height: 4)
+        accent.cornerRadius = 2
+        material.layer?.addSublayer(accent)
+
+        progressLabel.frame = NSRect(x: 24, y: 178, width: 170, height: 18)
+        progressLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        progressLabel.textColor = .secondaryLabelColor
+        material.addSubview(progressLabel)
+
+        appLabel.frame = NSRect(x: 210, y: 176, width: 226, height: 22)
+        appLabel.alignment = .right
+        appLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        appLabel.textColor = .secondaryLabelColor
+        appLabel.lineBreakMode = .byTruncatingTail
+        material.addSubview(appLabel)
+
+        instructionLabel.frame = NSRect(x: 24, y: 101, width: 412, height: 64)
+        instructionLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        instructionLabel.textColor = .labelColor
+        instructionLabel.maximumNumberOfLines = 3
+        material.addSubview(instructionLabel)
+
+        safetyLabel.frame = NSRect(x: 24, y: 67, width: 412, height: 26)
+        safetyLabel.font = .systemFont(ofSize: 12)
+        safetyLabel.textColor = .secondaryLabelColor
+        safetyLabel.maximumNumberOfLines = 2
+        material.addSubview(safetyLabel)
+
+        let whereButton = button(title: "Where?", action: #selector(whereClicked(_:)))
+        whereButton.frame = NSRect(x: 24, y: 20, width: 76, height: 30)
+        material.addSubview(whereButton)
+        let back = button(title: "Back", action: #selector(backClicked(_:)))
+        back.frame = NSRect(x: 116, y: 20, width: 68, height: 30)
+        material.addSubview(back)
+        let doIt = button(title: "Do it", action: #selector(doItClicked(_:)))
+        doIt.frame = NSRect(x: 192, y: 20, width: 68, height: 30)
+        doIt.bezelColor = .controlAccentColor
+        material.addSubview(doIt)
+        let next = button(title: "Next", action: #selector(nextClicked(_:)))
+        next.frame = NSRect(x: 268, y: 20, width: 72, height: 30)
+        next.bezelColor = .controlAccentColor
+        material.addSubview(next)
+        let quit = button(title: "Quit", action: #selector(quitClicked(_:)))
+        quit.frame = NSRect(x: 350, y: 20, width: 86, height: 30)
+        material.addSubview(quit)
+    }
+
+    private func button(title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.font = .systemFont(ofSize: 13, weight: .medium)
+        return button
+    }
+
+    func present(
+        sessionID: String,
+        stepIndex: Int,
+        totalSteps: Int,
+        instruction: String,
+        appHint: String,
+        sensitive: Bool
+    ) {
+        self.sessionID = sessionID
+        progressLabel.stringValue = "STEP \(stepIndex + 1) OF \(totalSteps)"
+        appLabel.stringValue = appHint
+        instructionLabel.stringValue = instruction
+        safetyLabel.stringValue = sensitive
+            ? "This step is yours. MICE will only keep the target highlighted."
+            : "Review the highlighted target, complete the step, then choose Next."
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let visible = screen.visibleFrame
+            setFrameOrigin(NSPoint(x: visible.maxX - frame.width - 28, y: visible.minY + 28))
+        }
+        orderFrontRegardless()
+    }
+
+    private func send(_ action: String) {
+        guard !sessionID.isEmpty else { return }
+        // Avoid a stale panel accepting a second click while the core handles
+        // the first explicit decision.
+        orderOut(nil)
+        MiceMacAgent.sendGuideControl(sessionID: sessionID, action: action)
+    }
+
+    @objc private func whereClicked(_ sender: NSButton) { send("stay") }
+    @objc private func backClicked(_ sender: NSButton) { send("back") }
+    @objc private func doItClicked(_ sender: NSButton) { send("do-it") }
+    @objc private func nextClicked(_ sender: NSButton) { send("next") }
+    @objc private func quitClicked(_ sender: NSButton) { send("quit") }
+
+    func dismissFromGlobalEscape() {
+        send("quit")
+    }
+}
+
+/// The palette is the only MICE surface that deliberately becomes key: a
+/// person has explicitly invoked it and needs a normal text field. It captures
+/// front-app/selection context once before activation, then returns focus on
+/// Escape or close so it never becomes a hidden observer.
+@MainActor
+private final class PalettePanel: NSPanel, NSTextFieldDelegate {
+    private let input = NSTextField(string: "")
+    private let inputCard = NSView(frame: .zero)
+    private let hint = NSTextField(labelWithString: "Ask anything · plan a task · summarize selected text")
+    private let result = NSTextView(frame: .zero)
+    private let resultScroll = NSScrollView(frame: .zero)
+    private var sessionID = ""
+    private var previousApp: NSRunningApplication?
+    private var selectedText: String?
+    private var daemonDeadline: DispatchWorkItem?
+    private var timedOutSessionID: String?
+    private static let maxResultCharacters = 12_000
+
+    override var canBecomeKey: Bool { true }
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 124),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let material = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
+        material.autoresizingMask = [.width, .height]
+        material.material = .hudWindow
+        material.blendingMode = .withinWindow
+        material.state = .active
+        material.wantsLayer = true
+        material.layer?.cornerRadius = 24
+        material.layer?.masksToBounds = true
+        contentView = material
+
+        // A real card behind the text field is intentional. The standard
+        // rounded bezel can disappear on the dark HUD material, leaving an
+        // apparently blank palette even though the field is focused.
+        inputCard.frame = NSRect(x: 18, y: 54, width: 604, height: 50)
+        inputCard.wantsLayer = true
+        inputCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.26).cgColor
+        inputCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        inputCard.layer?.borderWidth = 1
+        inputCard.layer?.cornerRadius = 15
+        material.addSubview(inputCard)
+
+        input.frame = NSRect(x: 14, y: 7, width: 576, height: 36)
+        input.font = .systemFont(ofSize: 20, weight: .medium)
+        input.textColor = .labelColor
+        input.backgroundColor = .clear
+        input.isBordered = false
+        input.placeholderAttributedString = NSAttributedString(
+            string: "Ask MICE, or describe a task to make a plan…",
+            attributes: [.foregroundColor: NSColor.secondaryLabelColor]
+        )
+        input.focusRingType = .none
+        input.delegate = self
+        input.target = self
+        input.action = #selector(submit(_:))
+        inputCard.addSubview(input)
+
+        hint.frame = NSRect(x: 28, y: 25, width: 584, height: 20)
+        hint.font = .systemFont(ofSize: 12)
+        hint.textColor = .secondaryLabelColor
+        hint.lineBreakMode = .byTruncatingTail
+        material.addSubview(hint)
+
+        resultScroll.frame = NSRect(x: 24, y: 22, width: 592, height: 240)
+        resultScroll.hasVerticalScroller = true
+        resultScroll.autohidesScrollers = true
+        resultScroll.drawsBackground = false
+        resultScroll.isHidden = true
+        result.isEditable = false
+        result.isSelectable = true
+        result.drawsBackground = false
+        result.font = .systemFont(ofSize: 14)
+        result.textColor = .labelColor
+        result.textContainerInset = NSSize(width: 4, height: 4)
+        result.isVerticallyResizable = true
+        result.isHorizontallyResizable = false
+        result.autoresizingMask = [.width]
+        result.textContainer?.widthTracksTextView = true
+        resultScroll.documentView = result
+        material.addSubview(resultScroll)
+    }
+
+    func present(
+        sessionID: String? = nil,
+        prefill: String? = nil,
+        preservePreviousApp: Bool = false
+    ) {
+        daemonDeadline?.cancel()
+        timedOutSessionID = nil
+        if !preservePreviousApp {
+            previousApp = NSWorkspace.shared.frontmostApplication
+        }
+        let selection = MiceMacAgent.selectedText()
+        selectedText = selection.text.isEmpty
+            ? nil
+            : boundedPaletteText(selection.text, maxUTF8Bytes: paletteSelectionByteLimit)
+        self.sessionID = sessionID ?? UUID().uuidString
+        input.stringValue = prefill ?? ""
+        input.isEnabled = true
+        resultScroll.isHidden = true
+        inputCard.frame.origin.y = 54
+        hint.stringValue = "Ask anything · plan a task · summarize selected text"
+        setContentSize(NSSize(width: 640, height: 124))
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let visible = screen.visibleFrame
+            setFrameOrigin(NSPoint(
+                x: visible.midX - frame.width / 2,
+                y: visible.maxY - frame.height - 96
+            ))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(input)
+    }
+
+    func append(_ chunk: String, sessionID: String) {
+        guard sessionID == self.sessionID,
+              timedOutSessionID != sessionID,
+              !input.isEnabled else { return }
+        expandForResultIfNeeded()
+        let remaining = max(0, Self.maxResultCharacters - result.string.count)
+        guard remaining > 0 else { return }
+        result.string += String(chunk.prefix(remaining))
+        result.scrollToEndOfDocument(nil)
+    }
+
+    func finish(_ text: String?, sessionID: String) {
+        guard sessionID == self.sessionID, timedOutSessionID != sessionID else { return }
+        complete(text, sessionID: sessionID)
+    }
+
+    private func timeout(sessionID: String) {
+        guard sessionID == self.sessionID, !input.isEnabled else { return }
+        timedOutSessionID = sessionID
+        complete("MICE stopped responding. Check `mice status`, then try again.", sessionID: sessionID)
+    }
+
+    private func complete(_ text: String?, sessionID: String) {
+        guard sessionID == self.sessionID else { return }
+        daemonDeadline?.cancel()
+        if let text, !text.isEmpty {
+            expandForResultIfNeeded()
+            let remaining = max(0, Self.maxResultCharacters - result.string.count)
+            if remaining > 0 {
+                let bounded = String(text.prefix(remaining))
+                if result.string.isEmpty { result.string = bounded } else { result.string += bounded }
+            }
+        }
+        input.isEnabled = true
+        hint.stringValue = "Return asks again · Esc returns to your app"
+        makeFirstResponder(input)
+    }
+
+    func dismissAndRestoreFocus(
+        sessionID: String? = nil,
+        notifyCore: Bool = false,
+        restoreFocus: Bool = true
+    ) {
+        guard sessionID == nil || sessionID == self.sessionID else { return }
+        let dismissedSession = self.sessionID
+        let hadInFlightRequest = !input.isEnabled
+        daemonDeadline?.cancel()
+        orderOut(nil)
+        if restoreFocus {
+            previousApp?.activate(options: [])
+        }
+        if notifyCore, hadInFlightRequest, !dismissedSession.isEmpty {
+            MiceMacAgent.sendPaletteDismissed(sessionID: dismissedSession)
+        }
+    }
+
+    private func expandForResultIfNeeded() {
+        guard resultScroll.isHidden else { return }
+        resultScroll.isHidden = false
+        result.string = ""
+        hint.frame.origin.y = 278
+        inputCard.frame.origin.y = 307
+        setContentSize(NSSize(width: 640, height: 377))
+    }
+
+    @objc private func submit(_ sender: NSTextField) {
+        let fullText = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = boundedPaletteText(fullText, maxUTF8Bytes: paletteInputByteLimit)
+        guard !text.isEmpty else { return }
+        sender.isEnabled = false
+        hint.stringValue = text == fullText
+            ? "MICE is thinking…"
+            : "MICE is thinking… (input was safely shortened)"
+        result.string = ""
+        daemonDeadline?.cancel()
+        let requestSession = sessionID
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.sessionID == requestSession,
+                  !self.input.isEnabled else { return }
+            self.timeout(sessionID: requestSession)
+        }
+        daemonDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90, execute: deadline)
+        MiceMacAgent.sendPaletteSubmitted(
+            sessionID: sessionID,
+            text: text,
+            frontAppName: previousApp?.localizedName,
+            selectionText: selectedText
+        )
+    }
+
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:))
+            || commandSelector == #selector(NSResponder.insertLineBreak(_:))
+        {
+            submit(input)
+            return true
+        }
+        return false
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        dismissAndRestoreFocus(notifyCore: true)
+    }
+}
+
+/// A native reference panel rather than a web page. It intentionally uses
+/// normal AppKit controls so VoiceOver, keyboard focus, Escape, and the user's
+/// system appearance work without a separate rendering stack.
+@MainActor
+private final class HomePanel: NSPanel, NSWindowDelegate {
+    private let modeLabel = NSTextField(labelWithString: "")
+    private let modelLabel = NSTextField(labelWithString: "")
+    private let cloudLabel = NSTextField(labelWithString: "")
+    private let recentPlansLabel = NSTextField(wrappingLabelWithString: "")
+
+    override var canBecomeKey: Bool { true }
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 790, height: 650),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        title = "MICE Home"
+        isFloatingPanel = true
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        isReleasedWhenClosed = false
+        delegate = self
+
+        let background = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
+        background.autoresizingMask = [.width, .height]
+        background.material = .hudWindow
+        background.blendingMode = .withinWindow
+        background.state = .active
+        background.wantsLayer = true
+        contentView = background
+
+        let glow = CAGradientLayer()
+        glow.colors = OverlayController.miceAccentColors.map { $0.copy(alpha: 0.13) ?? $0 }
+        glow.startPoint = CGPoint(x: 0, y: 0)
+        glow.endPoint = CGPoint(x: 1, y: 1)
+        glow.frame = NSRect(x: 0, y: 460, width: 790, height: 190)
+        background.layer?.addSublayer(glow)
+
+        let hero = materialCard(NSRect(x: 24, y: 430, width: 742, height: 176))
+        background.addSubview(hero)
+        let eyebrow = label("YOUR DESKTOP COMPANION", frame: NSRect(x: 24, y: 137, width: 300, height: 16), size: 11, weight: .semibold)
+        eyebrow.textColor = .secondaryLabelColor
+        hero.addSubview(eyebrow)
+        let title = label("Make the next step\nfeel obvious.", frame: NSRect(x: 24, y: 69, width: 420, height: 66), size: 30, weight: .bold)
+        title.maximumNumberOfLines = 2
+        hero.addSubview(title)
+        let subtitle = label("Ask, understand, plan, and keep work moving —\nwith you in control.", frame: NSRect(x: 24, y: 27, width: 430, height: 35), size: 14, weight: .regular)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.maximumNumberOfLines = 2
+        hero.addSubview(subtitle)
+        let stripe = CAGradientLayer()
+        stripe.colors = OverlayController.miceAccentColors
+        stripe.frame = NSRect(x: 24, y: 18, width: 116, height: 4)
+        stripe.cornerRadius = 2
+        hero.layer?.addSublayer(stripe)
+        addGlassPrimaryButton(to: hero, title: "Ask MICE", frame: NSRect(x: 548, y: 104, width: 164, height: 42), action: #selector(openPalette(_:)))
+        let plan = button("Plan a goal", frame: NSRect(x: 548, y: 54, width: 164, height: 36), action: #selector(planGoal(_:)))
+        hero.addSubview(plan)
+
+        let start = materialCard(NSRect(x: 24, y: 54, width: 480, height: 354))
+        background.addSubview(start)
+        let startEyebrow = label("START HERE", frame: NSRect(x: 20, y: 318, width: 160, height: 16), size: 11, weight: .semibold)
+        startEyebrow.textColor = .secondaryLabelColor
+        start.addSubview(startEyebrow)
+        start.addSubview(label("What would you like to do?", frame: NSRect(x: 20, y: 287, width: 380, height: 25), size: 20, weight: .semibold))
+        addFeature(to: start, frame: NSRect(x: 20, y: 180, width: 212, height: 88), title: "Understand anything", detail: "Hover a control or select text.", action: "Try hover explain", selector: #selector(openPalette(_:)))
+        addFeature(to: start, frame: NSRect(x: 248, y: 180, width: 212, height: 88), title: "Guide me safely", detail: "Review a goal before starting.", action: "Start a plan", selector: #selector(planGoal(_:)))
+        addFeature(to: start, frame: NSRect(x: 20, y: 76, width: 212, height: 88), title: "Work with selections", detail: "Recap, define, or Smart Copy.", action: "Selection actions", selector: #selector(openPalette(_:)))
+        addFeature(to: start, frame: NSRect(x: 248, y: 76, width: 212, height: 88), title: "Keep things tidy", detail: "Review cleanup suggestions.", action: "Explore files", selector: #selector(showFilesHint(_:)))
+
+        let status = materialCard(NSRect(x: 522, y: 54, width: 244, height: 354))
+        background.addSubview(status)
+        let statusEyebrow = label("AT A GLANCE", frame: NSRect(x: 18, y: 318, width: 180, height: 16), size: 11, weight: .semibold)
+        statusEyebrow.textColor = .secondaryLabelColor
+        status.addSubview(statusEyebrow)
+        status.addSubview(label("Ready when you are", frame: NSRect(x: 18, y: 288, width: 210, height: 25), size: 18, weight: .semibold))
+        modeLabel.frame = NSRect(x: 18, y: 248, width: 208, height: 19)
+        modelLabel.frame = NSRect(x: 18, y: 222, width: 208, height: 19)
+        cloudLabel.frame = NSRect(x: 18, y: 196, width: 208, height: 19)
+        [modeLabel, modelLabel, cloudLabel].forEach { field in
+            field.font = .systemFont(ofSize: 12, weight: .medium)
+            field.textColor = .secondaryLabelColor
+            status.addSubview(field)
+        }
+        let shortcutTitle = label("YOUR SHORTCUTS", frame: NSRect(x: 18, y: 158, width: 170, height: 16), size: 11, weight: .semibold)
+        shortcutTitle.textColor = .secondaryLabelColor
+        status.addSubview(shortcutTitle)
+        addShortcut(to: status, frame: NSRect(x: 18, y: 118, width: 208, height: 29), name: "Open MICE", keys: "⌃ ⇧ Space")
+        addShortcut(to: status, frame: NSRect(x: 18, y: 82, width: 208, height: 29), name: "Plan a goal", keys: "⌃ ⌥ Space")
+        let plansTitle = label("RECENT PLANS", frame: NSRect(x: 18, y: 48, width: 170, height: 16), size: 11, weight: .semibold)
+        plansTitle.textColor = .secondaryLabelColor
+        status.addSubview(plansTitle)
+        recentPlansLabel.frame = NSRect(x: 18, y: 10, width: 208, height: 34)
+        recentPlansLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        recentPlansLabel.textColor = .secondaryLabelColor
+        recentPlansLabel.maximumNumberOfLines = 2
+        status.addSubview(recentPlansLabel)
+    }
+
+    func present(_ text: String) {
+        modeLabel.stringValue = text.contains("local only") ? "●  Privacy · Local only" : "●  Privacy · Cloud allowed"
+        modeLabel.textColor = text.contains("local only") ? .systemGreen : .secondaryLabelColor
+        modelLabel.stringValue = text.components(separatedBy: "Local model: ").dropFirst().first?.components(separatedBy: "\n").first.map { "Local · \($0)" } ?? "Local model ready"
+        cloudLabel.stringValue = text.components(separatedBy: "Cloud model: ").dropFirst().first?.components(separatedBy: "\n").first.map { "Cloud · \($0)" } ?? "Browser actions · Confirm each"
+        recentPlansLabel.stringValue = text.components(separatedBy: "Recent plans:\n").dropFirst().first?.components(separatedBy: "\n\n").first ?? "No saved plans yet."
+        center()
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(self)
+    }
+
+    private func materialCard(_ frame: NSRect) -> NSVisualEffectView {
+        let card = NSVisualEffectView(frame: frame)
+        card.material = .hudWindow
+        card.blendingMode = .withinWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 18
+        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        card.layer?.borderWidth = 1
+        card.layer?.masksToBounds = true
+        return card
+    }
+
+    private func label(_ value: String, frame: NSRect, size: CGFloat, weight: NSFont.Weight) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: value)
+        field.frame = frame
+        field.font = .systemFont(ofSize: size, weight: weight)
+        field.textColor = .labelColor
+        return field
+    }
+
+    private func button(_ title: String, frame: NSRect, action: Selector) -> NSButton {
+        let control = NSButton(title: title, target: self, action: action)
+        control.frame = frame
+        control.bezelStyle = .rounded
+        control.font = .systemFont(ofSize: 13, weight: .semibold)
+        return control
+    }
+
+    private func addGlassPrimaryButton(to view: NSView, title: String, frame: NSRect, action: Selector) {
+        let glow = CAGradientLayer()
+        glow.colors = [
+            NSColor.systemPink.cgColor, NSColor.systemOrange.cgColor,
+            NSColor.systemTeal.cgColor, NSColor.systemBlue.cgColor,
+            NSColor.systemPurple.cgColor,
+        ]
+        glow.startPoint = CGPoint(x: 0, y: 0)
+        glow.endPoint = CGPoint(x: 1, y: 1)
+        glow.frame = frame
+        glow.cornerRadius = 13
+        view.layer?.addSublayer(glow)
+        let control = NSButton(title: title, target: self, action: action)
+        control.frame = frame.insetBy(dx: 1, dy: 1)
+        control.isBordered = false
+        control.font = .systemFont(ofSize: 14, weight: .bold)
+        control.contentTintColor = .white
+        view.addSubview(control)
+    }
+
+    private func addFeature(to view: NSView, frame: NSRect, title: String, detail: String, action: String, selector: Selector) {
+        let card = NSView(frame: frame)
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.12).cgColor
+        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        card.layer?.borderWidth = 1
+        card.layer?.cornerRadius = 13
+        view.addSubview(card)
+        card.addSubview(label(title, frame: NSRect(x: 12, y: 56, width: 188, height: 18), size: 13, weight: .semibold))
+        let detailLabel = label(detail, frame: NSRect(x: 12, y: 34, width: 188, height: 18), size: 11, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+        card.addSubview(detailLabel)
+        let control = button(action, frame: NSRect(x: 10, y: 8, width: 112, height: 21), action: selector)
+        control.font = .systemFont(ofSize: 11, weight: .semibold)
+        card.addSubview(control)
+    }
+
+    private func addShortcut(to view: NSView, frame: NSRect, name: String, keys: String) {
+        let row = NSView(frame: frame)
+        row.wantsLayer = true
+        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
+        row.layer?.cornerRadius = 8
+        view.addSubview(row)
+        let nameLabel = label(name, frame: NSRect(x: 8, y: 7, width: 95, height: 16), size: 11, weight: .medium)
+        nameLabel.textColor = .secondaryLabelColor
+        row.addSubview(nameLabel)
+        let keyLabel = label(keys, frame: NSRect(x: 105, y: 6, width: 95, height: 17), size: 11, weight: .semibold)
+        keyLabel.alignment = .right
+        row.addSubview(keyLabel)
+    }
+
+    @objc private func openPalette(_ sender: NSButton) {
+        // A Home-only helper has no request loop of its own. Its button
+        // invokes the configured palette gesture for the resident daemon,
+        // whose agent/core pair owns the resulting request and response.
+        if !daemonMode {
+            guard MiceMacAgent.requestPaletteFromResidentDaemon() else {
+                showResidentDaemonRequired()
+                return
+            }
+            orderOut(nil)
+            return
+        }
+        orderOut(nil)
+        OverlayController.showPaletteActive()
+    }
+
+    @objc private func planGoal(_ sender: NSButton) {
+        if !daemonMode {
+            guard MiceMacAgent.requestGoalFromResidentDaemon() else {
+                showResidentDaemonRequired()
+                return
+            }
+            orderOut(nil)
+            return
+        }
+        orderOut(nil)
+        MiceMacAgent.requestGoal()
+    }
+
+    private func showResidentDaemonRequired() {
+        let alert = NSAlert()
+        alert.messageText = "MICE is not running"
+        alert.informativeText = "Start MICE, then reopen Home to use Ask MICE or Plan a goal."
+        alert.addButton(withTitle: "Got it")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    @objc private func showFilesHint(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.messageText = "Explore files in Terminal"
+        alert.informativeText = "Run `mice tidy ~/Downloads` to review cleanup suggestions, or `mice file <path>` to file an item."
+        alert.addButton(withTitle: "Got it")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    @objc private func hideHome(_ sender: NSButton) {
+        OverlayController.dismissActive()
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        OverlayController.dismissActive()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if homeOnlyMode {
+            NSApp.terminate(nil)
+        }
+    }
+}
+
 @MainActor
 private final class OverlayController: NSObject {
     private static weak var active: OverlayController?
@@ -1031,7 +1777,14 @@ private final class OverlayController: NSObject {
     private let captionLabel: NSTextField
     private let imageView: NSImageView
     private var highlightPanels: [NSPanel] = []
+    private var guidePanel: GuideStepPanel?
+    private var palettePanel: PalettePanel?
+    private var homePanel: HomePanel?
     private var currentSessionId: String?
+    /// The generic result panel also renders the Goal Guide review buttons.
+    /// Keep that narrow distinction so Escape can cancel only this transient
+    /// review state without affecting an ordinary result or active guide.
+    private var reviewSessionId: String?
 
     override init() {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.nonactivatingPanel, .titled, .closable], backing: .buffered, defer: false)
@@ -1101,8 +1854,21 @@ private final class OverlayController: NSObject {
               let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         guard let method = frame["method"] as? String else { return }
         let params = frame["params"] as? [String: Any] ?? [:]
+        // A palette is an explicit foreground interaction. A hover request
+        // may already be in flight when its shortcut is pressed; do not let
+        // that late response redraw the ordinary overlay over the palette.
+        let passiveOverlayMethods: Set<String> = [
+            "overlay.show", "overlay.update", "overlay.appendResult",
+            "overlay.finishResult", "overlay.result",
+        ]
+        if palettePanel?.isVisible == true && passiveOverlayMethods.contains(method) {
+            return
+        }
         switch method {
+        case "home.show":
+            showHome(params["text"] as? String ?? "MICE Home")
         case "overlay.show":
+            reviewSessionId = nil
             MiceMacAgent.rememberPasteDestination()
             // Position near the cursor only when opening fresh; while already
             // visible (streaming a result) keep the panel where the user put it.
@@ -1123,7 +1889,13 @@ private final class OverlayController: NSObject {
         case "overlay.result":
             guard let sessionID = params["sessionId"] as? String else { return }
             currentSessionId = sessionID
-            showActions((params["actions"] as? [[String: Any]]) ?? [])
+            let actions = (params["actions"] as? [[String: Any]]) ?? []
+            let actionIDs = Set(actions.compactMap { $0["id"] as? String })
+            reviewSessionId = Set(["goal.accept", "goal.revise", "goal.cancel"])
+                .isSubset(of: actionIDs)
+                ? sessionID
+                : nil
+            showActions(actions)
         case "overlay.showImage":
             guard let pngBase64 = params["pngBase64"] as? String,
                   let imageData = Data(base64Encoded: pngBase64),
@@ -1165,8 +1937,21 @@ private final class OverlayController: NSObject {
                 instruction: instruction,
                 appHint: appHint,
                 sensitive: sensitive,
-                browserCapable: browserCapable
+                browserCapable: browserCapable,
+                presentation: params["presentation"] as? String
             )
+        case "palette.show":
+            guard daemonMode, let sessionID = params["sessionId"] as? String else { return }
+            showPalette(sessionID: sessionID, prefill: params["prefill"] as? String)
+        case "palette.result.append":
+            guard let sessionID = params["sessionId"] as? String else { return }
+            palettePanel?.append(params["chunk"] as? String ?? "", sessionID: sessionID)
+        case "palette.result.finish":
+            guard let sessionID = params["sessionId"] as? String else { return }
+            palettePanel?.finish(params["text"] as? String, sessionID: sessionID)
+        case "palette.hide":
+            guard let sessionID = params["sessionId"] as? String else { return }
+            palettePanel?.dismissAndRestoreFocus(sessionID: sessionID)
         case "clipboard.set":
             guard let text = params["text"] as? String else { return }
             let pasteboard = NSPasteboard.general
@@ -1238,11 +2023,74 @@ private final class OverlayController: NSObject {
     }
 
     func dismiss() {
+        let panelWasVisible = panel.isVisible
+        let reviewSession = reviewSessionId
+        let guideWasVisible = guidePanel?.isVisible == true
         panel.orderOut(nil)
+        let paletteWasVisible = palettePanel?.isVisible == true
+        palettePanel?.dismissAndRestoreFocus(notifyCore: true)
+        // Escape is scoped to the surface the person is currently using.
+        // Closing the palette must not silently send quit for a separately
+        // active Goal Guide panel.
+        if !paletteWasVisible {
+            guidePanel?.dismissFromGlobalEscape()
+            guidePanel = nil
+        }
+        // The plan-review surface is neither a palette request nor a guide
+        // panel. Its Cancel action owns the transient GoalSession cleanup in
+        // core, so Escape must send the same action before discarding the UI.
+        if panelWasVisible,
+           !paletteWasVisible,
+           !guideWasVisible,
+           let reviewSession {
+            reviewSessionId = nil
+            currentSessionId = nil
+            clearButtons()
+            MiceMacAgent.sendOverlayAction(sessionID: reviewSession, actionID: "goal.cancel")
+        }
+        showHighlights([])
+        homePanel?.orderOut(nil)
+        if homeOnlyMode {
+            NSApp.terminate(nil)
+        }
     }
 
     static func dismissActive() {
         active?.dismiss()
+    }
+
+    static var isPaletteActive: Bool {
+        active?.palettePanel?.isVisible == true
+    }
+
+    static func showPaletteActive(prefill: String? = nil) {
+        guard daemonMode else { return }
+        active?.showPalette(sessionID: nil, prefill: prefill)
+    }
+
+    private func showHome(_ text: String) {
+        panel.orderOut(nil)
+        palettePanel?.dismissAndRestoreFocus(notifyCore: true)
+        let home = homePanel ?? HomePanel()
+        homePanel = home
+        home.present(text)
+    }
+
+    private func showPalette(sessionID: String?, prefill: String?) {
+        // Hide the passive result window before making the key palette. This
+        // also clears an already-finished hover explanation from view.
+        panel.orderOut(nil)
+        let palette = palettePanel ?? PalettePanel()
+        // Replacing an in-flight request must tell the core to discard the
+        // old session before the new session is submitted.
+        let preservePreviousApp = palette.isVisible
+        palette.dismissAndRestoreFocus(notifyCore: true, restoreFocus: false)
+        palettePanel = palette
+        palette.present(
+            sessionID: sessionID,
+            prefill: prefill,
+            preservePreviousApp: preservePreviousApp
+        )
     }
 
     /// Show text in the scrolling result panel, resetting from image mode and
@@ -1295,6 +2143,12 @@ private final class OverlayController: NSObject {
             showSendMenu(from: sender)
             return
         }
+        // Once Start guide is clicked, the core transitions out of Reviewing.
+        // A second Escape before the next guide frame arrives must not send a
+        // stale review cancellation for an already-accepted session.
+        if id == "goal.accept" || id == "goal.cancel" {
+            reviewSessionId = nil
+        }
         MiceMacAgent.sendOverlayAction(sessionID: session, actionID: id)
     }
 
@@ -1321,6 +2175,12 @@ private final class OverlayController: NSObject {
         placeholder: String,
         context: String?
     ) {
+        // Prompt cancellation has its own IPC cleanup path. Once a reviewer
+        // chooses Revise, the underlying action panel must no longer claim
+        // Escape as a second, stale review cancellation.
+        if reviewSessionId == sessionID {
+            reviewSessionId = nil
+        }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = context ?? ""
@@ -1346,7 +2206,8 @@ private final class OverlayController: NSObject {
         instruction: String,
         appHint: String,
         sensitive: Bool,
-        browserCapable: Bool
+        browserCapable: Bool,
+        presentation: String?
     ) {
         if let bounds = try? AXSupport.matchingBounds(for: "\(appHint) \(instruction)") {
             showHighlights([[
@@ -1360,6 +2221,19 @@ private final class OverlayController: NSObject {
             ]])
         } else {
             showHighlights([])
+        }
+        if presentation == "panel" {
+            let panel = guidePanel ?? GuideStepPanel()
+            guidePanel = panel
+            panel.present(
+                sessionID: sessionID,
+                stepIndex: stepIndex,
+                totalSteps: totalSteps,
+                instruction: instruction,
+                appHint: appHint,
+                sensitive: sensitive
+            )
+            return
         }
         let alert = NSAlert()
         alert.messageText = "Step \(stepIndex + 1) of \(totalSteps)"
@@ -1402,6 +2276,14 @@ private final class OverlayController: NSObject {
     /// floating above it. Guide highlights pulse to draw the eye; the capture
     /// flash uses the same styling without the pulse so MICE's "look here"
     /// visuals stay consistent.
+    static let miceAccentColors: [CGColor] = [
+        NSColor(calibratedRed: 0.38, green: 0.84, blue: 1.0, alpha: 1).cgColor,
+        NSColor(calibratedRed: 0.49, green: 0.55, blue: 1.0, alpha: 1).cgColor,
+        NSColor(calibratedRed: 0.81, green: 0.47, blue: 1.0, alpha: 1).cgColor,
+        NSColor(calibratedRed: 1.0, green: 0.56, blue: 0.74, alpha: 1).cgColor,
+        NSColor(calibratedRed: 1.0, green: 0.83, blue: 0.48, alpha: 1).cgColor,
+    ]
+
     static func makeHighlightPanel(around rect: NSRect, label: String, pulsing: Bool) -> NSPanel {
         let margin: CGFloat = 6
         let labelHeight: CGFloat = label.isEmpty ? 0 : 26
@@ -1429,14 +2311,30 @@ private final class OverlayController: NSObject {
             frame: NSRect(x: margin, y: margin, width: rect.width, height: rect.height)
         )
         border.wantsLayer = true
-        border.layer?.borderWidth = 2.5
-        border.layer?.borderColor = NSColor.systemCyan.cgColor
-        border.layer?.cornerRadius = 8
+        border.layer?.cornerRadius = 14
         border.layer?.shadowColor = NSColor.systemCyan.cgColor
         border.layer?.shadowOpacity = 0.55
-        border.layer?.shadowRadius = 6
+        border.layer?.shadowRadius = 10
         border.layer?.shadowOffset = .zero
         border.layer?.masksToBounds = false
+        let gradient = CAGradientLayer()
+        gradient.frame = border.bounds
+        gradient.colors = miceAccentColors
+        gradient.startPoint = CGPoint(x: 0, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+        let mask = CAShapeLayer()
+        mask.frame = border.bounds
+        mask.path = CGPath(
+            roundedRect: border.bounds.insetBy(dx: 1.25, dy: 1.25),
+            cornerWidth: 12,
+            cornerHeight: 12,
+            transform: nil
+        )
+        mask.fillColor = NSColor.clear.cgColor
+        mask.strokeColor = NSColor.black.cgColor
+        mask.lineWidth = 2.5
+        gradient.mask = mask
+        border.layer?.addSublayer(gradient)
         panel.contentView?.addSubview(border)
         if pulsing, let layer = border.layer {
             let pulse = CABasicAnimation(keyPath: "opacity")
@@ -1464,8 +2362,15 @@ private final class OverlayController: NSObject {
                 )
             )
             pill.wantsLayer = true
+            let pillGradient = CAGradientLayer()
+            pillGradient.frame = pill.bounds
+            pillGradient.colors = miceAccentColors.map { $0.copy(alpha: 0.28) ?? $0 }
+            pillGradient.startPoint = CGPoint(x: 0, y: 0.5)
+            pillGradient.endPoint = CGPoint(x: 1, y: 0.5)
+            pill.layer?.addSublayer(pillGradient)
             pill.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
             pill.layer?.cornerRadius = labelHeight / 2
+            pill.layer?.masksToBounds = true
             text.frame = NSRect(
                 x: 10,
                 y: (labelHeight - text.frame.height) / 2,
