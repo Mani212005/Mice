@@ -34,13 +34,13 @@ use crossterm::{
 use mice_core::{
     AgentAction, AgentDecision, AgentLoop, AgentLoopState, ExecutionLane, GoalSession, GoalState,
     LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, MachineProfile, PaletteIntent,
-    SmartCopyPlan, ToolDecision, action_instruction, apply_preferences, chunk_summary_instruction,
-    clipboard_contents, config_path, estimate_tokens, load_config, looks_like_code,
-    parse_markdown_table, parse_palette_intent, reduce_summary_instruction, route_execution_lane,
-    save_config, selection_summary_instruction, smart_copy_chunks, smart_copy_clean_instruction,
-    smart_copy_plan, smart_copy_preserves_links, smart_copy_preserves_visible_text,
-    smart_copy_table_instruction, structural_summary_chunks, summary_reduce_batches,
-    table_clipboard_contents,
+    ScheduleAction, ScheduledTask, SmartCopyPlan, ToolDecision, action_instruction,
+    apply_preferences, chunk_summary_instruction, clipboard_contents, config_path, estimate_tokens,
+    load_config, looks_like_code, parse_markdown_table, parse_palette_intent, parse_schedule_time,
+    reduce_summary_instruction, route_execution_lane, save_config, selection_summary_instruction,
+    smart_copy_chunks, smart_copy_clean_instruction, smart_copy_plan, smart_copy_preserves_links,
+    smart_copy_preserves_visible_text, smart_copy_table_instruction, structural_summary_chunks,
+    summary_reduce_batches, table_clipboard_contents,
 };
 use mice_ipc::{
     AgentCommand, Capabilities, ClipboardCaptured, HoverCaptured, InitializeParams,
@@ -113,6 +113,7 @@ fn main() {
         Some("file") => filing::file_cmd(),
         Some("mcp") => mcp_cmd(),
         Some("mcp-server") => mcp_server(),
+        Some("schedule") => schedule_cmd(),
         Some("team") => team(),
         Some("mission") => mission::command(&env::args().skip(2).collect::<Vec<_>>()),
         _ if chrome_native_host => native_host(),
@@ -4372,6 +4373,27 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_millis(250));
         }
     });
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(store) = schedule_store() {
+                let now = memory::now();
+                if let Ok(due) = store.due_tasks(now) {
+                    for task in due {
+                        let _ = store.mark_triggered(&task.id);
+                        match task.action {
+                            ScheduleAction::Reminder { message } => {
+                                eprintln!("[MICE Schedule] Reminder: {message}");
+                            }
+                            ScheduleAction::ExecuteGoal { goal, .. } => {
+                                eprintln!("[MICE Schedule] Goal due: {goal}");
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
     println!(
         "MICE is running with {} agent (overlay={}). Press Ctrl-C to stop.",
         agent.platform, agent.capabilities.overlay
@@ -5951,6 +5973,38 @@ fn handle_palette_submission(
             };
             palette_finish(writer, &session_id, &text)
         }
+        PaletteIntent::Schedule(args) => {
+            let now = memory::now();
+            match parse_schedule_intent(&args, now) {
+                Ok(task) => {
+                    let store = schedule_store()?;
+                    store.add(task.clone())?;
+                    let trigger_in = task.trigger_at.saturating_sub(now);
+                    palette_finish(
+                        writer,
+                        &session_id,
+                        &format!("Scheduled task `{}` due in {trigger_in}s.", task.id),
+                    )
+                }
+                Err(err) => palette_finish(writer, &session_id, &format!("Schedule error: {err}")),
+            }
+        }
+        PaletteIntent::Remind(args) => {
+            let now = memory::now();
+            match parse_remind_intent(&args, now) {
+                Ok(task) => {
+                    let store = schedule_store()?;
+                    store.add(task.clone())?;
+                    let trigger_in = task.trigger_at.saturating_sub(now);
+                    palette_finish(
+                        writer,
+                        &session_id,
+                        &format!("Reminder set for {trigger_in}s from now."),
+                    )
+                }
+                Err(err) => palette_finish(writer, &session_id, &format!("Reminder error: {err}")),
+            }
+        }
         PaletteIntent::Ask(question) => handle_palette_ask(writer, config, &session_id, &question),
         PaletteIntent::See(_)
         | PaletteIntent::Sheet(_)
@@ -5975,6 +6029,180 @@ fn palette_finish(
             text: Some(text.into()),
         },
     )
+}
+
+fn schedule_store() -> Result<crate::memory::ScheduleStore, Box<dyn std::error::Error>> {
+    let root = crate::memory::ScheduleStore::default_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "MICE schedule directory is unavailable",
+        )
+    })?;
+    Ok(crate::memory::ScheduleStore::at(root)?)
+}
+
+fn parse_schedule_intent(args: &str, now: u64) -> Result<ScheduledTask, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Err("Usage: schedule <goal> in <time> (e.g. schedule build app in 10m)".into());
+    }
+    let (goal, time_str) = if let Some((g, t)) = args.rsplit_once(" in ") {
+        (g.trim(), t.trim())
+    } else if let Some((g, t)) = args.rsplit_once(" at ") {
+        (g.trim(), t.trim())
+    } else {
+        (args, "10m")
+    };
+
+    let trigger_at = parse_schedule_time(time_str, now)?;
+    let id = format!(
+        "sched-{}",
+        memory::digest_name(goal).get(..8).unwrap_or("0000")
+    );
+    Ok(ScheduledTask {
+        id,
+        created_at: now,
+        trigger_at,
+        cron_expression: None,
+        action: ScheduleAction::ExecuteGoal {
+            goal: goal.into(),
+            plan: None,
+        },
+        triggered: false,
+    })
+}
+
+fn parse_remind_intent(args: &str, now: u64) -> Result<ScheduledTask, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Err(
+            "Usage: remind me in <time> to <msg> (e.g. remind me in 30m to check PR)".into(),
+        );
+    }
+    let text = args.trim_start_matches("me ").trim();
+    let (time_str, message) = if let Some((t, m)) = text.split_once(" to ") {
+        (t.trim_start_matches("in ").trim(), m.trim())
+    } else if let Some((g, t)) = text.rsplit_once(" in ") {
+        (t.trim(), g.trim())
+    } else {
+        ("10m", text)
+    };
+
+    let trigger_at = parse_schedule_time(time_str, now)?;
+    let id = format!(
+        "remind-{}",
+        memory::digest_name(message).get(..8).unwrap_or("0000")
+    );
+    Ok(ScheduledTask {
+        id,
+        created_at: now,
+        trigger_at,
+        cron_expression: None,
+        action: ScheduleAction::Reminder {
+            message: message.into(),
+        },
+        triggered: false,
+    })
+}
+
+fn schedule_cmd() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().skip(2).collect();
+    let sub = args.first().map(String::as_str);
+    let store = schedule_store()?;
+    let now = memory::now();
+
+    match sub {
+        Some("list") | None => {
+            let tasks = store.list()?;
+            if tasks.is_empty() {
+                println!("No scheduled tasks or reminders.");
+                return Ok(());
+            }
+            println!("MICE Scheduled Tasks & Reminders:\n");
+            println!(
+                "{:<16} {:<14} {:<10} {:<30}",
+                "ID", "TRIGGER IN", "STATUS", "ACTION"
+            );
+            println!("{}", "-".repeat(72));
+            for task in tasks {
+                let status = if task.triggered {
+                    "triggered"
+                } else {
+                    "pending"
+                };
+                let rel = if task.trigger_at > now {
+                    format!("{}s", task.trigger_at - now)
+                } else {
+                    "due".to_owned()
+                };
+                let desc = match task.action {
+                    ScheduleAction::Reminder { message } => format!("Reminder: {message}"),
+                    ScheduleAction::ExecuteGoal { goal, .. } => format!("Goal: {goal}"),
+                };
+                println!("{:<16} {:<14} {:<10} {:<30}", task.id, rel, status, desc);
+            }
+        }
+        Some("add") => {
+            let time_arg = args
+                .windows(2)
+                .find(|w| w[0] == "--in" || w[0] == "--at")
+                .map(|w| w[1].as_str())
+                .unwrap_or("10m");
+            let goal_arg = args
+                .windows(2)
+                .find(|w| w[0] == "--goal")
+                .map(|w| w[1].as_str());
+            let remind_arg = args
+                .windows(2)
+                .find(|w| w[0] == "--reminder")
+                .map(|w| w[1].as_str());
+
+            let trigger_at = parse_schedule_time(time_arg, now)?;
+            let (action, id_prefix) = if let Some(g) = goal_arg {
+                (
+                    ScheduleAction::ExecuteGoal {
+                        goal: g.into(),
+                        plan: None,
+                    },
+                    "sched",
+                )
+            } else if let Some(r) = remind_arg {
+                (ScheduleAction::Reminder { message: r.into() }, "remind")
+            } else {
+                return Err("Specify `--goal \"...\"` or `--reminder \"...\"`.".into());
+            };
+            let id = format!(
+                "{id_prefix}-{}",
+                memory::digest_name(&format!("{trigger_at}"))
+                    .get(..8)
+                    .unwrap_or("0000")
+            );
+            let task = ScheduledTask {
+                id: id.clone(),
+                created_at: now,
+                trigger_at,
+                cron_expression: None,
+                action,
+                triggered: false,
+            };
+            store.add(task)?;
+            println!("Scheduled task `{id}` for {time_arg} from now.");
+        }
+        Some("cancel") => {
+            let id = args.get(1).ok_or("Usage: mice schedule cancel <id>")?;
+            if store.cancel(id)? {
+                println!("Cancelled scheduled task `{id}`.");
+            } else {
+                println!("No active scheduled task with ID `{id}`.");
+            }
+        }
+        _ => {
+            println!(
+                "Usage:\n  mice schedule list\n  mice schedule add [--in <time>] [--goal \"...\" | --reminder \"...\"]\n  mice schedule cancel <id>"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn handle_palette_ask(
