@@ -4593,19 +4593,27 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            // Palette session IDs are also used for plan sessions. Removing
-            // them makes Escape a real cancellation boundary and ensures an
-            // old plan cannot later own the guide UI.
+            // Pressing Escape hides the native palette/overlay panel, but does
+            // NOT cancel or erase an active goal plan session. Retain sessions
+            // that are currently planning or ready for review.
             if let Ok(mut sessions) = goal_sessions.lock() {
-                sessions.remove(&dismissed.session_id);
+                let is_active_plan = sessions.get(&dismissed.session_id).is_some_and(|s| {
+                    matches!(
+                        s.state(),
+                        GoalState::Planning { .. } | GoalState::Reviewing { .. }
+                    )
+                });
+                if !is_active_plan {
+                    sessions.remove(&dismissed.session_id);
+                    if let Ok(mut plans) = goal_plans.lock() {
+                        plans.remove(&dismissed.session_id);
+                    }
+                    if let Ok(mut guides) = active_guides.lock() {
+                        guides.remove(&dismissed.session_id);
+                    }
+                    clear_browser_goal_directive(&browser_goal_directive);
+                }
             }
-            if let Ok(mut plans) = goal_plans.lock() {
-                plans.remove(&dismissed.session_id);
-            }
-            if let Ok(mut guides) = active_guides.lock() {
-                guides.remove(&dismissed.session_id);
-            }
-            clear_browser_goal_directive(&browser_goal_directive);
         } else if msg.method == "palette.submitted" {
             let submission: PaletteSubmitted = match serde_json::from_value(msg.params) {
                 Ok(submission) => submission,
