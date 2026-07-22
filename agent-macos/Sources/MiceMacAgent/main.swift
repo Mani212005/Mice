@@ -870,8 +870,53 @@ struct MiceMacAgent {
     /// the user's configured global gesture, which the resident agent already
     /// owns. This avoids a second palette request loop and keeps the helper
     /// from ever observing input on its own.
+    static func bridgeSocketPath() -> String? {
+        guard let home = ProcessInfo.processInfo.environment["HOME"] else { return nil }
+        return "\(home)/Library/Application Support/MICE/bridge.sock"
+    }
+
+    static func sendBridgeMessage(_ payload: [String: Any]) -> Bool {
+        guard let path = bridgeSocketPath() else { return false }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = path.utf8CString
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            let raw = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self)
+            for i in 0..<pathBytes.count {
+                raw[i] = pathBytes[i]
+            }
+        }
+
+        let len = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
+        let connected = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, len) == 0
+            }
+        }
+        guard connected else { return false }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
+        var length = UInt32(data.count).bigEndian
+        let headerWritten = withUnsafePointer(to: &length) { ptr in
+            write(fd, ptr, 4) == 4
+        }
+        guard headerWritten else { return false }
+        let bodyWritten = data.withUnsafeBytes { ptr in
+            write(fd, ptr.baseAddress, data.count) == data.count
+        }
+        return bodyWritten
+    }
+
     static func requestPaletteFromResidentDaemon() -> Bool {
         guard homeHasResidentDaemon else { return false }
+        if sendBridgeMessage(["type": "palette.show"]) {
+            return true
+        }
         guard let source = CGEventSource(stateID: .hidSystemState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: false) else { return false }
@@ -889,6 +934,9 @@ struct MiceMacAgent {
     /// from the helper itself would only write to an unread stdout pipe.
     static func requestGoalFromResidentDaemon() -> Bool {
         guard homeHasResidentDaemon else { return false }
+        if sendBridgeMessage(["type": "goal.show"]) {
+            return true
+        }
         guard let source = CGEventSource(stateID: .hidSystemState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: false) else { return false }

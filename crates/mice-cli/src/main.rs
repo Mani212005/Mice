@@ -218,16 +218,21 @@ fn recent_plan_preview() -> String {
 /// background daemon owns the gesture loop, while `mice start` remains useful
 /// when a developer deliberately wants foreground diagnostics.
 fn launch() -> Result<(), Box<dyn std::error::Error>> {
-    if UnixStream::connect(bridge_socket_path()?).is_ok() {
-        let executable = env::current_exe()?;
-        Command::new(executable)
-            .arg("home")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        println!("MICE is already running. MICE Home is open.");
-        return Ok(());
+    if let Ok(path) = bridge_socket_path()
+        && let Ok(mut stream) = UnixStream::connect(&path)
+    {
+        let mut verified = false;
+        if write_frame(&mut stream, &serde_json::json!({"type":"palette.show"})).is_ok()
+            && let Ok(resp) = read_frame::<serde_json::Value>(&mut stream)
+            && resp["type"].as_str() == Some("palette.showing")
+        {
+            verified = true;
+        }
+        if verified {
+            println!("MICE is running. Command palette is open.");
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&path);
     }
     let executable = env::current_exe()?;
     let mut child = Command::new(executable)
@@ -267,10 +272,22 @@ fn launch() -> Result<(), Box<dyn std::error::Error>> {
 /// already-running daemon.
 fn home() -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
-    let resident_daemon = bridge_socket_path()
-        .ok()
-        .is_some_and(|path| UnixStream::connect(path).is_ok());
-    let mut agent = start_agent_home(&config.gesture, resident_daemon)?;
+    if let Ok(path) = bridge_socket_path()
+        && let Ok(mut stream) = UnixStream::connect(&path)
+    {
+        let mut verified = false;
+        if write_frame(&mut stream, &serde_json::json!({"type":"home.show"})).is_ok()
+            && let Ok(resp) = read_frame::<serde_json::Value>(&mut stream)
+            && resp["type"].as_str() == Some("home.showing")
+        {
+            verified = true;
+        }
+        if verified {
+            println!("MICE Home is open. Press Esc to hide it.");
+            return Ok(());
+        }
+    }
+    let mut agent = start_agent_home(&config.gesture, false)?;
     send_command(
         &mut agent.stdin,
         AgentCommand::HomeShow {
@@ -987,6 +1004,65 @@ fn handle_native_bridge(
     loop {
         let message: serde_json::Value = read_frame(&mut stream)?;
         match message["type"].as_str() {
+            Some("daemon.ping") => {
+                write_frame(&mut stream, &serde_json::json!({"type":"daemon.pong"}))?;
+            }
+            Some("palette.show") => {
+                let prefill = message["text"]
+                    .as_str()
+                    .or_else(|| message["prefill"].as_str())
+                    .map(|s| s.to_string());
+                let session_id = message["session_id"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("session-{}", memory::now()));
+                if let Ok(state) = bridge.lock()
+                    && let Some(writer) = &state.overlay_writer
+                    && let Ok(mut writer) = writer.lock()
+                {
+                    let _ = send_command(
+                        &mut writer,
+                        AgentCommand::PaletteShow {
+                            session_id,
+                            prefill,
+                        },
+                    );
+                }
+                write_frame(&mut stream, &serde_json::json!({"type":"palette.showing"}))?;
+            }
+            Some("goal.show") => {
+                let session_id = message["session_id"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("session-{}", memory::now()));
+                if let Ok(state) = bridge.lock()
+                    && let Some(writer) = &state.overlay_writer
+                    && let Ok(mut writer) = writer.lock()
+                {
+                    let _ = send_command(
+                        &mut writer,
+                        AgentCommand::PaletteShow {
+                            session_id,
+                            prefill: Some("plan ".into()),
+                        },
+                    );
+                }
+                write_frame(&mut stream, &serde_json::json!({"type":"goal.showing"}))?;
+            }
+            Some("home.show") => {
+                if let Ok(state) = bridge.lock()
+                    && let Some(writer) = &state.overlay_writer
+                    && let Ok(mut writer) = writer.lock()
+                {
+                    let _ = send_command(
+                        &mut writer,
+                        AgentCommand::HomeShow {
+                            text: home_text(config),
+                        },
+                    );
+                }
+                write_frame(&mut stream, &serde_json::json!({"type":"home.showing"}))?;
+            }
             Some("daemon.stop") => {
                 write_frame(&mut stream, &serde_json::json!({"type":"daemon.stopping"}))?;
                 let path = bridge_socket_path()?;
@@ -4352,6 +4428,10 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     // bridge socket is deliberately bound second so it cannot be a false
     // positive when the agent binary or its permissions fail immediately.
     let mut agent = start_agent_daemon(&config.gesture)?;
+    let agent_writer = Arc::new(Mutex::new(agent.stdin));
+    if let Ok(mut state) = browser_goal_directive.lock() {
+        state.overlay_writer = Some(Arc::clone(&agent_writer));
+    }
     if let Err(error) = start_native_bridge(config.clone(), Arc::clone(&browser_goal_directive)) {
         let _ = agent.child.kill();
         let _ = agent.child.wait();
@@ -4404,7 +4484,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     );
     if env::var_os("MICE_OPEN_HOME").is_some() {
         send_command(
-            &mut agent.stdin,
+            &mut agent_writer.lock().unwrap(),
             AgentCommand::HomeShow {
                 text: home_text(&config),
             },
@@ -4423,14 +4503,14 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             // Goal Guide is resumable. Losing focus or pressing Escape only
             // hides the native surface; the reviewed plan remains in core
             // state until the person starts, revises, or cancels it.
-            if resume_reviewed_goal(&mut agent.stdin, &goal_sessions)? {
+            if resume_reviewed_goal(&mut agent_writer.lock().unwrap(), &goal_sessions)? {
                 continue;
             }
             let session_id = msg.params["sessionId"]
                 .as_str()
                 .ok_or("MICE received a goal request without a session ID")?;
             send_command(
-                &mut agent.stdin,
+                &mut agent_writer.lock().unwrap(),
                 AgentCommand::PaletteShow {
                     session_id: session_id.into(),
                     prefill: Some("plan ".into()),
@@ -4450,7 +4530,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             if let Err(error) = handle_goal_submission(
-                &mut agent.stdin,
+                &mut agent_writer.lock().unwrap(),
                 &config,
                 session,
                 &mut goal_plans,
@@ -4475,7 +4555,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 clear_browser_goal_directive(&browser_goal_directive);
             }
             let _ = send_command(
-                &mut agent.stdin,
+                &mut agent_writer.lock().unwrap(),
                 AgentCommand::OverlayFinishResult {
                     text: Some("Goal planning cancelled.".into()),
                 },
@@ -4489,7 +4569,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             };
             let value = msg.params["value"].as_str();
             match handle_guide_control(
-                &mut agent.stdin,
+                &mut agent_writer.lock().unwrap(),
                 &mut active_guides,
                 &browser_goal_directive,
                 session_id,
@@ -4528,7 +4608,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             };
             let palette_session = submission.session_id.clone();
             if let Err(error) = handle_palette_submission(
-                &mut agent.stdin,
+                &mut agent_writer.lock().unwrap(),
                 &config,
                 &mut goal_sessions,
                 &mut goal_plans,
@@ -4547,7 +4627,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 // The palette disabled its input at submit time; a failure
                 // must reach the panel or it stays stuck at "thinking".
                 let _ = send_command(
-                    &mut agent.stdin,
+                    &mut agent_writer.lock().unwrap(),
                     AgentCommand::PaletteFinishResult {
                         session_id: palette_session,
                         text: Some(format!("MICE could not complete that: {error}")),
@@ -4564,7 +4644,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             };
             let session_id = selection.session_id.clone();
             let text = selection.text.clone();
-            match handle_selection_action(&mut agent.stdin, &config, selection) {
+            match handle_selection_action(&mut agent_writer.lock().unwrap(), &config, selection) {
                 Ok(Some(response)) => {
                     let prepared_go_deeper = start_go_deeper_prefetch(
                         &config,
@@ -4589,7 +4669,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            if let Err(error) = handle_smart_copy(&mut agent.stdin, &config, captured) {
+            if let Err(error) =
+                handle_smart_copy(&mut agent_writer.lock().unwrap(), &config, captured)
+            {
                 eprintln!("MICE smart copy failed: {error}");
             }
         } else if msg.method == "overlay.action" {
@@ -4607,7 +4689,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             );
             let result = if goal_action {
                 handle_goal_review_action(
-                    &mut agent.stdin,
+                    &mut agent_writer.lock().unwrap(),
                     &mut goal_sessions,
                     &mut goal_plans,
                     &mut active_guides,
@@ -4617,7 +4699,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 )
             } else {
                 handle_overlay_action(
-                    &mut agent.stdin,
+                    &mut agent_writer.lock().unwrap(),
                     &config,
                     &mut selection_cache,
                     &session_id,
@@ -4683,21 +4765,24 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("[Streaming via {}]", selected.id);
             send_command(
-                &mut agent.stdin,
+                &mut agent_writer.lock().unwrap(),
                 AgentCommand::OverlayShow {
                     text: "MICE is thinking…".into(),
                 },
             )?;
 
             if action == Action::Image {
-                match generate_and_present_image(&mut agent.stdin, &request.instruction) {
+                match generate_and_present_image(
+                    &mut agent_writer.lock().unwrap(),
+                    &request.instruction,
+                ) {
                     Ok(()) => {
                         println!("[gpt-image-2] Infographic generated and copied to the clipboard.")
                     }
                     Err(error) => {
                         println!("Image generation error: {error}");
                         let _ = send_command(
-                            &mut agent.stdin,
+                            &mut agent_writer.lock().unwrap(),
                             AgentCommand::OverlayFinishResult {
                                 text: Some(format!("Image generation error: {error}")),
                             },
@@ -4707,7 +4792,8 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            let mut stream = OverlayStream::echoing(&mut agent.stdin);
+            let mut stdin_guard = agent_writer.lock().unwrap();
+            let mut stream = OverlayStream::echoing(&mut stdin_guard);
             let result = if selected.locality == mice_providers::Locality::Local {
                 stream_ollama(
                     selected.id,
@@ -4737,10 +4823,13 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => {
                     let response = stream.finish()?;
                     if !response.is_empty() {
-                        send_command(&mut agent.stdin, clipboard_command(&response))?;
+                        send_command(
+                            &mut agent_writer.lock().unwrap(),
+                            clipboard_command(&response),
+                        )?;
                     }
                     send_command(
-                        &mut agent.stdin,
+                        &mut agent_writer.lock().unwrap(),
                         AgentCommand::OverlayFinishResult { text: None },
                     )?;
                 }
@@ -4748,7 +4837,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = stream.finish();
                     println!("Error: {}", error);
                     let _ = send_command(
-                        &mut agent.stdin,
+                        &mut agent_writer.lock().unwrap(),
                         AgentCommand::OverlayFinishResult {
                             text: Some(format!("Error: {error}")),
                         },
@@ -4776,7 +4865,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            if let Err(error) = explain_hover(&mut agent.stdin, &config, hover) {
+            if let Err(error) = explain_hover(&mut agent_writer.lock().unwrap(), &config, hover) {
                 eprintln!("MICE hover explanation failed: {error}");
             }
         }
