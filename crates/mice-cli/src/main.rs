@@ -1,6 +1,8 @@
+mod coordination;
 mod filing;
 mod mcp_client;
 mod memory;
+mod mission;
 mod tidy;
 mod tools;
 
@@ -13,7 +15,7 @@ use std::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
@@ -31,17 +33,19 @@ use crossterm::{
 };
 use mice_core::{
     AgentAction, AgentDecision, AgentLoop, AgentLoopState, ExecutionLane, GoalSession, GoalState,
-    LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, MachineProfile, SmartCopyPlan,
-    ToolDecision, action_instruction, chunk_summary_instruction, clipboard_contents, config_path,
-    estimate_tokens, load_config, looks_like_code, parse_markdown_table,
-    reduce_summary_instruction, route_execution_lane, save_config, selection_summary_instruction,
-    smart_copy_chunks, smart_copy_clean_instruction, smart_copy_plan, smart_copy_preserves_links,
-    smart_copy_preserves_visible_text, smart_copy_table_instruction, structural_summary_chunks,
-    summary_reduce_batches, table_clipboard_contents,
+    LOCAL_SUMMARY_CHUNK_TOKENS, LOCAL_SUMMARY_REDUCE_TOKENS, MachineProfile, PaletteIntent,
+    SmartCopyPlan, ToolDecision, action_instruction, apply_preferences, chunk_summary_instruction,
+    clipboard_contents, config_path, estimate_tokens, load_config, looks_like_code,
+    parse_markdown_table, parse_palette_intent, reduce_summary_instruction, route_execution_lane,
+    save_config, selection_summary_instruction, smart_copy_chunks, smart_copy_clean_instruction,
+    smart_copy_plan, smart_copy_preserves_links, smart_copy_preserves_visible_text,
+    smart_copy_table_instruction, structural_summary_chunks, summary_reduce_batches,
+    table_clipboard_contents,
 };
 use mice_ipc::{
     AgentCommand, Capabilities, ClipboardCaptured, HoverCaptured, InitializeParams,
-    PromptSubmitted, RpcRequest, SelectionAction, SelectionText, read_frame, write_frame,
+    PaletteSubmitted, PromptSubmitted, RpcRequest, SelectionAction, SelectionText, read_frame,
+    write_frame,
 };
 use mice_providers::{
     Action, Artifacts, ModelPreferences, OllamaError, PrivacyMode, RouteRequest,
@@ -65,14 +69,29 @@ fn main() {
     // Chrome starts a native-messaging host directly and does not pass our
     // `native-host` subcommand. It may pass the extension origin as argv[1],
     // but stdin is always a framing pipe, so recognise both launch forms.
+    let packaged_app_launch = command.is_none()
+        && env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(packaged_app_root)
+            .is_some();
     let chrome_native_host = command
         .as_deref()
         .is_some_and(|argument| argument.starts_with("chrome-extension://"))
-        || (command.is_none() && !std::io::stdin().is_terminal());
+        || (command.is_none() && !std::io::stdin().is_terminal() && !packaged_app_launch);
     let result = match command.as_deref() {
+        None if !chrome_native_host => launch(),
+        Some("help") | Some("--help") | Some("-h") => usage(),
+        Some("install") => install(),
+        Some("home") => home(),
+        Some("setup") => setup(),
+        Some("connect") => connect(),
+        Some("disconnect") => disconnect(),
+        Some("integrations") => integrations(),
         Some("status") => status(),
         Some("doctor") => doctor(),
         Some("settings") => settings(),
+        Some("keys") | Some("key") => keys(),
         Some("actions") => actions(),
         Some("tools") => list_tools(),
         Some("do") => do_goal(),
@@ -88,10 +107,14 @@ fn main() {
         Some("route") => route_preview(),
         Some("ask") => ask(),
         Some("see") => see(),
+        Some("history") => history(),
+        Some("plans") => plans(),
         Some("tidy") => tidy::tidy(),
         Some("file") => filing::file_cmd(),
         Some("mcp") => mcp_cmd(),
         Some("mcp-server") => mcp_server(),
+        Some("team") => team(),
+        Some("mission") => mission::command(&env::args().skip(2).collect::<Vec<_>>()),
         _ if chrome_native_host => native_host(),
         _ => usage(),
     };
@@ -102,25 +125,515 @@ fn main() {
 }
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
+    println!("MICE — native, privacy-aware desktop assistance");
+    println!("Usage: mice [command]");
     println!(
-        "Usage: mice <start|stop|status|doctor|settings|actions|tools|do|bench-tools|savings|advertise|browser-bridge|setup-browser|autopilot|route|ask|see|tidy|file|mcp-server>"
+        "\nApp\n  mice                     Start/reuse MICE and open MICE Home\n  mice start | stop | home | setup | install | status | doctor | settings\n  mice keys <set|status|delete> [groq|openai]"
     );
-    println!("       mice ask [--action <preset>] <instruction>");
     println!(
-        "       mice see [--display|--sheet] <question about your screen>   (--sheet: dense text/spreadsheets)"
+        "\nAsk and screen\n  mice ask [--action <preset>] <instruction>\n  mice see [--display|--sheet] <question>\n  mice history [query] | mice history --clear | mice plans\n  mice actions | route"
     );
-    println!("       mice autopilot <goal>");
-    println!("       mice mcp-server");
-    println!("       mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>");
     println!(
-        "       mice tidy [--apply] [--no-label] [folder]   (default ~/Downloads; dry run without --apply)"
+        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
     );
-    println!("       mice tidy --undo");
-    println!("       mice file --add-root <folder>");
-    println!("       mice file --finder   (file selected in frontmost Finder window)");
-    println!("       mice file <path>");
-    println!("       mice mcp list");
-    println!("       mice mcp call <server> <tool> [json-arguments]");
+    println!(
+        "\nIntegrations\n  mice connect <codex|claude|all> [--yes]\n  mice disconnect <codex|claude|all> [--yes]\n  mice integrations\n  mice mcp-server | mice mcp <list|call>"
+    );
+    println!(
+        "\nAdvanced\n  mice team [status|risks]\n  mice mission plan <plan-file> --agents <codex,claude,antigravity> [--planner auto|markdown] [--allow-cloud] [--review|--dry-run|--launch --yes]\n  mice mission status|watch <plan-file>\n  mice tools | bench-tools | savings | advertise | setup-browser"
+    );
+    Ok(())
+}
+
+/// Coordination Mesh P0 is deliberately a read-only snapshot. It discovers
+/// the current repository's existing worktrees and writes only metadata to
+/// owner-only MICE application support storage.
+fn team() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    let mode = match arguments.as_slice() {
+        [] => "status",
+        [value] if value == "status" => "status",
+        [value] if value == "risks" => "risks",
+        _ => return Err("Usage: mice team [status|risks]".into()),
+    };
+    let cwd = env::current_dir()?;
+    let snapshot = coordination::discover(&cwd).map_err(|error| {
+        format!("Coordination requires a Git worktree. Run this from a repository: {error}")
+    })?;
+    let root = coordination::SnapshotStore::default_path().ok_or("HOME is not set")?;
+    let store = coordination::SnapshotStore::at(root)?;
+    let saved = store.record(&snapshot)?;
+    println!("{}", coordination::render_status(&snapshot, &saved));
+    if mode == "risks" {
+        println!();
+        println!(
+            "{}",
+            coordination::render_risks(&coordination::merge_risks(&snapshot))
+        );
+    }
+    Ok(())
+}
+
+const MICE_HOME_TEXT: &str = "MICE Home\n\nAsk & explain\n• Ctrl+Shift+Space — open the command palette\n• Hold Control over a control — explain it\n• Ctrl double-tap after selecting text — quick recap\n• Ctrl+Option+I — make an infographic\n• Cmd-C, then Ctrl+Option+C — Smart Copy\n\nGuide & act\n• Ctrl+Option+Space — plan a goal; you review before starting\n• `mice autopilot <goal>` — browser actions, one confirmation at a time\n\nFiles & screen\n• `mice see <question>` — ask about your screen\n• `mice tidy` — review folder cleanup suggestions\n• `mice file <path>` — file an item into a registered root\n\nPrivacy & integrations\n• `mice settings` — choose cloud allowed, cloud only, or local only\n• `mice connect all` — add MICE's private local tools to Codex and Claude\n• Esc hides MICE; `mice stop` stops the background service.";
+
+fn home_text(config: &mice_core::Config) -> String {
+    let plans = recent_plan_preview();
+    format!(
+        "MICE Home\nPrivacy mode: {}\nLocal model: {}\nCloud model: {}\nRecent plans:\n{}\n\n{}",
+        privacy_mode_name(config.privacy_mode),
+        config.local_model,
+        config.cloud_model,
+        plans,
+        MICE_HOME_TEXT
+            .strip_prefix("MICE Home\n\n")
+            .unwrap_or(MICE_HOME_TEXT)
+    )
+}
+
+/// Home is deliberately a compact, local view. The complete bounded plans
+/// remain available through `mice plans`; this preview makes a saved plan
+/// discoverable without turning the reference surface into a transcript.
+fn recent_plan_preview() -> String {
+    let Ok(history) = user_history() else {
+        return "No saved plans yet.".into();
+    };
+    let Ok(events) = history.search(None) else {
+        return "No saved plans yet.".into();
+    };
+    let plans = events
+        .into_iter()
+        .filter(|entry| entry.kind == memory::HistoryKind::GoalPlan)
+        .take(2)
+        .map(|entry| format!("• {}", bounded_for_model(&entry.question, 72)))
+        .collect::<Vec<_>>();
+    if plans.is_empty() {
+        "No saved plans yet.".into()
+    } else {
+        plans.join("\n")
+    }
+}
+
+/// The everyday entry point. It never ties up the caller's terminal: a
+/// background daemon owns the gesture loop, while `mice start` remains useful
+/// when a developer deliberately wants foreground diagnostics.
+fn launch() -> Result<(), Box<dyn std::error::Error>> {
+    if UnixStream::connect(bridge_socket_path()?).is_ok() {
+        let executable = env::current_exe()?;
+        Command::new(executable)
+            .arg("home")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        println!("MICE is already running. MICE Home is open.");
+        return Ok(());
+    }
+    let executable = env::current_exe()?;
+    let mut child = Command::new(executable)
+        .arg("start")
+        .env("MICE_OPEN_HOME", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Local Only may need to start Ollama and pull the approved first model,
+    // which legitimately takes minutes. Do not claim failure after eight
+    // seconds and invite a second competing bootstrap.
+    let startup_budget = if config()?.privacy_mode == PrivacyMode::LocalOnly {
+        Duration::from_secs(10 * 60)
+    } else {
+        Duration::from_secs(30)
+    };
+    let deadline = Instant::now() + startup_budget;
+    while Instant::now() < deadline {
+        if UnixStream::connect(bridge_socket_path()?).is_ok() {
+            println!("MICE is running. MICE Home is open.");
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "MICE stopped during startup ({status}). Run `mice start` for diagnostics."
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("MICE is still preparing Local Only startup. Keep this process running or use `mice start` for diagnostics; do not start a second daemon.".into())
+}
+
+/// Open MICE Home without enabling any global input capture. This display-only
+/// helper exits with the native panel, so it can safely be launched beside an
+/// already-running daemon.
+fn home() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    let resident_daemon = bridge_socket_path()
+        .ok()
+        .is_some_and(|path| UnixStream::connect(path).is_ok());
+    let mut agent = start_agent_home(&config.gesture, resident_daemon)?;
+    send_command(
+        &mut agent.stdin,
+        AgentCommand::HomeShow {
+            text: home_text(&config),
+        },
+    )?;
+    println!("MICE Home is open. Press Esc to hide it.");
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        if agent.child.try_wait()?.is_some() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// First-run setup is deliberately explicit about permissions, while local
+/// model setup is automatic only for the approved default model.
+fn setup() -> Result<(), Box<dyn std::error::Error>> {
+    let config = config()?;
+    // Setup is the explicit one-time preparation command. It makes the safe
+    // default local lane ready even when the everyday routing mode is cloud
+    // allowed, without changing the user's configured privacy mode.
+    let mut local_setup = config.clone();
+    local_setup.local_model = DEFAULT_AUTOMATIC_LOCAL_MODEL.into();
+    ensure_local_model(&local_setup)?;
+    println!("MICE setup complete. Run `mice status` to inspect macOS permissions.");
+    Ok(())
+}
+
+fn packaged_app_root(executable: &Path) -> Option<PathBuf> {
+    executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .map(Path::to_path_buf)
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(std::fs::read_link(&from)?, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err("MICE cannot preserve bundle symlinks on this platform.".into());
+            }
+        } else if file_type.is_dir() {
+            copy_directory(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Install only into paths owned by the current user. It never edits shell
+/// profiles and refuses to overwrite an unrelated executable named `mice`.
+fn install() -> Result<(), Box<dyn std::error::Error>> {
+    let executable = std::fs::canonicalize(env::current_exe()?)?;
+    let source_app = packaged_app_root(&executable).ok_or(
+        "`mice install` must run from MICE.app. Build the package first with `scripts/package-macos.sh`.",
+    )?;
+    let home = env::var_os("HOME").ok_or("HOME is not set")?;
+    let applications = PathBuf::from(&home).join("Applications");
+    let destination = applications.join("MICE.app");
+    if source_app == destination {
+        println!("MICE is already installed at {}.", destination.display());
+    } else {
+        std::fs::create_dir_all(&applications)?;
+        let staged = applications.join(format!(".MICE.app.installing-{}", std::process::id()));
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged)?;
+        }
+        copy_directory(&source_app, &staged)?;
+        let backup = applications.join(format!(".MICE.app.backup-{}", std::process::id()));
+        if destination.exists() {
+            std::fs::rename(&destination, &backup)?;
+        }
+        if let Err(error) = std::fs::rename(&staged, &destination) {
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, &destination);
+            }
+            return Err(error.into());
+        }
+        if backup.exists() {
+            std::fs::remove_dir_all(backup)?;
+        }
+        println!("Installed MICE.app at {}.", destination.display());
+    }
+    let bin = PathBuf::from(&home).join(".local/bin");
+    std::fs::create_dir_all(&bin)?;
+    let launcher = bin.join("mice");
+    let target = destination.join("Contents/MacOS/mice");
+    if launcher.exists() || launcher.is_symlink() {
+        let existing = std::fs::canonicalize(&launcher).ok();
+        if existing.as_deref() != Some(target.as_path()) {
+            return Err(format!(
+                "Refusing to replace existing {}. Remove it yourself, then run `mice install` again.",
+                launcher.display()
+            )
+            .into());
+        }
+        std::fs::remove_file(&launcher)?;
+    }
+    std::os::unix::fs::symlink(&target, &launcher)?;
+    let in_path =
+        env::var_os("PATH").is_some_and(|paths| env::split_paths(&paths).any(|path| path == bin));
+    println!("Installed command launcher at {}.", launcher.display());
+    if !in_path {
+        println!("Add it to PATH once: export PATH=\"$HOME/.local/bin:$PATH\"");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Harness {
+    Codex,
+    Claude,
+}
+
+impl Harness {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+        }
+    }
+
+    fn binary(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+fn requested_harnesses(
+    arguments: &[String],
+) -> Result<(Vec<Harness>, bool), Box<dyn std::error::Error>> {
+    let Some(target) = arguments.first().map(String::as_str) else {
+        return Err("Usage: mice <connect|disconnect> <codex|claude|all> [--yes]".into());
+    };
+    let yes = arguments.iter().skip(1).any(|argument| argument == "--yes");
+    if arguments.iter().skip(1).any(|argument| argument != "--yes") {
+        return Err("Usage: mice <connect|disconnect> <codex|claude|all> [--yes]".into());
+    }
+    let harnesses = if target == "all" {
+        vec![Harness::Codex, Harness::Claude]
+    } else {
+        vec![Harness::parse(target).ok_or("Choose codex, claude, or all.")?]
+    };
+    Ok((harnesses, yes))
+}
+
+fn confirm_change(summary: &str, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{summary}");
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err("Use --yes when running without an interactive terminal.".into());
+    }
+    print!("Continue? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err("Cancelled; no integration settings changed.".into())
+    }
+}
+
+fn harness_available(harness: Harness) -> bool {
+    Command::new(harness.binary())
+        .arg("mcp")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn packaged_mice_executable() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let executable = std::fs::canonicalize(env::current_exe()?)?;
+    let Some(app) = packaged_app_root(&executable) else {
+        return Err(
+            "MICE integrations require the packaged app. Run `mice install` from MICE.app first."
+                .into(),
+        );
+    };
+    Ok(app.join("Contents/MacOS/mice"))
+}
+
+fn harness_mice_entry(harness: Harness) -> Option<String> {
+    let output = Command::new(harness.binary())
+        .args(["mcp", "get", "mice"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn harness_has_this_mice(harness: Harness, executable: &Path) -> bool {
+    let canonical = executable
+        .canonicalize()
+        .unwrap_or_else(|_| executable.into());
+    harness_mice_entry(harness).is_some_and(|entry| {
+        entry.contains(&canonical.display().to_string()) && entry.contains("mcp-server")
+    })
+}
+
+fn connect() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    let (harnesses, yes) = requested_harnesses(&arguments)?;
+    let missing = harnesses
+        .iter()
+        .copied()
+        .filter(|harness| !harness_available(*harness))
+        .map(|harness| harness.name())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!("Not installed or unavailable: {}.", missing.join(", ")).into());
+    }
+    let executable = packaged_mice_executable()?;
+    let existing = harnesses
+        .iter()
+        .copied()
+        .filter(|harness| harness_mice_entry(*harness).is_some())
+        .map(|harness| harness.name())
+        .collect::<Vec<_>>();
+    if !existing.is_empty() {
+        return Err(format!(
+            "MICE is already registered for {}. Run `mice integrations` to inspect it; MICE will not replace an existing entry automatically.",
+            existing.join(", ")
+        )
+        .into());
+    }
+    confirm_change(
+        &format!(
+            "Register MICE's local-only MCP server for {}.\nCommand: {} mcp-server\nNo repository files, cloud keys, or copied content are shared.",
+            harnesses
+                .iter()
+                .map(|harness| harness.name())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            executable.display()
+        ),
+        yes,
+    )?;
+    let mut connected = Vec::new();
+    for harness in harnesses {
+        let mut command = Command::new(harness.binary());
+        command.arg("mcp").arg("add");
+        if matches!(harness, Harness::Claude) {
+            command.args(["--scope", "user"]);
+        }
+        let status = command
+            .arg("mice")
+            .arg("--")
+            .arg(&executable)
+            .arg("mcp-server")
+            .status()?;
+        if !status.success() {
+            // `connect all` is transactional from the user's perspective.
+            // Roll back only entries we just created and can positively
+            // identify as this executable.
+            for prior in connected {
+                if harness_has_this_mice(prior, &executable) {
+                    let _ = Command::new(prior.binary())
+                        .args(["mcp", "remove", "mice"])
+                        .status();
+                }
+            }
+            return Err(format!("{} rejected the MICE MCP registration.", harness.name()).into());
+        }
+        connected.push(harness);
+        println!("Connected {}.", harness.name());
+    }
+    Ok(())
+}
+
+fn disconnect() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    let (harnesses, yes) = requested_harnesses(&arguments)?;
+    confirm_change(
+        &format!(
+            "Remove MICE's MCP entry from {}. This does not affect MICE.app or your files.",
+            harnesses
+                .iter()
+                .map(|harness| harness.name())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+        yes,
+    )?;
+    let executable = packaged_mice_executable()?;
+    for harness in harnesses {
+        if !harness_available(harness) {
+            println!("{} is unavailable; nothing changed there.", harness.name());
+            continue;
+        }
+        if !harness_has_this_mice(harness, &executable) {
+            println!(
+                "{} has no MICE entry owned by this installation; nothing changed.",
+                harness.name()
+            );
+            continue;
+        }
+        let status = Command::new(harness.binary())
+            .args(["mcp", "remove", "mice"])
+            .status()?;
+        if status.success() {
+            println!("Disconnected {}.", harness.name());
+        } else {
+            println!("{} has no removable MICE entry.", harness.name());
+        }
+    }
+    Ok(())
+}
+
+fn integrations() -> Result<(), Box<dyn std::error::Error>> {
+    let executable = packaged_mice_executable().ok();
+    for harness in [Harness::Codex, Harness::Claude] {
+        let availability = if harness_available(harness) {
+            "available"
+        } else {
+            "not installed"
+        };
+        let connection = if executable
+            .as_ref()
+            .is_some_and(|path| harness_has_this_mice(harness, path))
+        {
+            "connected"
+        } else if harness_mice_entry(harness).is_some() {
+            "mice entry belongs to another installation"
+        } else {
+            "not connected"
+        };
+        println!("{}: {availability}; {connection}", harness.name());
+    }
+    println!("MICE MCP tools always use the local Ollama model, never a cloud provider.");
     Ok(())
 }
 
@@ -285,6 +798,10 @@ struct NativeBridgeState {
     control_client: Option<Arc<Mutex<UnixStream>>>,
     overlay_writer: Option<Arc<Mutex<ChildStdin>>>,
     overlay_shown: bool,
+    /// The browser bridge is also the bounded local handoff path for Mission
+    /// Control lifecycle notices. Repeating the same state transition should
+    /// never create a stack of identical native panels.
+    last_mission_notification: Option<(String, Instant)>,
 }
 
 #[derive(Clone)]
@@ -380,6 +897,64 @@ fn native_overlay(bridge: &NativeBridge, text: impl Into<String>) {
     autopilot_narrate(bridge, text, false);
 }
 
+fn present_mission_notification(
+    bridge: &NativeBridge,
+    gesture: mice_core::GestureConfig,
+    text: String,
+) {
+    let text = text
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\n')
+        .take(600)
+        .collect::<String>();
+    if text.trim().is_empty() {
+        return;
+    }
+    let should_show = bridge.lock().ok().is_some_and(|mut state| {
+        let repeated =
+            state
+                .last_mission_notification
+                .as_ref()
+                .is_some_and(|(previous, shown_at)| {
+                    previous == &text && shown_at.elapsed() < Duration::from_secs(10)
+                });
+        if !repeated {
+            state.last_mission_notification = Some((text.clone(), Instant::now()));
+        }
+        !repeated
+    });
+    if !should_show {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(mut agent) = start_agent_overlay_only(&gesture) else {
+            return;
+        };
+        if !agent.capabilities.overlay {
+            let _ = agent.child.kill();
+            let _ = agent.child.wait();
+            return;
+        }
+        if send_command(&mut agent.stdin, AgentCommand::OverlayShow { text }).is_err() {
+            let _ = agent.child.kill();
+            let _ = agent.child.wait();
+            return;
+        }
+        let _ = send_command(
+            &mut agent.stdin,
+            AgentCommand::OverlayFinishResult { text: None },
+        );
+        // A Mission Control state notice is deliberately transient. It does
+        // not take ownership of an interactive workflow or retain any task
+        // transcript in the native agent.
+        std::thread::sleep(Duration::from_secs(8));
+        let _ = send_command(&mut agent.stdin, AgentCommand::OverlayDismiss);
+        drop(agent.stdin);
+        let _ = agent.child.kill();
+        let _ = agent.child.wait();
+    });
+}
+
 /// Paint one line of narration to the native overlay and forward it to the CLI
 /// control client exactly once, with the terminal `done` flag. Callers must not
 /// separately call `autopilot_status` for the same message, or it prints twice.
@@ -437,6 +1012,11 @@ fn handle_native_bridge(
                 )?;
             }
             Some("autopilot.stop") => stop_autopilot(&bridge, "Autopilot stopped."),
+            Some("mission.notification") => {
+                if let Some(text) = message["text"].as_str() {
+                    present_mission_notification(&bridge, config.gesture.clone(), text.into());
+                }
+            }
             Some("bridge.hello") => {
                 let writer = Arc::new(Mutex::new(stream.try_clone()?));
                 let directive = {
@@ -654,7 +1234,7 @@ fn advance_autopilot(
     // on one page for two turns (common on canvas/app UIs like Canva where
     // clickable tiles are divs the DOM snapshot cannot expose). Only worth doing
     // when vision is actually reachable.
-    let vision_possible = env::var_os("OPENAI_API_KEY").is_some();
+    let vision_possible = provider_api_key("OPENAI_API_KEY").is_ok();
     let needs_screenshot = screenshot.is_none()
         && vision_possible
         && (candidates.len() <= 3 || stuck_turns >= 2)
@@ -685,7 +1265,7 @@ fn advance_autopilot(
         "interactive_elements": candidates,
     }))?;
     let usable_screenshot = screenshot.filter(|image| image.starts_with("data:image/"));
-    let vision_unavailable = usable_screenshot.is_some() && env::var_os("OPENAI_API_KEY").is_none();
+    let vision_unavailable = usable_screenshot.is_some() && !vision_possible;
     if vision_unavailable {
         let notice = "I cannot use the visual view because OpenAI is not configured. I will continue from the page controls I can read.";
         eprintln!("[MICE autopilot] {notice}");
@@ -1682,6 +2262,7 @@ fn stop() -> Result<(), Box<dyn std::error::Error>> {
     if response["type"] != "daemon.stopping" {
         return Err("The MICE daemon did not acknowledge the stop request.".into());
     }
+    stop_managed_ollama();
     println!("MICE is stopping.");
     Ok(())
 }
@@ -1966,7 +2547,13 @@ fn post_provider_request(
     api_key: &str,
     payload: &str,
 ) -> Result<ureq::Response, Box<dyn std::error::Error>> {
-    ureq::post(endpoint)
+    ureq::AgentBuilder::new()
+        // A generation is streamed by the caller. Bound connection setup but
+        // do not turn this into a 45-second whole-response deadline: slow,
+        // healthy Ollama/OpenAI/Groq streams must be allowed to finish.
+        .timeout_connect(Duration::from_secs(10))
+        .build()
+        .post(endpoint)
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {api_key}"))
         .send_string(payload)
@@ -2002,8 +2589,7 @@ fn call_openai_guide(
     instruction: &str,
     dom_snapshot: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY is required for browser guide-me")?;
+    let api_key = provider_api_key("OPENAI_API_KEY")?;
     let payload = mice_providers::openai_guide_payload(instruction, dom_snapshot).to_string();
     let response = post_provider_json(
         "OpenAI Responses API",
@@ -2028,8 +2614,7 @@ fn call_groq_guide(
     instruction: &str,
     dom_snapshot: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY is required when Groq is selected for browser guide-me")?;
+    let api_key = provider_api_key("GROQ_API_KEY")?;
     let payload = mice_providers::groq_guide_payload(model, instruction, dom_snapshot).to_string();
     let response = post_provider_json(
         "Groq guide API",
@@ -2046,8 +2631,7 @@ fn call_groq_guide(
 }
 
 fn call_openai_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key =
-        env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for Goal Guide")?;
+    let api_key = provider_api_key("OPENAI_API_KEY")?;
     let payload = mice_providers::structured_goal_plan_payload(model, goal).to_string();
     let response = post_provider_json(
         "OpenAI Goal Guide API",
@@ -2064,8 +2648,7 @@ fn call_openai_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std:
 }
 
 fn call_groq_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY is required when Groq is selected for Goal Guide")?;
+    let api_key = provider_api_key("GROQ_API_KEY")?;
     let payload = mice_providers::groq_goal_plan_payload(model, goal).to_string();
     let response = post_provider_json(
         "Groq Goal Guide API",
@@ -2081,6 +2664,88 @@ fn call_groq_goal_plan(model: &str, goal: &str) -> Result<String, Box<dyn std::e
         .ok_or_else(|| "Groq Goal Guide response did not contain JSON output".into())
 }
 
+/// Mission Control is deliberately local-first even when normal UI requests
+/// may use a cloud lane. A repository plan and its path index stay on-device
+/// unless the developer explicitly passes `mice mission plan --allow-cloud`.
+pub(crate) fn mission_planner_response(
+    prompt: &str,
+    allow_cloud: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let configuration = config()?;
+    let local_error = if configuration.privacy_mode != PrivacyMode::CloudOnly {
+        let mut response = String::new();
+        match stream_ollama(
+            &configuration.local_model,
+            "Return a validated MICE Mission Control task graph as specified in the content. JSON only.",
+            Some(prompt),
+            |chunk| {
+                response.push_str(chunk);
+                Ok(())
+            },
+        ) {
+            Ok(()) if !response.trim().is_empty() => return Ok(response),
+            Ok(()) => "local planner returned no output".into(),
+            Err(error) => error.to_string(),
+        }
+    } else {
+        "privacy mode is cloud_only".into()
+    };
+    if !allow_cloud {
+        return Err(format!(
+            "local mission planner unavailable ({}) and cloud planning was not explicitly allowed",
+            local_error
+        )
+        .into());
+    }
+    if configuration.privacy_mode == PrivacyMode::LocalOnly {
+        return Err(
+            "local mission planner failed and local-only mode forbids cloud planning".into(),
+        );
+    }
+    if is_groq_model(&configuration.cloud_model) {
+        call_groq_mission_plan(&configuration.cloud_model, prompt)
+    } else {
+        call_openai_mission_plan(&configuration.cloud_model, prompt)
+    }
+}
+
+fn call_openai_mission_plan(
+    model: &str,
+    prompt: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = provider_api_key("OPENAI_API_KEY")?;
+    let payload = mice_providers::structured_mission_plan_payload(model, prompt).to_string();
+    let response = post_provider_json(
+        "OpenAI Mission Control planner",
+        "https://api.openai.com/v1/responses",
+        &api_key,
+        &payload,
+    )?;
+    response["output"]
+        .as_array()
+        .and_then(|items| items.iter().find_map(|item| item["content"].as_array()))
+        .and_then(|content| content.iter().find_map(|part| part["text"].as_str()))
+        .map(str::to_owned)
+        .ok_or_else(|| "OpenAI Mission Control planner returned no structured graph".into())
+}
+
+fn call_groq_mission_plan(model: &str, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = provider_api_key("GROQ_API_KEY")?;
+    let payload = mice_providers::groq_mission_plan_payload(model, prompt).to_string();
+    let response = post_provider_json(
+        "Groq Mission Control planner",
+        "https://api.groq.com/openai/v1/chat/completions",
+        &api_key,
+        &payload,
+    )?;
+    response["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice["message"]["content"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "Groq Mission Control planner returned no JSON graph".into())
+}
+
 fn call_openai_agent_turn(
     model: &str,
     goal: &str,
@@ -2089,8 +2754,7 @@ fn call_openai_agent_turn(
     image_data_url: Option<&str>,
     persona: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key =
-        env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for autopilot")?;
+    let api_key = provider_api_key("OPENAI_API_KEY")?;
     let payload = mice_providers::agent_loop_payload_with_image_and_persona(
         model,
         goal,
@@ -2121,8 +2785,7 @@ fn call_groq_agent_turn(
     history: &str,
     persona: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("GROQ_API_KEY")
-        .map_err(|_| "GROQ_API_KEY is required when Groq is selected for autopilot")?;
+    let api_key = provider_api_key("GROQ_API_KEY")?;
     let payload = mice_providers::groq_agent_loop_payload_with_persona(
         model,
         goal,
@@ -2154,6 +2817,201 @@ fn actions() -> Result<(), Box<dyn std::error::Error>> {
 fn config() -> Result<mice_core::Config, Box<dyn std::error::Error>> {
     let path = config_path().ok_or("HOME is not set")?;
     Ok(load_config(&path)?)
+}
+
+const MICE_KEYCHAIN_SERVICE: &str = "MICE";
+const KEYCHAIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cloud keys belong in the user's login Keychain, never in MICE's TOML
+/// config, history, repository, or a long-lived shell environment. Environment
+/// variables still take precedence for CI and one-off developer overrides.
+fn provider_api_key(variable: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(value) = env::var(variable)
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+    keychain_api_key(variable).ok_or_else(|| {
+        format!(
+            "{variable} is not configured. Run `mice keys set {}` to save it securely in your macOS Keychain.",
+            provider_key_name(variable).unwrap_or("provider")
+        )
+        .into()
+    })
+}
+
+fn provider_key_name(variable: &str) -> Option<&'static str> {
+    match variable {
+        "GROQ_API_KEY" => Some("groq"),
+        "OPENAI_API_KEY" => Some("openai"),
+        _ => None,
+    }
+}
+
+fn provider_key_variable(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "groq" => Some("GROQ_API_KEY"),
+        "openai" | "open_ai" => Some("OPENAI_API_KEY"),
+        _ => None,
+    }
+}
+
+fn keychain_api_key(variable: &str) -> Option<String> {
+    provider_key_name(variable)?;
+    let mut child = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            MICE_KEYCHAIN_SERVICE,
+            "-a",
+            variable,
+            "-w",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + KEYCHAIN_LOOKUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if child.try_wait().ok()?.is_some() {
+            let output = child.wait_with_output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let value = String::from_utf8(output.stdout).ok()?;
+            let value = value.trim_end_matches(['\r', '\n']).to_owned();
+            return (!value.is_empty()).then_some(value);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+fn keys() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    match arguments.first().map(String::as_str) {
+        Some("status") if arguments.len() == 1 => {
+            for (label, variable) in [("Groq", "GROQ_API_KEY"), ("OpenAI", "OPENAI_API_KEY")] {
+                let source = if env::var_os(variable).is_some() {
+                    "environment override"
+                } else if keychain_api_key(variable).is_some() {
+                    "macOS Keychain"
+                } else {
+                    "not configured"
+                };
+                println!("{label}: {source}");
+            }
+            Ok(())
+        }
+        Some("set") if arguments.len() == 2 => {
+            let name = provider_key_variable(&arguments[1])
+                .ok_or("Choose `groq` or `openai`.")?;
+            let secret = read_keychain_secret(&arguments[1])?;
+            save_keychain_api_key(name, &secret)?;
+            println!("Saved {} securely in your macOS Keychain.", arguments[1].to_ascii_uppercase());
+            println!("Restart MICE (`mice stop`, then `mice`) if it is already running.");
+            Ok(())
+        }
+        Some("delete") | Some("remove") if arguments.len() == 2 => {
+            let variable = provider_key_variable(&arguments[1])
+                .ok_or("Choose `groq` or `openai`.")?;
+            confirm_change(
+                &format!("Delete MICE's {} key from your macOS Keychain?", arguments[1]),
+                false,
+            )?;
+            let status = Command::new("/usr/bin/security")
+                .args([
+                    "delete-generic-password",
+                    "-s",
+                    MICE_KEYCHAIN_SERVICE,
+                    "-a",
+                    variable,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            if !status.success() {
+                return Err("No matching MICE key was found in your macOS Keychain.".into());
+            }
+            println!("Deleted MICE's {} key from your macOS Keychain.", arguments[1]);
+            Ok(())
+        }
+        _ => Err("Usage: mice keys <set|status|delete> <groq|openai> (use `mice keys status` without a provider)".into()),
+    }
+}
+
+/// Read a key with normal terminal line input. Some terminals encode a paste
+/// in raw mode with bracketed-paste markers (`\x1b[200~` / `\x1b[201~`), which
+/// would silently corrupt the credential. Visible input is the reliable
+/// temporary UX; the value still never enters shell history or a command
+/// argument and is handed to Keychain over stdin.
+fn read_keychain_secret(provider: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if !std::io::stdin().is_terminal() {
+        return Err("`mice keys set` requires an interactive terminal.".into());
+    }
+    print!("Paste your {provider} API key (visible): ");
+    std::io::stdout().flush()?;
+    let mut secret = String::new();
+    std::io::stdin().read_line(&mut secret)?;
+    // Defensive cleanup for a pasted value copied from a terminal that has
+    // already leaked its bracketed-paste envelope into the line buffer.
+    let secret = secret
+        .trim()
+        .trim_start_matches("\u{1b}[200~")
+        .trim_start_matches("[200~")
+        .trim_end_matches("\u{1b}[201~")
+        .trim_end_matches("[201~")
+        .trim()
+        .to_owned();
+    if secret.is_empty() {
+        Err("The API key was empty; nothing was saved.".into())
+    } else {
+        Ok(secret)
+    }
+}
+
+fn save_keychain_api_key(variable: &str, secret: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut child = Command::new("/usr/bin/security")
+        // Per `security help add-generic-password`, a final `-w` with no
+        // value reads the password from stdin. Do not replace this with
+        // `-w <secret>`: process arguments are observable by other apps.
+        .args([
+            "add-generic-password",
+            "-a",
+            variable,
+            "-s",
+            MICE_KEYCHAIN_SERVICE,
+            "-U",
+            "-w",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("Keychain input was unavailable")?;
+    // `security add-generic-password -w` reads the password twice to
+    // confirm it. It can exit successfully even when the confirmation is
+    // missing, leaving an unusable empty keychain entry, so provide both
+    // interactive answers through the private stdin pipe.
+    stdin.write_all(secret.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.write_all(secret.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() && !stderr.contains("passwords don't match") {
+        Ok(())
+    } else {
+        Err(
+            "macOS Keychain could not save the key. Unlock your login keychain and try again."
+                .into(),
+        )
+    }
 }
 
 fn status() -> Result<(), Box<dyn std::error::Error>> {
@@ -2199,6 +3057,111 @@ fn enabled(value: bool) -> &'static str {
 fn shared_memory() -> Result<memory::SharedMemory, Box<dyn std::error::Error>> {
     let path = memory::SharedMemory::default_path().ok_or("HOME is not set")?;
     Ok(memory::SharedMemory::at(path)?)
+}
+
+fn user_history() -> Result<memory::UserHistory, Box<dyn std::error::Error>> {
+    let path = memory::UserHistory::default_path().ok_or("HOME is not set")?;
+    Ok(memory::UserHistory::at(path)?)
+}
+
+fn record_user_history(
+    kind: memory::HistoryKind,
+    question: &str,
+    answer: &str,
+    app_context: Option<String>,
+) {
+    if let Ok(history) = user_history() {
+        let _ = history.record(memory::HistoryEvent {
+            ts: memory::now(),
+            kind,
+            question: question.into(),
+            answer_digest: answer.into(),
+            app_context,
+        });
+    }
+}
+
+/// Captured screen/selection source material must never be reconstructed from
+/// history. Record only an event marker, not the model's answer, because an
+/// answer can quote the private source verbatim.
+fn record_sensitive_history(
+    kind: memory::HistoryKind,
+    question: &str,
+    app_context: Option<String>,
+) {
+    record_user_history(
+        kind,
+        question,
+        "Completed. Source-derived response was intentionally not retained.",
+        app_context,
+    );
+}
+
+fn history() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    let store = user_history()?;
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--clear")
+    {
+        if arguments.len() != 1 {
+            return Err("Usage: mice history --clear".into());
+        }
+        store.clear()?;
+        println!("MICE history and preferences cleared.");
+        return Ok(());
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--remember")
+    {
+        store.remember(&arguments.get(1..).unwrap_or_default().join(" "))?;
+        println!("MICE will apply that local preference to future answers.");
+        return Ok(());
+    }
+    let query = (!arguments.is_empty()).then(|| arguments.join(" "));
+    let entries = store.search(query.as_deref())?;
+    if entries.is_empty() {
+        println!("No matching MICE history.");
+        return Ok(());
+    }
+    for entry in entries.into_iter().take(50) {
+        let app = entry
+            .app_context
+            .as_deref()
+            .map(|value| format!(" — {value}"))
+            .unwrap_or_default();
+        println!(
+            "- [{}] {}: {}{}",
+            entry.ts,
+            format!("{:?}", entry.kind).to_lowercase(),
+            entry.question,
+            app
+        );
+        println!("  {}", entry.answer_digest);
+    }
+    Ok(())
+}
+
+/// Show the plans a person explicitly asked MICE to remember. Plans are kept
+/// in the owner-only history store and are never reconstructed from screen,
+/// clipboard, or selection content.
+fn plans() -> Result<(), Box<dyn std::error::Error>> {
+    let plans = user_history()?
+        .search(None)?
+        .into_iter()
+        .filter(|entry| entry.kind == memory::HistoryKind::GoalPlan)
+        .collect::<Vec<_>>();
+    if plans.is_empty() {
+        println!("No saved plans yet. Use Ctrl+Option+Space or type `plan <goal>` in MICE.");
+        return Ok(());
+    }
+    for (index, plan) in plans.into_iter().take(20).enumerate() {
+        println!("{}. {}", index + 1, plan.question);
+        println!("{}", plan.answer_digest);
+        println!();
+    }
+    Ok(())
 }
 
 fn tool_session_name() -> String {
@@ -2519,7 +3482,7 @@ fn savings() -> Result<(), Box<dyn std::error::Error>> {
 
 fn advertise() -> Result<(), Box<dyn std::error::Error>> {
     let text = format!(
-        "You are paired with MICE, a local execution manager. Delegate mechanical, repetitive, or token-heavy steps through run_tool or delegate_task; MICE first uses deterministic local CLIs and returns bounded results. Check team_status before editing shared files and record durable choices with memory_note.\n\nAvailable deterministic tools:\n{}",
+        "You are paired with MICE, a local execution manager. Delegate mechanical, repetitive, or token-heavy steps through run_tool or delegate_task; MICE first uses deterministic local CLIs and returns bounded results. For an assigned repository mission, call mission_status before editing; check team_status before editing shared files and record durable choices with memory_note.\n\nAvailable deterministic tools:\n{}",
         tools::stable_tool_prompt()
     );
     let arguments = env::args().skip(2).collect::<Vec<_>>();
@@ -2668,6 +3631,7 @@ fn delegate_task(
     goal: &str,
     max_actions: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    ensure_local_model(config)?;
     validate_tool_action_budget(max_actions)?;
     if route_execution_lane(
         config.machine_profile,
@@ -2771,12 +3735,13 @@ fn delegate_task(
 }
 
 fn extract_json_object(value: &str) -> &str {
-    let start = value.find('{').unwrap_or(0);
-    let end = value
-        .rfind('}')
-        .map(|index| index + 1)
-        .unwrap_or(value.len());
-    &value[start..end]
+    let Some(start) = value.find('{') else {
+        return value;
+    };
+    let Some(relative_end) = value[start..].rfind('}') else {
+        return value;
+    };
+    &value[start..start + relative_end + 1]
 }
 
 fn doctor() -> Result<(), Box<dyn std::error::Error>> {
@@ -2803,7 +3768,7 @@ fn doctor() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "OPENAI_API_KEY: {}",
-        if env::var_os("OPENAI_API_KEY").is_some() {
+        if provider_api_key("OPENAI_API_KEY").is_ok() {
             "set"
         } else {
             "not set"
@@ -2811,7 +3776,7 @@ fn doctor() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "GROQ_API_KEY: {}",
-        if env::var_os("GROQ_API_KEY").is_some() {
+        if provider_api_key("GROQ_API_KEY").is_ok() {
             "set"
         } else {
             "not set"
@@ -2879,18 +3844,220 @@ fn settings() -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path().ok_or("HOME is not set")?;
     let mut config = load_config(&path)?;
     if run_settings_tui(&mut config)? {
+        // Validate a prospective Local Only setting before persisting it. A
+        // failed disk/Ollama/model check must leave the known-good config in
+        // place for the resident daemon and the next launch.
+        ensure_local_only_ready(&config)?;
         save_config(&path, &config)?;
         println!("Saved settings to {}.", path.display());
+        // The resident daemon owns an immutable routing snapshot. Restart it
+        // after an explicit settings save so a privacy-mode switch takes
+        // effect immediately rather than silently waiting for a later launch.
+        if UnixStream::connect(bridge_socket_path()?).is_ok() {
+            stop()?;
+            launch()?;
+            println!("Restarted MICE with the new settings.");
+        }
+    }
+    Ok(())
+}
+
+const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+const DEFAULT_AUTOMATIC_LOCAL_MODEL: &str = "gemma3:4b";
+const MIN_AUTOMATIC_MODEL_DISK_GIB: u64 = 8;
+
+fn ollama_models_path() -> PathBuf {
+    env::var_os("OLLAMA_MODELS")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".ollama/models")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn available_disk_gib() -> u64 {
+    let mut volume_path = ollama_models_path();
+    while !volume_path.exists() {
+        let Some(parent) = volume_path.parent() else {
+            break;
+        };
+        volume_path = parent.to_owned();
+    }
+    Command::new("df")
+        .arg("-g")
+        .arg(volume_path)
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| {
+            output
+                .lines()
+                .nth(1)
+                .and_then(|line| line.split_whitespace().nth(3))
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn ollama_available() -> bool {
+    Command::new("ollama")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn managed_ollama_pid_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    config_path()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("managed-ollama.pid"))
+        })
+        .ok_or_else(|| "HOME is not set".into())
+}
+
+fn process_start_marker(pid: u32) -> Option<String> {
+    Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|marker| !marker.is_empty())
+}
+
+fn remember_managed_ollama(pid: u32) {
+    if let (Ok(path), Some(marker)) = (managed_ollama_pid_path(), process_start_marker(pid)) {
+        let _ = std::fs::write(path, format!("{pid}\t{marker}"));
+    }
+}
+
+fn stop_managed_ollama() {
+    let Ok(path) = managed_ollama_pid_path() else {
+        return;
+    };
+    let record = std::fs::read_to_string(&path).ok();
+    let parsed = record.as_deref().and_then(|value| {
+        let (pid, marker) = value.trim().split_once('\t')?;
+        Some((pid.parse::<u32>().ok()?, marker.to_owned()))
+    });
+    let Some((pid, expected_marker)) = parsed else {
+        let _ = std::fs::remove_file(path);
+        return;
+    };
+    let command = Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).to_ascii_lowercase())
+        .unwrap_or_default();
+    if command.contains("ollama")
+        && command.contains("serve")
+        && process_start_marker(pid).as_deref() == Some(expected_marker.as_str())
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Start an Ollama server only when no one else is already serving it. Ollama
+/// is intentionally launched without a shell, keeping user configuration and
+/// provider keys out of the child environment contract.
+fn ensure_ollama_server() -> Result<(), Box<dyn std::error::Error>> {
+    if mice_providers::ollama_model_ready(OLLAMA_ENDPOINT, DEFAULT_AUTOMATIC_LOCAL_MODEL).is_ok()
+        || ureq::get(&format!("{OLLAMA_ENDPOINT}/api/tags"))
+            .timeout(Duration::from_secs(1))
+            .call()
+            .is_ok()
+    {
+        return Ok(());
+    }
+    if !ollama_available() {
+        return Err("Ollama is not installed. Install it from https://ollama.com, then run `mice setup` again.".into());
+    }
+    let child = Command::new("ollama")
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    remember_managed_ollama(child.id());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if ureq::get(&format!("{OLLAMA_ENDPOINT}/api/tags"))
+            .timeout(Duration::from_secs(1))
+            .call()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("Ollama did not become ready within 20 seconds. Run `ollama serve` for diagnostics.".into())
+}
+
+/// Local Only is the one mode where MICE must make the local lane ready before
+/// accepting work. The automatic download boundary is deliberately narrow:
+/// only the default small model is pulled; heavier or user-selected alternates
+/// remain an explicit choice in settings.
+fn ensure_local_model(config: &mice_core::Config) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_ollama_server()?;
+    if mice_providers::ollama_model_ready(OLLAMA_ENDPOINT, &config.local_model).is_ok() {
+        return Ok(());
+    }
+    if config.local_model != DEFAULT_AUTOMATIC_LOCAL_MODEL {
+        return Err(format!(
+            "The selected local model `{}` is not installed. MICE only auto-downloads `{DEFAULT_AUTOMATIC_LOCAL_MODEL}`; select it in `mice settings` or run `ollama pull {}` yourself.",
+            config.local_model, config.local_model
+        )
+        .into());
+    }
+    let available = available_disk_gib();
+    if available < MIN_AUTOMATIC_MODEL_DISK_GIB {
+        return Err(format!(
+            "MICE needs at least {MIN_AUTOMATIC_MODEL_DISK_GIB} GiB free to download `{DEFAULT_AUTOMATIC_LOCAL_MODEL}` (only {available} GiB available)."
+        )
+        .into());
+    }
+    println!("Preparing private mode: downloading `{DEFAULT_AUTOMATIC_LOCAL_MODEL}` once…");
+    let status = Command::new("ollama")
+        .args(["pull", DEFAULT_AUTOMATIC_LOCAL_MODEL])
+        .status()?;
+    if !status.success() {
+        return Err(format!("Ollama could not download `{DEFAULT_AUTOMATIC_LOCAL_MODEL}`.").into());
+    }
+    mice_providers::ollama_model_ready(OLLAMA_ENDPOINT, &config.local_model).map_err(|error| {
+        format!(
+            "Ollama finished but `{}` is still unavailable: {error}",
+            config.local_model
+        )
+        .into()
+    })
+}
+
+fn ensure_local_only_ready(config: &mice_core::Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.privacy_mode == PrivacyMode::LocalOnly {
+        ensure_local_model(config)?;
     }
     Ok(())
 }
 
 fn run_settings_tui(config: &mut mice_core::Config) -> Result<bool, Box<dyn std::error::Error>> {
+    // Keychain/Ollama checks happen once on entry, never inside the 250 ms
+    // render loop. Settings must remain responsive even if Keychain prompts
+    // or Ollama is unavailable.
+    let availability = SettingsAvailability {
+        local_model_ready: mice_providers::ollama_model_ready(OLLAMA_ENDPOINT, &config.local_model)
+            .is_ok(),
+        groq_key_available: provider_api_key("GROQ_API_KEY").is_ok(),
+        openai_key_available: provider_api_key("OPENAI_API_KEY").is_ok(),
+    };
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = settings_event_loop(&mut terminal, config);
+    let result = settings_event_loop(&mut terminal, config, availability);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -2900,10 +4067,11 @@ fn run_settings_tui(config: &mut mice_core::Config) -> Result<bool, Box<dyn std:
 fn settings_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     config: &mut mice_core::Config,
+    availability: SettingsAvailability,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut selected = 0usize;
     loop {
-        terminal.draw(|frame| draw_settings(frame, config, selected))?;
+        terminal.draw(|frame| draw_settings(frame, config, selected, availability))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -2914,8 +4082,8 @@ fn settings_event_loop(
             continue;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.checked_sub(1).unwrap_or(10),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % 11,
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.checked_sub(1).unwrap_or(11),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % 12,
             KeyCode::Left | KeyCode::Char('h') => adjust_setting(config, selected, false),
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                 adjust_setting(config, selected, true)
@@ -2927,11 +4095,23 @@ fn settings_event_loop(
     }
 }
 
-fn draw_settings(frame: &mut ratatui::Frame, config: &mice_core::Config, selected: usize) {
+#[derive(Clone, Copy)]
+struct SettingsAvailability {
+    local_model_ready: bool,
+    groq_key_available: bool,
+    openai_key_available: bool,
+}
+
+fn draw_settings(
+    frame: &mut ratatui::Frame,
+    config: &mice_core::Config,
+    selected: usize,
+    availability: SettingsAvailability,
+) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .constraints([Constraint::Min(8), Constraint::Length(8)])
         .split(area);
     let rows = [
         format!(
@@ -2955,6 +4135,7 @@ fn draw_settings(frame: &mut ratatui::Frame, config: &mice_core::Config, selecte
         ),
         format!("Smart copy         {}", config.gesture.smart_copy_trigger),
         format!("Goal Guide        {}", config.gesture.goal_trigger),
+        format!("Command palette   {}", config.gesture.palette_trigger),
         format!("Autopilot persona  {}", config.autopilot.persona),
         format!(
             "Always confirm actions {}",
@@ -2982,11 +4163,67 @@ fn draw_settings(frame: &mut ratatui::Frame, config: &mice_core::Config, selecte
         ),
         chunks[0],
     );
+    let overview = settings_routing_overview(config, availability);
     frame.render_widget(
-        Paragraph::new("↑/↓ select  ←/→ change  s save  q cancel")
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(overview).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Active routing "),
+        ),
         chunks[1],
     );
+}
+
+fn settings_routing_overview(
+    config: &mice_core::Config,
+    availability: SettingsAvailability,
+) -> String {
+    let local_status = if availability.local_model_ready {
+        "ready"
+    } else {
+        "not ready"
+    };
+    let cloud_provider = if is_groq_model(&config.cloud_model) {
+        "Groq"
+    } else {
+        "OpenAI"
+    };
+    let cloud_key_ready = match cloud_provider {
+        "Groq" => availability.groq_key_available,
+        _ => availability.openai_key_available,
+    };
+    let cloud_status = if cloud_key_ready {
+        "key available"
+    } else {
+        "KEY MISSING"
+    };
+    let routing = match config.privacy_mode {
+        PrivacyMode::LocalOnly => format!(
+            "All supported text and Goal Guide work → LOCAL {} ({local_status}). Cloud is blocked.",
+            config.local_model
+        ),
+        PrivacyMode::CloudOnly => format!(
+            "All supported work → CLOUD {} via {cloud_provider} ({cloud_status}).",
+            config.cloud_model
+        ),
+        PrivacyMode::CloudAllowed => format!(
+            "Text / hover / selection summaries → LOCAL {} ({local_status}). Goal Guide / browser / images → CLOUD {} via {cloud_provider} ({cloud_status}).",
+            config.local_model, config.cloud_model
+        ),
+    };
+    format!(
+        "{routing}\n\nGroq key: {}    OpenAI key: {}\nUse `mice keys set groq` or `mice keys set openai` to save a key.\n↑/↓ select  ←/→ change  s save  q cancel",
+        if availability.groq_key_available {
+            "available"
+        } else {
+            "not configured"
+        },
+        if availability.openai_key_available {
+            "available"
+        } else {
+            "not configured"
+        },
+    )
 }
 
 fn adjust_setting(config: &mut mice_core::Config, selected: usize, forward: bool) {
@@ -3056,11 +4293,16 @@ fn adjust_setting(config: &mut mice_core::Config, selected: usize, forward: bool
             forward,
         ),
         9 => cycle_value(
+            &mut config.gesture.palette_trigger,
+            &["ctrl+shift+space", "ctrl+alt+space", "cmd+shift+space"],
+            forward,
+        ),
+        10 => cycle_value(
             &mut config.autopilot.persona,
             &["patient", "concise", "playful"],
             forward,
         ),
-        10 => config.autopilot.careful_mode = !config.autopilot.careful_mode,
+        11 => config.autopilot.careful_mode = !config.autopilot.careful_mode,
         _ => {}
     }
 }
@@ -3103,8 +4345,26 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         !mcp_client::granted_servers(&config).is_empty(),
         Ordering::Relaxed,
     );
+    ensure_local_only_ready(&config)?;
     let browser_goal_directive: NativeBridge = Arc::new(Mutex::new(NativeBridgeState::default()));
-    start_native_bridge(config.clone(), Arc::clone(&browser_goal_directive))?;
+    // Readiness is only advertised after the native agent has started. The
+    // bridge socket is deliberately bound second so it cannot be a false
+    // positive when the agent binary or its permissions fail immediately.
+    let mut agent = start_agent_daemon(&config.gesture)?;
+    if let Err(error) = start_native_bridge(config.clone(), Arc::clone(&browser_goal_directive)) {
+        let _ = agent.child.kill();
+        let _ = agent.child.wait();
+        return Err(error);
+    }
+    // Best-effort warm path: daemon startup never waits for Ollama and never
+    // fails in cloud-only mode, but local requests avoid a cold model load.
+    if config.privacy_mode != PrivacyMode::CloudOnly {
+        let warm_model = config.local_model.clone();
+        std::thread::spawn(move || {
+            let _ =
+                mice_providers::warm_ollama_model("http://127.0.0.1:11434/api/chat", &warm_model);
+        });
+    }
     let watchdog_bridge = Arc::clone(&browser_goal_directive);
     std::thread::spawn(move || {
         loop {
@@ -3112,7 +4372,6 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_millis(250));
         }
     });
-    let mut agent = start_agent(&config.gesture)?;
     println!(
         "MICE is running with {} agent (overlay={}). Press Ctrl-C to stop.",
         agent.platform, agent.capabilities.overlay
@@ -3121,6 +4380,14 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Capture: Ctrl+Shift+Space. Hover: hold Control. Select text, then Ctrl double-tap to summarize or Ctrl+Option+I for an infographic. After a normal Cmd-C, Ctrl+Option+C smart-copies."
     );
+    if env::var_os("MICE_OPEN_HOME").is_some() {
+        send_command(
+            &mut agent.stdin,
+            AgentCommand::HomeShow {
+                text: home_text(&config),
+            },
+        )?;
+    }
 
     let mut goal_sessions = HashMap::<String, GoalSession>::new();
     let mut goal_plans = HashMap::<String, GoalPlanResult>::new();
@@ -3131,21 +4398,20 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let go_deeper_prefetch_in_flight = Arc::new(AtomicBool::new(false));
     while let Ok(msg) = read_frame::<mice_ipc::RpcNotification>(&mut agent.reader) {
         if msg.method == "goal.request" {
-            let Some(session_id) = msg.params["sessionId"].as_str() else {
-                eprintln!("MICE received a goal request without a session ID");
+            // Goal Guide is resumable. Losing focus or pressing Escape only
+            // hides the native surface; the reviewed plan remains in core
+            // state until the person starts, revises, or cancels it.
+            if resume_reviewed_goal(&mut agent.stdin, &goal_sessions)? {
                 continue;
-            };
-            goal_sessions.insert(session_id.into(), GoalSession::new());
+            }
+            let session_id = msg.params["sessionId"]
+                .as_str()
+                .ok_or("MICE received a goal request without a session ID")?;
             send_command(
                 &mut agent.stdin,
-                AgentCommand::OverlayPromptInput {
+                AgentCommand::PaletteShow {
                     session_id: session_id.into(),
-                    title: "What is your goal today?".into(),
-                    placeholder: "For example: organize my tax documents".into(),
-                    context: Some(
-                        "MICE will make an advisory plan. You stay in control of every click, form, login, and payment."
-                            .into(),
-                    ),
+                    prefill: Some("plan ".into()),
                 },
             )?;
         } else if msg.method == "prompt.submitted" {
@@ -3156,7 +4422,8 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            let Some(session) = goal_sessions.get_mut(&submission.session_id) else {
+            let session_id = submission.session_id.clone();
+            let Some(session) = goal_sessions.get_mut(&session_id) else {
                 eprintln!("MICE received a prompt submission for an unknown session");
                 continue;
             };
@@ -3170,6 +4437,13 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 submission,
             ) {
                 eprintln!("MICE goal planning failed: {error}");
+                // A failed provider call leaves the session in Planning.
+                // Remove every associated entry so it cannot suppress future
+                // hover explanations for the lifetime of the daemon.
+                goal_sessions.remove(&session_id);
+                goal_plans.remove(&session_id);
+                active_guides.remove(&session_id);
+                clear_browser_goal_directive(&browser_goal_directive);
             }
         } else if msg.method == "prompt.cancelled" {
             if let Some(session_id) = msg.params["sessionId"].as_str() {
@@ -3192,7 +4466,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             let value = msg.params["value"].as_str();
-            if let Err(error) = handle_guide_control(
+            match handle_guide_control(
                 &mut agent.stdin,
                 &mut active_guides,
                 &browser_goal_directive,
@@ -3200,7 +4474,63 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 action,
                 value,
             ) {
-                eprintln!("MICE guide control failed: {error}");
+                Ok(true) => {
+                    goal_sessions.remove(session_id);
+                    goal_plans.remove(session_id);
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("MICE guide control failed: {error}"),
+            }
+        } else if msg.method == "palette.dismissed" {
+            let dismissed: mice_ipc::PaletteDismissed = match serde_json::from_value(msg.params) {
+                Ok(dismissed) => dismissed,
+                Err(error) => {
+                    eprintln!("MICE received an invalid palette dismissal: {error}");
+                    continue;
+                }
+            };
+            // Palette session IDs are also used for plan sessions. Removing
+            // them makes Escape a real cancellation boundary and ensures an
+            // old plan cannot later own the guide UI.
+            goal_sessions.remove(&dismissed.session_id);
+            goal_plans.remove(&dismissed.session_id);
+            active_guides.remove(&dismissed.session_id);
+            clear_browser_goal_directive(&browser_goal_directive);
+        } else if msg.method == "palette.submitted" {
+            let submission: PaletteSubmitted = match serde_json::from_value(msg.params) {
+                Ok(submission) => submission,
+                Err(error) => {
+                    eprintln!("MICE received invalid palette input: {error}");
+                    continue;
+                }
+            };
+            let palette_session = submission.session_id.clone();
+            if let Err(error) = handle_palette_submission(
+                &mut agent.stdin,
+                &config,
+                &mut goal_sessions,
+                &mut goal_plans,
+                &mut active_guides,
+                &browser_goal_directive,
+                submission,
+            ) {
+                eprintln!("MICE palette request failed: {error}");
+                // Palette task planning creates a GoalSession before the
+                // provider call. A failed call must not leave it Planning,
+                // because that would suppress all later hover explanations.
+                goal_sessions.remove(&palette_session);
+                goal_plans.remove(&palette_session);
+                active_guides.remove(&palette_session);
+                clear_browser_goal_directive(&browser_goal_directive);
+                // The palette disabled its input at submit time; a failure
+                // must reach the panel or it stays stuck at "thinking".
+                let _ = send_command(
+                    &mut agent.stdin,
+                    AgentCommand::PaletteFinishResult {
+                        session_id: palette_session,
+                        text: Some(format!("MICE could not complete that: {error}")),
+                    },
+                );
             }
         } else if msg.method == "selection.text" {
             let selection: SelectionText = match serde_json::from_value(msg.params) {
@@ -3249,13 +4579,30 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            if let Err(error) = handle_overlay_action(
-                &mut agent.stdin,
-                &config,
-                &mut selection_cache,
-                &session_id,
-                &action_id,
-            ) {
+            let goal_action = matches!(
+                action_id.as_str(),
+                "goal.accept" | "goal.revise" | "goal.cancel"
+            );
+            let result = if goal_action {
+                handle_goal_review_action(
+                    &mut agent.stdin,
+                    &mut goal_sessions,
+                    &mut goal_plans,
+                    &mut active_guides,
+                    &browser_goal_directive,
+                    &session_id,
+                    &action_id,
+                )
+            } else {
+                handle_overlay_action(
+                    &mut agent.stdin,
+                    &config,
+                    &mut selection_cache,
+                    &session_id,
+                    &action_id,
+                )
+            };
+            if let Err(error) = result {
                 eprintln!("MICE overlay action failed: {error}");
             }
         } else if msg.method == "selection.captured" {
@@ -3387,6 +4734,19 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else if msg.method == "hover.captured" {
+            // A reviewed plan owns the visible guidance surface. Hover events
+            // captured just before the palette was submitted must not replace
+            // its Planning/Review panel after the model returns.
+            if goal_sessions.values().any(|session| {
+                matches!(
+                    session.state(),
+                    GoalState::Planning { .. }
+                        | GoalState::Reviewing { .. }
+                        | GoalState::Accepted { .. }
+                )
+            }) {
+                continue;
+            }
             let hover: HoverCaptured = match serde_json::from_value(msg.params) {
                 Ok(hover) => hover,
                 Err(error) => {
@@ -4254,6 +5614,7 @@ fn handle_selection_action(
         // passage is a summary. Same gesture, intent inferred from length.
         SelectionAction::Summarize if is_short_phrase(&selection.text) => Action::Define,
         SelectionAction::Summarize => Action::Summarize,
+        SelectionAction::Define => Action::Define,
         SelectionAction::Image => Action::Image,
     };
     let instruction = if action == Action::Summarize {
@@ -4261,6 +5622,13 @@ fn handle_selection_action(
     } else {
         action_instruction(action, "")
     };
+    let instruction = apply_preferences(
+        &instruction,
+        user_history()
+            .ok()
+            .and_then(|history| history.preferences_preamble().ok().flatten())
+            .as_deref(),
+    );
     let request = RouteRequest {
         artifacts: Artifacts {
             text: Some(selection.text.clone()),
@@ -4323,6 +5691,11 @@ fn handle_selection_action(
         Ok(response) => {
             if !response.is_empty() {
                 send_command(writer, clipboard_command(&response))?;
+                record_sensitive_history(
+                    memory::HistoryKind::Summarize,
+                    "A selected-text summary",
+                    None,
+                );
             }
             send_command(writer, AgentCommand::OverlayFinishResult { text: None })?;
             send_command(
@@ -4351,8 +5724,8 @@ fn handle_goal_submission(
     config: &mice_core::Config,
     session: &mut GoalSession,
     goal_plans: &mut HashMap<String, GoalPlanResult>,
-    active_guides: &mut HashMap<String, ActiveGuide>,
-    browser_goal_directive: &NativeBridge,
+    _active_guides: &mut HashMap<String, ActiveGuide>,
+    _browser_goal_directive: &NativeBridge,
     submission: PromptSubmitted,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let planning_input = match session.state() {
@@ -4361,22 +5734,14 @@ fn handle_goal_submission(
             submission.text
         }
         GoalState::Reviewing { .. } if submission.text.trim().is_empty() => {
-            session.accept()?;
-            let plan = goal_plans
-                .get(&submission.session_id)
-                .ok_or("MICE lost the reviewed plan; please start again.")?;
-            active_guides.insert(
-                submission.session_id.clone(),
-                ActiveGuide {
-                    steps: plan.steps.clone(),
-                    current_step: 0,
-                },
-            );
-            return show_active_guide_step(
+            // A blank revision must never double as consent. Restore the
+            // explicit review choices instead of accepting the plan.
+            return send_command(
                 writer,
-                active_guides,
-                browser_goal_directive,
-                &submission.session_id,
+                AgentCommand::OverlayResult {
+                    session_id: submission.session_id,
+                    actions: goal_review_actions(),
+                },
             );
         }
         GoalState::Reviewing { .. } => session.begin_revision(submission.text)?,
@@ -4392,10 +5757,34 @@ fn handle_goal_submission(
             text: "Planning your goal…".into(),
         },
     )?;
-    let plan = generate_goal_plan(config, &planning_input)?;
+    let plan = match generate_goal_plan(config, &planning_input) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let message = format!(
+                "MICE could not make this plan: {error}\n\nCheck your selected provider in `mice settings`, then try again."
+            );
+            let _ = send_command(
+                writer,
+                AgentCommand::OverlayFinishResult {
+                    text: Some(message),
+                },
+            );
+            return Err(error);
+        }
+    };
     let rendered = render_goal_plan(&plan);
     session.review(rendered.clone())?;
     goal_plans.insert(submission.session_id.clone(), plan);
+    // A typed goal and its bounded, advisory plan are intentional personal
+    // memory. This lets Home and `mice plans` reopen the context after the
+    // person changes apps or restarts MICE. Never use this path for captures
+    // or selections, whose source content remains non-persistent.
+    record_user_history(
+        memory::HistoryKind::GoalPlan,
+        &planning_input,
+        &rendered,
+        None,
+    );
     send_command(
         writer,
         AgentCommand::OverlayShow {
@@ -4404,14 +5793,365 @@ fn handle_goal_submission(
     )?;
     send_command(
         writer,
-        AgentCommand::OverlayPromptInput {
+        AgentCommand::OverlayResult {
             session_id: submission.session_id,
-            title: "Review your plan".into(),
-            placeholder: "Optional revision; leave blank to accept".into(),
-            context: Some(rendered),
+            actions: goal_review_actions(),
         },
     )?;
     Ok(())
+}
+
+/// Dispatch the small, explicit palette surface. It intentionally reuses the
+/// same typed selection and goal flows as global gestures: the palette is a
+/// faster entry point, never a second decision-maker or a background observer.
+fn handle_palette_submission(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    sessions: &mut HashMap<String, GoalSession>,
+    goal_plans: &mut HashMap<String, GoalPlanResult>,
+    active_guides: &mut HashMap<String, ActiveGuide>,
+    browser_goal_directive: &NativeBridge,
+    submission: PaletteSubmitted,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = submission.session_id;
+    let intent = parse_palette_intent(&submission.text);
+    // Questions remain Ask requests, but an unmistakable task statement is
+    // allowed to enter the reviewed Goal Guide without teaching people a
+    // command language. This does not authorize execution: the generated plan
+    // still needs an explicit Start guide decision.
+    let plan_goal = match &intent {
+        PaletteIntent::Plan(goal) => Some(goal.clone()),
+        PaletteIntent::Ask(question) if looks_like_goal_statement(question) => {
+            Some(question.clone())
+        }
+        _ => None,
+    };
+    if let Some(goal) = plan_goal {
+        if goal.trim().is_empty() {
+            return palette_finish(writer, &session_id, "Type a goal after `plan`.");
+        }
+        // Only one reviewed plan may be resumed by the Goal gesture. A new
+        // palette plan intentionally supersedes an older unstarted review,
+        // rather than allowing HashMap iteration order to choose a plan.
+        sessions.retain(|existing_id, session| {
+            let keep = !matches!(session.state(), GoalState::Reviewing { .. });
+            if !keep {
+                goal_plans.remove(existing_id);
+                active_guides.remove(existing_id);
+            }
+            keep
+        });
+        sessions.insert(session_id.clone(), GoalSession::new());
+        send_command(
+            writer,
+            AgentCommand::PaletteDismiss {
+                session_id: session_id.clone(),
+            },
+        )?;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or("MICE could not create a goal session.")?;
+        return handle_goal_submission(
+            writer,
+            config,
+            session,
+            goal_plans,
+            active_guides,
+            browser_goal_directive,
+            PromptSubmitted {
+                session_id,
+                text: goal,
+            },
+        );
+    }
+    match intent {
+        PaletteIntent::Plan(_) => unreachable!("handled before palette dispatch"),
+        PaletteIntent::Summarize(_) => {
+            let Some(text) = submission
+                .selection_text
+                .filter(|text| !text.trim().is_empty())
+            else {
+                return palette_finish(
+                    writer,
+                    &session_id,
+                    "Select text first, then use summarize.",
+                );
+            };
+            send_command(
+                writer,
+                AgentCommand::PaletteDismiss {
+                    session_id: session_id.clone(),
+                },
+            )?;
+            let _ = handle_selection_action(
+                writer,
+                config,
+                SelectionText {
+                    session_id,
+                    text,
+                    html: None,
+                    source: mice_ipc::SelectionSource::Ax,
+                    action: SelectionAction::Summarize,
+                },
+            )?;
+            Ok(())
+        }
+        PaletteIntent::Define(term) => {
+            // A typed `define` term is intentional and always wins. A
+            // selection is a convenience fallback only for bare `define`.
+            let text = (!term.trim().is_empty())
+                .then_some(term)
+                .or_else(|| {
+                    submission
+                        .selection_text
+                        .filter(|text| !text.trim().is_empty())
+                })
+                .unwrap_or_default();
+            if text.trim().is_empty() {
+                return palette_finish(
+                    writer,
+                    &session_id,
+                    "Type a word after `define`, or select text first.",
+                );
+            }
+            send_command(
+                writer,
+                AgentCommand::PaletteDismiss {
+                    session_id: session_id.clone(),
+                },
+            )?;
+            let _ = handle_selection_action(
+                writer,
+                config,
+                SelectionText {
+                    session_id,
+                    text,
+                    html: None,
+                    source: mice_ipc::SelectionSource::Ax,
+                    action: SelectionAction::Define,
+                },
+            )?;
+            Ok(())
+        }
+        PaletteIntent::Remember(note) => {
+            user_history()?.remember(&note)?;
+            palette_finish(writer, &session_id, "Saved as a local MICE preference.")
+        }
+        PaletteIntent::History(query) => {
+            let entries = user_history()?.search((!query.is_empty()).then_some(query.as_str()))?;
+            let text = if entries.is_empty() {
+                "No matching MICE history.".into()
+            } else {
+                entries
+                    .into_iter()
+                    .take(12)
+                    .map(|entry| format!("{}: {}", entry.question, entry.answer_digest))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            palette_finish(writer, &session_id, &text)
+        }
+        PaletteIntent::Ask(question) => handle_palette_ask(writer, config, &session_id, &question),
+        PaletteIntent::See(_)
+        | PaletteIntent::Sheet(_)
+        | PaletteIntent::Tidy(_)
+        | PaletteIntent::File(_) => palette_finish(
+            writer,
+            &session_id,
+            "That command is available from the CLI for now. Palette support for it is coming next.",
+        ),
+    }
+}
+
+fn palette_finish(
+    writer: &mut ChildStdin,
+    session_id: &str,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_command(
+        writer,
+        AgentCommand::PaletteFinishResult {
+            session_id: session_id.into(),
+            text: Some(text.into()),
+        },
+    )
+}
+
+fn handle_palette_ask(
+    writer: &mut ChildStdin,
+    config: &mice_core::Config,
+    session_id: &str,
+    question: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if question.trim().is_empty() {
+        return palette_finish(writer, session_id, "Type a question for MICE.");
+    }
+    let preferences = user_history()
+        .ok()
+        .and_then(|history| history.preferences_preamble().ok().flatten());
+    let instruction = apply_preferences(question, preferences.as_deref());
+    let request = RouteRequest {
+        artifacts: Artifacts::default(),
+        instruction: instruction.clone(),
+        action: Some(Action::Summarize),
+        privacy_mode: config.privacy_mode,
+        cost_policy: config.cost_policy,
+        model_preferences: ModelPreferences {
+            local_model: config.local_model.clone(),
+            cloud_model: config.cloud_model.clone(),
+        },
+    };
+    let selected = route(&request)?.model;
+    let mut stream = PaletteStream::new(writer, session_id);
+    if selected.locality == mice_providers::Locality::Local {
+        mice_providers::ollama_model_ready("http://127.0.0.1:11434", selected.id)?;
+        stream_ollama(selected.id, &instruction, None, |chunk| stream.push(chunk))?;
+    } else if is_groq_model(selected.id) {
+        stream_groq(selected.id, &instruction, None, |chunk| stream.push(chunk))?;
+    } else {
+        stream_openai(selected.id, &instruction, None, |chunk| stream.push(chunk))?;
+    }
+    let answer = stream.finish()?;
+    if answer.trim().is_empty() {
+        return palette_finish(
+            writer,
+            session_id,
+            "MICE received an empty response. Check `mice status` and your selected model, then try again.",
+        );
+    }
+    record_user_history(memory::HistoryKind::Palette, question, &answer, None);
+    palette_finish(writer, session_id, "")
+}
+
+/// Keep ordinary questions such as “OpenAI pricing” and “help me understand
+/// Rust” as Ask requests, while letting a concrete multi-step task feel
+/// natural in the palette. The classifier is intentionally narrow and merely
+/// chooses the reviewed planning UI; it can never cause browser mutation.
+fn looks_like_goal_statement(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let starts_with_destination = ["go to ", "navigate to ", "visit "]
+        .iter()
+        .any(|prefix| value.starts_with(prefix));
+    let starts_with_creation = ["create ", "make ", "set up ", "sign up ", "register "]
+        .iter()
+        .any(|prefix| value.starts_with(prefix));
+    let has_follow_on_action = [
+        " start ",
+        " create ",
+        " choose ",
+        " design",
+        " upload ",
+        " fill ",
+        " organize ",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle));
+    starts_with_creation || (starts_with_destination && has_follow_on_action)
+}
+
+fn goal_review_actions() -> Vec<mice_ipc::OverlayAction> {
+    vec![
+        mice_ipc::OverlayAction {
+            id: "goal.accept".into(),
+            label: "Start guide".into(),
+        },
+        mice_ipc::OverlayAction {
+            id: "goal.revise".into(),
+            label: "Revise".into(),
+        },
+        mice_ipc::OverlayAction {
+            id: "goal.cancel".into(),
+            label: "Cancel".into(),
+        },
+    ]
+}
+
+/// Re-open the most recent reviewed plan after its overlay was dismissed.
+/// The plan text lives in `GoalSession`, so no provider call or regeneration
+/// is needed merely because the person changed applications.
+fn resume_reviewed_goal(
+    writer: &mut ChildStdin,
+    sessions: &HashMap<String, GoalSession>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some((session_id, plan)) = sessions.iter().find_map(|(session_id, session)| {
+        let GoalState::Reviewing { plan, .. } = session.state() else {
+            return None;
+        };
+        Some((session_id.clone(), plan.clone()))
+    }) else {
+        return Ok(false);
+    };
+    send_command(writer, AgentCommand::OverlayShow { text: plan })?;
+    send_command(
+        writer,
+        AgentCommand::OverlayResult {
+            session_id,
+            actions: goal_review_actions(),
+        },
+    )?;
+    Ok(true)
+}
+
+fn handle_goal_review_action(
+    writer: &mut ChildStdin,
+    sessions: &mut HashMap<String, GoalSession>,
+    goal_plans: &mut HashMap<String, GoalPlanResult>,
+    active_guides: &mut HashMap<String, ActiveGuide>,
+    browser_goal_directive: &NativeBridge,
+    session_id: &str,
+    action: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if action == "goal.cancel" {
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or("MICE received a plan action for an unknown session.")?;
+        if !matches!(session.state(), GoalState::Reviewing { .. }) {
+            return Err("This plan is no longer awaiting review.".into());
+        }
+        session.cancel()?;
+        // Plans and their original goals are transient daemon state. Once a
+        // person cancels, retain neither for the rest of the daemon lifetime.
+        sessions.remove(session_id);
+        goal_plans.remove(session_id);
+        return send_command(
+            writer,
+            AgentCommand::OverlayFinishResult {
+                text: Some("Goal planning cancelled.".into()),
+            },
+        );
+    }
+    let session = sessions
+        .get_mut(session_id)
+        .ok_or("MICE received a plan action for an unknown session.")?;
+    if !matches!(session.state(), GoalState::Reviewing { .. }) {
+        return Err("This plan is no longer awaiting review.".into());
+    }
+    match action {
+        "goal.accept" => {
+            session.accept()?;
+            let plan = goal_plans
+                .get(session_id)
+                .ok_or("MICE lost the reviewed plan; please start again.")?;
+            active_guides.insert(
+                session_id.into(),
+                ActiveGuide {
+                    steps: plan.steps.clone(),
+                    current_step: 0,
+                },
+            );
+            show_active_guide_step(writer, active_guides, browser_goal_directive, session_id)
+        }
+        "goal.revise" => send_command(
+            writer,
+            AgentCommand::OverlayPromptInput {
+                session_id: session_id.into(),
+                title: "Revise your plan".into(),
+                placeholder: "What should MICE change?".into(),
+                context: Some("Tell MICE what to add, remove, or simplify. Your current plan stays visible behind this prompt.".into()),
+            },
+        ),
+        _ => Err("Unknown plan review action.".into()),
+    }
 }
 
 fn generate_goal_plan(
@@ -4434,6 +6174,7 @@ fn generate_goal_plan(
     };
     let selected = route(&request)?.model;
     let raw = if selected.locality == mice_providers::Locality::Local {
+        mice_providers::ollama_model_ready("http://127.0.0.1:11434", selected.id)?;
         let mut response = String::new();
         stream_ollama(
             selected.id,
@@ -4450,10 +6191,66 @@ fn generate_goal_plan(
     } else {
         call_openai_goal_plan(selected.id, planning_input)?
     };
-    let plan: GoalPlanResult = serde_json::from_str(&raw)
+    match parse_goal_plan(&raw) {
+        Ok(plan) => Ok(plan),
+        // Gemma and other local models commonly add a Markdown fence or an
+        // explanatory sentence around otherwise-valid JSON. `parse_goal_plan`
+        // handles the common cases; if this small formatting-only contract is
+        // still missed, give the person a clearly safe starter plan rather
+        // than leaving the Goal UI blank. An unavailable Ollama server/model
+        // returned above as an error and is never hidden by this recovery.
+        Err(_) if selected.locality == mice_providers::Locality::Local => {
+            Ok(local_goal_plan_recovery(planning_input))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_goal_plan(raw: &str) -> Result<GoalPlanResult, Box<dyn std::error::Error>> {
+    let raw = strip_markdown_fence(raw);
+    let plan: GoalPlanResult = serde_json::from_str(extract_json_object(raw))
         .map_err(|_| "The planning model returned an invalid plan; please try again.")?;
     validate_goal_plan(&plan)?;
     Ok(plan)
+}
+
+/// Local models should normally produce the same structured plan as cloud
+/// models. This recovery covers only malformed presentation around a completed
+/// local response, preserving the core safety boundary: it gives advice and
+/// never emits executable browser actions.
+fn local_goal_plan_recovery(goal: &str) -> GoalPlanResult {
+    let goal = bounded_for_model(goal.trim(), 180);
+    let app_hint = infer_goal_app_hint(&goal);
+    GoalPlanResult {
+        steps: vec![
+            GoalPlanStep {
+                instruction: format!("Open the app or website you need for: {goal}"),
+                app_hint: app_hint.clone(),
+                sensitive: false,
+            },
+            GoalPlanStep {
+                instruction: "Find the relevant page, template, or starting point for your goal.".into(),
+                app_hint: app_hint.clone(),
+                sensitive: false,
+            },
+            GoalPlanStep {
+                instruction: "Carry out the next step yourself, then review the result before sharing, submitting, or paying.".into(),
+                app_hint,
+                sensitive: false,
+            },
+        ],
+    }
+}
+
+fn infer_goal_app_hint(goal: &str) -> String {
+    let goal = goal.to_ascii_lowercase();
+    if goal.contains("canva") {
+        "Canva in your browser".into()
+    } else if goal.contains("chrome") || goal.contains("browser") || goal.contains("website") {
+        "Your web browser".into()
+    } else {
+        "The relevant app or website".into()
+    }
 }
 
 fn show_active_guide_step(
@@ -4493,6 +6290,7 @@ fn show_active_guide_step(
             // exclusively owned by the AXI executor, which supplies the
             // current-snapshot and per-action consent guarantees.
             browser_capable: false,
+            presentation: Some("panel".into()),
         },
     )
 }
@@ -4504,24 +6302,27 @@ fn handle_guide_control(
     session_id: &str,
     action: &str,
     _value: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     if action == "do-it" || action == "do-it-fill" {
-        return send_command(
+        send_command(
             writer,
             AgentCommand::OverlayFinishResult {
                 text: Some("Goal Guide only highlights and explains. Use `mice autopilot --engine axi <goal>` for individually confirmed browser actions.".into()),
             },
-        );
+        )?;
+        return Ok(false);
     }
     if action == "quit" {
         guides.remove(session_id);
         clear_browser_goal_directive(browser_goal_directive);
-        return send_command(
+        send_command(writer, AgentCommand::OverlayHighlight { boxes: vec![] })?;
+        send_command(
             writer,
             AgentCommand::OverlayFinishResult {
                 text: Some("Goal Guide ended. You can start another goal at any time.".into()),
             },
-        );
+        )?;
+        return Ok(true);
     }
     let guide = guides
         .get_mut(session_id)
@@ -4530,19 +6331,22 @@ fn handle_guide_control(
         "next" if guide.current_step + 1 == guide.steps.len() => {
             guides.remove(session_id);
             clear_browser_goal_directive(browser_goal_directive);
-            return send_command(
+            send_command(writer, AgentCommand::OverlayHighlight { boxes: vec![] })?;
+            send_command(
                 writer,
                 AgentCommand::OverlayFinishResult {
                     text: Some("Goal Guide complete. Great work!".into()),
                 },
-            );
+            )?;
+            return Ok(true);
         }
         "next" => guide.current_step += 1,
         "back" => guide.current_step = guide.current_step.saturating_sub(1),
         "stay" => {}
         _ => return Err("Unknown guide control.".into()),
     }
-    show_active_guide_step(writer, guides, browser_goal_directive, session_id)
+    show_active_guide_step(writer, guides, browser_goal_directive, session_id)?;
+    Ok(false)
 }
 
 fn is_browser_step(step: &GoalPlanStep) -> bool {
@@ -4660,12 +6464,22 @@ fn explain_hover(
     let Some(label) = label else {
         return Ok(());
     };
+    if is_terminal_command_field(hover.app_name.as_deref(), &label, ax.role.as_deref()) {
+        send_command(
+            writer,
+            AgentCommand::OverlayShow {
+                text: "Terminal command area. Type a shell command here, then press Return to run it; output appears in this same window.".into(),
+            },
+        )?;
+        return send_command(writer, AgentCommand::OverlayFinishResult { text: None });
+    }
     let control_type = hover_control_type(ax.role.as_deref(), Some(&label), None);
     let auxiliary_context = auxiliary_hover_context(ax.description.as_deref(), &label);
     let current_value = ax.value.unwrap_or_default();
     let actions = ax.actions.join(", ");
     let context = format!(
-        "Current control (captured under the pointer now):\nControl type: {control_type}\nVisible label: {}\nAdditional context: {}\nCurrent value: {}\nAvailable actions: {}",
+        "Current control (captured under the pointer now):\nApplication: {}\nControl type: {control_type}\nVisible label: {}\nAdditional context: {}\nCurrent value: {}\nAvailable actions: {}",
+        bounded_for_model(hover.app_name.as_deref().unwrap_or("the current app"), 120),
         bounded_for_model(&label, 240),
         bounded_for_model(&auxiliary_context, 400),
         bounded_for_model(&current_value, 400),
@@ -4695,19 +6509,22 @@ fn explain_hover(
         },
     )?;
     let mut stream = OverlayStream::new(writer);
-    let result = if selected.locality == mice_providers::Locality::Local {
-        stream_ollama(selected.id, &request.instruction, Some(&context), |chunk| {
-            stream.push(chunk)
-        })
-    } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
-        stream_groq(selected.id, &request.instruction, Some(&context), |chunk| {
-            stream.push(chunk)
-        })
-    } else {
-        stream_openai(selected.id, &request.instruction, Some(&context), |chunk| {
-            stream.push(chunk)
-        })
-    };
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if selected.locality == mice_providers::Locality::Local {
+            mice_providers::ollama_model_ready("http://127.0.0.1:11434", selected.id)?;
+            stream_ollama(selected.id, &request.instruction, Some(&context), |chunk| {
+                stream.push(chunk)
+            })
+        } else if selected.id.starts_with("llama-") || selected.id.starts_with("mixtral-") {
+            stream_groq(selected.id, &request.instruction, Some(&context), |chunk| {
+                stream.push(chunk)
+            })
+        } else {
+            stream_openai(selected.id, &request.instruction, Some(&context), |chunk| {
+                stream.push(chunk)
+            })
+        }
+    })();
     match result {
         Ok(()) => {
             stream.finish()?;
@@ -4726,6 +6543,14 @@ fn explain_hover(
     }
 }
 
+fn is_terminal_command_field(app_name: Option<&str>, label: &str, role: Option<&str>) -> bool {
+    let app = app_name.unwrap_or_default().to_ascii_lowercase();
+    let label = label.to_ascii_lowercase();
+    let role = role.unwrap_or_default().to_ascii_lowercase();
+    (app == "terminal" || app.contains("iterm"))
+        && (label.contains("shell text") || label == "input field" || role.contains("textfield"))
+}
+
 struct AgentSession {
     child: Child,
     stdin: ChildStdin,
@@ -4737,7 +6562,16 @@ struct AgentSession {
 fn start_agent(
     gesture: &mice_core::GestureConfig,
 ) -> Result<AgentSession, Box<dyn std::error::Error>> {
-    spawn_agent(gesture, false, false)
+    spawn_agent(gesture, false, false, false, false, false)
+}
+
+/// The resident daemon's agent: the only agent allowed to open the palette.
+/// Probe agents (`mice status`) and one-shot fallbacks must never present a
+/// palette from a stray gesture while they briefly exist.
+fn start_agent_daemon(
+    gesture: &mice_core::GestureConfig,
+) -> Result<AgentSession, Box<dyn std::error::Error>> {
+    spawn_agent(gesture, false, false, true, false, false)
 }
 
 /// A display-only agent for one-shot commands: it never creates an event tap,
@@ -4745,7 +6579,14 @@ fn start_agent(
 fn start_agent_overlay_only(
     gesture: &mice_core::GestureConfig,
 ) -> Result<AgentSession, Box<dyn std::error::Error>> {
-    spawn_agent(gesture, false, true)
+    spawn_agent(gesture, false, true, false, false, false)
+}
+
+fn start_agent_home(
+    gesture: &mice_core::GestureConfig,
+    resident_daemon: bool,
+) -> Result<AgentSession, Box<dyn std::error::Error>> {
+    spawn_agent(gesture, false, true, false, true, resident_daemon)
 }
 
 /// Ask the thin macOS agent for the existing Finder selection. The core only
@@ -4837,6 +6678,9 @@ fn spawn_agent(
     gesture: &mice_core::GestureConfig,
     autopilot_active: bool,
     overlay_only: bool,
+    daemon: bool,
+    home_only: bool,
+    home_has_resident_daemon: bool,
 ) -> Result<AgentSession, Box<dyn std::error::Error>> {
     let agent = agent_path()?;
     if !agent.exists() {
@@ -4858,6 +6702,13 @@ fn spawn_agent(
         )
         .env("MICE_GOAL_TRIGGER", &gesture.goal_trigger)
         .env("MICE_SMART_COPY_TRIGGER", &gesture.smart_copy_trigger)
+        .env("MICE_PALETTE_TRIGGER", &gesture.palette_trigger)
+        .env("MICE_DAEMON", if daemon { "1" } else { "0" })
+        .env("MICE_HOME_ONLY", if home_only { "1" } else { "0" })
+        .env(
+            "MICE_HOME_HAS_RESIDENT_DAEMON",
+            if home_has_resident_daemon { "1" } else { "0" },
+        )
         .env(
             "MICE_AUTOPILOT_ACTIVE",
             if autopilot_active { "1" } else { "0" },
@@ -5048,7 +6899,7 @@ fn mcp_server() -> Result<(), Box<dyn std::error::Error>> {
                         "protocolVersion": "2025-06-18",
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "mice", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": "You are paired with MICE, a local execution manager. Delegate mechanical or token-heavy work through delegate_task or run_tool; MICE first uses deterministic local CLIs and returns bounded results. Check team_status before editing shared files and record durable decisions with memory_note."
+                        "instructions": "You are paired with MICE, a local execution manager. Delegate mechanical or token-heavy work through delegate_task or run_tool; MICE first uses deterministic local CLIs and returns bounded results. Check mission_status before editing an assigned mission task, check team_status before editing shared files, and record durable decisions with memory_note."
                     }
                 })
             }),
@@ -5160,6 +7011,7 @@ fn mcp_tools() -> Vec<Value> {
         json!({"name": "memory_note", "description": "Record a durable shared-team decision or fact.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         json!({"name": "memory_query", "description": "Search shared MICE events, decisions, and recent work deterministically.", "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}),
         json!({"name": "team_status", "description": "Show active MICE sessions and early file-overlap warnings.", "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "mission_status", "description": "Read the active MICE mission's task ownership, lifecycle state, and bounded Git overlap warnings. It never launches, merges, or edits.", "inputSchema": {"type": "object", "properties": {"plan_path": {"type": "string"}}, "required": ["plan_path"]}}),
     ];
     values.extend(tools::tool_schema());
     values
@@ -5259,6 +7111,7 @@ fn mcp_call_tool(
         }
         "memory_query" => Ok(shared_memory()?.query(string_argument("question")?)?),
         "team_status" => Ok(shared_memory()?.team_status()?),
+        "mission_status" => mission::mcp_status(string_argument("plan_path")?),
         "delegate_task" => {
             let max_actions = arguments
                 .get("max_actions")
@@ -5309,6 +7162,7 @@ fn mcp_local_response(
     instruction: &str,
     text: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    ensure_local_model(config)?;
     let mut response = String::new();
     stream_ollama(&config.local_model, instruction, text, |chunk| {
         response.push_str(chunk);
@@ -5401,12 +7255,16 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
         std::io::stdin().read_to_string(&mut text)?;
         (!text.trim().is_empty()).then_some(text)
     };
+    let model_instruction = action_instruction(action, &instruction);
+    let preferences = user_history()
+        .ok()
+        .and_then(|history| history.preferences_preamble().ok().flatten());
     let request = RouteRequest {
         artifacts: Artifacts {
             text: text.clone(),
             ..Default::default()
         },
-        instruction: action_instruction(action, &instruction),
+        instruction: apply_preferences(&model_instruction, preferences.as_deref()),
         action: Some(action),
         privacy_mode: config.privacy_mode,
         cost_policy: config.cost_policy,
@@ -5472,6 +7330,14 @@ fn ask() -> Result<(), Box<dyn std::error::Error>> {
             let response = stream.finish()?;
             if !response.is_empty() {
                 send_command(&mut agent.stdin, clipboard_command(&response))?;
+                if text.is_some() {
+                    // The answer can quote piped private source text verbatim.
+                    // Keep the useful request marker but never retain a
+                    // source-derived response in local history.
+                    record_sensitive_history(memory::HistoryKind::Ask, &instruction, None);
+                } else {
+                    record_user_history(memory::HistoryKind::Ask, &instruction, &response, None);
+                }
             }
             send_command(
                 &mut agent.stdin,
@@ -5594,7 +7460,7 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
     let ocr_text = captured.ocr_text.unwrap_or_default();
 
     let cloud_vision_allowed = config.privacy_mode != PrivacyMode::LocalOnly
-        && env::var_os("OPENAI_API_KEY").is_some()
+        && provider_api_key("OPENAI_API_KEY").is_ok()
         && captured.png_base64.is_some();
     if cloud_vision_allowed {
         let model = mice_providers::model_descriptor(&config.cloud_model)
@@ -5607,7 +7473,7 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
                 text: format!("Looking at {source} with {model}…"),
             },
         )?;
-        let api_key = env::var("OPENAI_API_KEY")?;
+        let api_key = provider_api_key("OPENAI_API_KEY")?;
         let data_url = format!(
             "data:image/png;base64,{}",
             captured.png_base64.unwrap_or_default()
@@ -5640,6 +7506,11 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("OpenAI vision returned no text answer.")?;
         println!("{answer}");
         send_command(&mut agent.stdin, clipboard_command(&answer))?;
+        record_sensitive_history(
+            memory::HistoryKind::See,
+            &question,
+            captured.app_name.clone(),
+        );
         send_command(
             &mut agent.stdin,
             AgentCommand::OverlayFinishResult { text: Some(answer) },
@@ -5678,6 +7549,13 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
     let instruction = format!(
         "Answer the question using only the OCR text extracted from the user's own screen. Be concrete and concise; if the answer is not in the text, say so plainly.\n\nQuestion: {question}"
     );
+    let instruction = apply_preferences(
+        &instruction,
+        user_history()
+            .ok()
+            .and_then(|history| history.preferences_preamble().ok().flatten())
+            .as_deref(),
+    );
     let mut stream = OverlayStream::echoing(&mut agent.stdin);
     stream_ollama(
         &config.local_model,
@@ -5696,6 +7574,11 @@ fn see() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     if !answer.is_empty() {
         send_command(&mut agent.stdin, clipboard_command(&answer))?;
+        record_sensitive_history(
+            memory::HistoryKind::See,
+            &question,
+            captured.app_name.clone(),
+        );
     }
     send_command(
         &mut agent.stdin,
@@ -5923,6 +7806,87 @@ struct OverlayStream<'a> {
     echo_to_terminal: bool,
 }
 
+/// Palette output has the same backpressure characteristics as overlay
+/// streaming, but it is also bounded: a bad or unusually verbose provider
+/// response cannot grow the daemon or native text view indefinitely.
+struct PaletteStream<'a> {
+    writer: &'a mut ChildStdin,
+    session_id: &'a str,
+    response: String,
+    pending: String,
+    response_chars: usize,
+    last_flush: Instant,
+    truncated: bool,
+}
+
+impl<'a> PaletteStream<'a> {
+    const FLUSH_BYTES: usize = 512;
+    const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+    const MAX_RESULT_CHARS: usize = 12_000;
+    const TRUNCATION_NOTICE: &'static str = "\n\n[Result truncated at 12,000 characters.]";
+
+    fn response_budget() -> usize {
+        Self::MAX_RESULT_CHARS - Self::TRUNCATION_NOTICE.chars().count()
+    }
+
+    fn new(writer: &'a mut ChildStdin, session_id: &'a str) -> Self {
+        Self {
+            writer,
+            session_id,
+            response: String::new(),
+            pending: String::new(),
+            response_chars: 0,
+            last_flush: Instant::now(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let remaining = Self::response_budget().saturating_sub(self.response_chars);
+        if remaining == 0 {
+            self.truncated = true;
+            return Ok(());
+        }
+        let bounded = chunk.chars().take(remaining).collect::<String>();
+        let bounded_chars = bounded.chars().count();
+        if bounded_chars < chunk.chars().count() {
+            self.truncated = true;
+        }
+        self.response_chars += bounded_chars;
+        self.response.push_str(&bounded);
+        self.pending.push_str(&bounded);
+        if self.pending.len() >= Self::FLUSH_BYTES
+            || self.last_flush.elapsed() >= Self::FLUSH_INTERVAL
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.pending.is_empty() {
+            send_command(
+                self.writer,
+                AgentCommand::PaletteAppendResult {
+                    session_id: self.session_id.into(),
+                    chunk: std::mem::take(&mut self.pending),
+                },
+            )?;
+        }
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String, Box<dyn std::error::Error>> {
+        if self.truncated {
+            self.response.push_str(Self::TRUNCATION_NOTICE);
+            self.pending.push_str(Self::TRUNCATION_NOTICE);
+        }
+        self.flush()?;
+        Ok(self.response)
+    }
+}
+
 impl<'a> OverlayStream<'a> {
     const FLUSH_BYTES: usize = 512;
     const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
@@ -5993,8 +7957,7 @@ fn stream_openai(
     text: Option<&str>,
     mut on_chunk: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let api_key =
-        env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is required for cloud requests")?;
+    let api_key = provider_api_key("OPENAI_API_KEY")?;
     let payload = mice_providers::openai_responses_payload(model, instruction, text).to_string();
     let response = post_provider_request(
         "OpenAI Responses API",
@@ -6021,8 +7984,7 @@ fn stream_openai(
 }
 
 fn generate_openai_image(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY is required for image generation")?;
+    let api_key = provider_api_key("OPENAI_API_KEY")?;
     let payload = mice_providers::openai_image_generation_payload(prompt).to_string();
     let response = post_provider_json(
         "OpenAI Images API",
@@ -6062,8 +8024,7 @@ fn stream_groq(
     text: Option<&str>,
     mut on_chunk: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let api_key =
-        env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY is required for Groq requests")?;
+    let api_key = provider_api_key("GROQ_API_KEY")?;
 
     let payload = serde_json::json!({
         "model": model,
@@ -6119,6 +8080,83 @@ mod hover_tests {
         ));
         assert!(!is_short_phrase("line one\nline two"));
         assert!(!is_short_phrase("   "));
+    }
+
+    #[test]
+    fn terminal_shell_field_has_a_concrete_hover_explanation_path() {
+        assert!(is_terminal_command_field(
+            Some("Terminal"),
+            "shell text field",
+            Some("AXTextField")
+        ));
+        assert!(is_terminal_command_field(
+            Some("iTerm2"),
+            "Input field",
+            Some("AXTextField")
+        ));
+        assert!(!is_terminal_command_field(
+            Some("Notes"),
+            "Input field",
+            Some("AXTextField")
+        ));
+    }
+
+    #[test]
+    fn palette_preserves_questions_but_recognizes_concrete_task_statements() {
+        assert!(matches!(
+            parse_palette_intent("plan Open Notes and make a checklist"),
+            PaletteIntent::Plan(_)
+        ));
+        assert!(matches!(
+            parse_palette_intent("help me understand lifetimes"),
+            PaletteIntent::Ask(_)
+        ));
+        assert!(matches!(
+            parse_palette_intent("I want you to go to Canva"),
+            PaletteIntent::Ask(_)
+        ));
+        assert!(looks_like_goal_statement("go to Canva and start a design"));
+        assert!(looks_like_goal_statement(
+            "create a checklist for my project"
+        ));
+        assert!(!looks_like_goal_statement("OpenAI pricing"));
+        assert!(!looks_like_goal_statement(
+            "help me understand Rust lifetimes"
+        ));
+    }
+
+    #[test]
+    fn local_goal_plans_accept_normal_fenced_json_and_have_a_safe_recovery() {
+        let fenced = r#"```json
+{"steps":[
+ {"instruction":"Open Canva in your browser.","app_hint":"Canva","sensitive":false},
+ {"instruction":"Choose a design type that fits your idea.","app_hint":"Canva","sensitive":false},
+ {"instruction":"Create the design and review it before sharing.","app_hint":"Canva","sensitive":false}
+]}
+```"#;
+        let plan = parse_goal_plan(fenced).unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].app_hint, "Canva");
+
+        let recovery = local_goal_plan_recovery("go to Canva and start a design");
+        assert_eq!(recovery.steps.len(), 3);
+        assert_eq!(recovery.steps[0].app_hint, "Canva in your browser");
+        assert!(validate_goal_plan(&recovery).is_ok());
+    }
+
+    #[test]
+    fn json_extraction_never_slices_backward_on_model_prose() {
+        let malformed = "A stray } appears before the plan: {\"steps\":[]}";
+        assert_eq!(extract_json_object(malformed), "{\"steps\":[]}");
+        assert_eq!(extract_json_object("no JSON here"), "no JSON here");
+    }
+
+    #[test]
+    fn palette_truncation_reserves_the_complete_notice() {
+        assert_eq!(
+            PaletteStream::response_budget() + PaletteStream::TRUNCATION_NOTICE.chars().count(),
+            PaletteStream::MAX_RESULT_CHARS
+        );
     }
 
     #[test]
