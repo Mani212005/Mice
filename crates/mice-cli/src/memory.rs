@@ -3,6 +3,8 @@
 //! Events are authoritative and append-only. Facts/digests are derived on
 //! demand, keeping the store inspectable and recoverable without a database.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
@@ -69,6 +71,150 @@ pub struct SavingsReport {
 #[derive(Debug, Clone)]
 pub struct SharedMemory {
     root: PathBuf,
+}
+
+/// Local-only personal history. This intentionally has a separate root from
+/// execution-manager memory: it contains no captures, clipboard bodies, or
+/// tool transcripts—only questions and short answer digests chosen by MICE.
+#[derive(Debug, Clone)]
+pub struct UserHistory {
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryKind {
+    Ask,
+    See,
+    Summarize,
+    Palette,
+    /// A goal the person explicitly asked MICE to plan, along with the
+    /// bounded, local plan digest. Unlike captures and selections, a typed
+    /// goal is intentional personal memory and can be reviewed later.
+    GoalPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEvent {
+    pub ts: u64,
+    pub kind: HistoryKind,
+    pub question: String,
+    pub answer_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_context: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct UserPreferences {
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+impl UserHistory {
+    pub fn at(root: PathBuf) -> Result<Self, std::io::Error> {
+        fs::create_dir_all(&root)?;
+        restrict_directory_to_user(&root)?;
+        Ok(Self { root })
+    }
+
+    pub fn default_path() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/MICE/history"))
+    }
+
+    pub fn record(&self, mut event: HistoryEvent) -> Result<(), std::io::Error> {
+        event.question = bounded_chars(&event.question, 2_000);
+        event.answer_digest = bounded_chars(&event.answer_digest, 500);
+        event.app_context = event
+            .app_context
+            .map(|context| bounded_chars(&context, 120))
+            .filter(|context| !context.trim().is_empty());
+        let _lock = self.lock()?;
+        let mut events: Vec<HistoryEvent> = read_jsonl(&self.root.join("history.jsonl"))?;
+        events.push(event);
+        if events.len() > 500 {
+            events.drain(..events.len() - 500);
+        }
+        let body = events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(std::io::Error::other)?
+            .join("\n");
+        atomic_write(
+            &self.root.join("history.jsonl"),
+            format!("{body}\n").as_bytes(),
+        )
+    }
+
+    pub fn search(&self, query: Option<&str>) -> Result<Vec<HistoryEvent>, std::io::Error> {
+        let query = query.unwrap_or_default().trim().to_ascii_lowercase();
+        let mut events: Vec<HistoryEvent> = read_jsonl(&self.root.join("history.jsonl"))?;
+        events.retain(|event| {
+            query.is_empty()
+                || format!(
+                    "{} {} {}",
+                    event.question,
+                    event.answer_digest,
+                    event.app_context.as_deref().unwrap_or_default()
+                )
+                .to_ascii_lowercase()
+                .contains(&query)
+        });
+        events.sort_by_key(|event| std::cmp::Reverse(event.ts));
+        Ok(events)
+    }
+
+    pub fn remember(&self, note: &str) -> Result<(), std::io::Error> {
+        let note = bounded_chars(note.trim(), 200);
+        if note.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Preference note is empty.",
+            ));
+        }
+        let _lock = self.lock()?;
+        let path = self.root.join("preferences.json");
+        let mut preferences: UserPreferences = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        preferences.notes.push(note);
+        if preferences.notes.len() > 10 {
+            preferences.notes.drain(..preferences.notes.len() - 10);
+        }
+        atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&preferences).map_err(std::io::Error::other)?,
+        )
+    }
+
+    pub fn preferences_preamble(&self) -> Result<Option<String>, std::io::Error> {
+        let path = self.root.join("preferences.json");
+        let preferences: UserPreferences = match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok((!preferences.notes.is_empty())
+            .then(|| format!("The user prefers: {}.", preferences.notes.join("; "))))
+    }
+
+    pub fn clear(&self) -> Result<(), std::io::Error> {
+        let _lock = self.lock()?;
+        for file in ["history.jsonl", "preferences.json"] {
+            match fs::remove_file(self.root.join(file)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<MemoryLock, std::io::Error> {
+        lock_at(&self.root, "MICE history")
+    }
 }
 
 impl SharedMemory {
@@ -341,33 +487,37 @@ impl Drop for MemoryLock {
 
 impl SharedMemory {
     fn lock(&self) -> Result<MemoryLock, std::io::Error> {
-        let path = self.root.join(".write.lock");
-        for _ in 0..2_000 {
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(_) => return Ok(MemoryLock(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // A lock is held only across a small append/rebuild. If a
-                    // process crashed, reclaim a clearly stale lock instead
-                    // of permanently wedging every future writer.
-                    let stale = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > Duration::from_secs(120));
-                    if stale {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    thread::sleep(Duration::from_millis(5))
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Timed out waiting for MICE shared-memory writer lock.",
-        ))
+        lock_at(&self.root, "MICE shared-memory")
     }
+}
+
+fn lock_at(root: &Path, name: &str) -> Result<MemoryLock, std::io::Error> {
+    let path = root.join(".write.lock");
+    for _ in 0..2_000 {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(_) => return Ok(MemoryLock(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A lock is held only across a small append/rebuild. If a
+                // process crashed, reclaim a clearly stale lock instead
+                // of permanently wedging every future writer.
+                let stale = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(120));
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("Timed out waiting for {name} writer lock."),
+    ))
 }
 
 pub fn now() -> u64 {
@@ -415,12 +565,86 @@ fn validate_storage_key(key: &str) -> Result<(), std::io::Error> {
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     let temporary = path.with_extension(format!("{}.tmp", now()));
     fs::write(&temporary, contents)?;
+    restrict_to_user(&temporary)?;
     fs::rename(temporary, path)
+}
+
+fn restrict_to_user(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn restrict_directory_to_user(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn bounded_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_history_bounds_searches_and_clears_local_data() {
+        let root = std::env::temp_dir().join(format!("mice-history-test-{}", now()));
+        let history = UserHistory::at(root.clone()).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for index in 0..502 {
+            history
+                .record(HistoryEvent {
+                    ts: index,
+                    kind: HistoryKind::Ask,
+                    question: format!("question {index}"),
+                    answer_digest: "x".repeat(600),
+                    app_context: None,
+                })
+                .unwrap();
+        }
+        let events = history.search(Some("question")).unwrap();
+        assert_eq!(events.len(), 500);
+        assert_eq!(events[0].question, "question 501");
+        assert_eq!(events[0].answer_digest.chars().count(), 500);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(root.join("history.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for index in 0..12 {
+            history.remember(&format!("note {index}")).unwrap();
+        }
+        let preamble = history.preferences_preamble().unwrap().unwrap();
+        assert!(!preamble.contains("note 0"));
+        assert!(preamble.contains("note 11"));
+        history.clear().unwrap();
+        assert!(history.search(None).unwrap().is_empty());
+        assert!(history.preferences_preamble().unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn shared_events_build_facts_and_flag_overlaps() {

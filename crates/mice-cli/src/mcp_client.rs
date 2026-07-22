@@ -99,7 +99,10 @@ impl McpServerProcess {
             .stdout
             .take()
             .ok_or("MCP server stdout was not available")?;
-        let (sender, lines) = mpsc::channel();
+        // Bound queued valid messages as well as individual line length. A
+        // granted but faulty server cannot accumulate unlimited output while
+        // MICE is waiting on another request.
+        let (sender, lines) = mpsc::sync_channel(16);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -262,12 +265,15 @@ impl McpServerProcess {
         });
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(format!(
-                "MCP server `{}` write failed: {}",
-                sanitize_external_text(&self.name),
-                sanitize_external_text(&error)
-            )
-            .into()),
+            Ok(Err(error)) => {
+                let message = format!(
+                    "MCP server `{}` write failed: {}",
+                    sanitize_external_text(&self.name),
+                    sanitize_external_text(&error)
+                );
+                self.terminate();
+                Err(message.into())
+            }
             Err(_) => {
                 self.terminate();
                 Err(format!(
