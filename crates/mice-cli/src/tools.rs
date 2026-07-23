@@ -163,6 +163,15 @@ impl BrowserSnapshot {
         self.targets.is_empty()
     }
 
+    pub fn is_captcha(&self) -> bool {
+        self.targets.values().any(|target| {
+            let label = target.context.to_ascii_lowercase();
+            label.contains("recaptcha")
+                || label.contains("hcaptcha widget")
+                || label.contains("cloudflare security challenge")
+        })
+    }
+
     /// Human-readable target context shown before the user confirms an AXI
     /// action. A UID by itself is never meaningful approval information.
     pub fn approval_summary(&self, call: &ToolCall) -> String {

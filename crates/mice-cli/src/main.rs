@@ -1887,6 +1887,12 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
 fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let runner = SystemRunner;
+    
+    // Default to auto-connect for autopilot to reduce CAPTCHA triggers
+    if std::env::var_os("CHROME_DEVTOOLS_AXI_AUTO_CONNECT").is_none() {
+        unsafe { std::env::set_var("CHROME_DEVTOOLS_AXI_AUTO_CONNECT", "1") };
+    }
+
     if !runner.available("npx") {
         return Err("AXI autopilot requires Node's `npx`. Install Node, then retry.".into());
     }
@@ -1924,6 +1930,12 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(observed) => observed,
                 Err(error) => return pause_axi(goal, &history, &error),
             };
+            
+            if observed.snapshot.is_captcha() {
+                println!("MICE has handed this step back to you. A CAPTCHA or security challenge was detected.");
+                return Ok(());
+            }
+
             let observation = observed.text.clone();
             let lane = if primary_lane == ExecutionLane::Local
                 && local_uncertainties >= AXI_LOCAL_UNCERTAINTY_LIMIT
@@ -3999,6 +4011,7 @@ fn doctor() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Browser setup: npx -y chrome-devtools-axi; optionally install chrome-devtools-mcp globally to avoid cold starts."
     );
+    println!("  Autopilot mode defaults to CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1 to attach to a running Chrome profile and reduce CAPTCHA triggers.");
     Ok(())
 }
 
