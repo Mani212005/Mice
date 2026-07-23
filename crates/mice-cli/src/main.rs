@@ -815,6 +815,7 @@ struct NativeBridgeState {
     autopilot: Option<AutopilotRun>,
     control_client: Option<Arc<Mutex<UnixStream>>>,
     overlay_writer: Option<Arc<Mutex<ChildStdin>>>,
+    goal_sessions: Option<Arc<Mutex<HashMap<String, GoalSession>>>>,
     overlay_shown: bool,
     /// The browser bridge is also the bounded local handoff path for Mission
     /// Control lifecycle notices. Repeating the same state transition should
@@ -996,6 +997,39 @@ fn autopilot_narrate(bridge: &NativeBridge, text: impl Into<String>, done: bool)
     autopilot_status(bridge, text, done);
 }
 
+/// Requests proxied through the resident-daemon bridge (from a Home-only
+/// helper process) must respect the same resumable Goal Guide state as the
+/// in-process gestures, or the plan-review surface silently vanishes behind
+/// a blank palette the moment Home is a separate process from the daemon.
+fn resume_or_show_palette(bridge: &NativeBridge, session_id: String, prefill: Option<String>) {
+    let (writer, sessions) = bridge
+        .lock()
+        .ok()
+        .map(|state| (state.overlay_writer.clone(), state.goal_sessions.clone()))
+        .unwrap_or((None, None));
+    let resumed = match (&writer, &sessions) {
+        (Some(writer), Some(sessions)) => match (writer.lock(), sessions.lock()) {
+            (Ok(mut writer), Ok(sessions)) => {
+                resume_reviewed_goal(&mut writer, &sessions).unwrap_or(false)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !resumed
+        && let Some(writer) = &writer
+        && let Ok(mut writer) = writer.lock()
+    {
+        let _ = send_command(
+            &mut writer,
+            AgentCommand::PaletteShow {
+                session_id,
+                prefill,
+            },
+        );
+    }
+}
+
 fn handle_native_bridge(
     mut stream: UnixStream,
     config: &mice_core::Config,
@@ -1016,18 +1050,7 @@ fn handle_native_bridge(
                     .as_str()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("session-{}", memory::now()));
-                if let Ok(state) = bridge.lock()
-                    && let Some(writer) = &state.overlay_writer
-                    && let Ok(mut writer) = writer.lock()
-                {
-                    let _ = send_command(
-                        &mut writer,
-                        AgentCommand::PaletteShow {
-                            session_id,
-                            prefill,
-                        },
-                    );
-                }
+                resume_or_show_palette(&bridge, session_id, prefill);
                 write_frame(&mut stream, &serde_json::json!({"type":"palette.showing"}))?;
             }
             Some("goal.show") => {
@@ -1035,18 +1058,7 @@ fn handle_native_bridge(
                     .as_str()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("session-{}", memory::now()));
-                if let Ok(state) = bridge.lock()
-                    && let Some(writer) = &state.overlay_writer
-                    && let Ok(mut writer) = writer.lock()
-                {
-                    let _ = send_command(
-                        &mut writer,
-                        AgentCommand::PaletteShow {
-                            session_id,
-                            prefill: Some("plan ".into()),
-                        },
-                    );
-                }
+                resume_or_show_palette(&bridge, session_id, Some("plan ".into()));
                 write_frame(&mut stream, &serde_json::json!({"type":"goal.showing"}))?;
             }
             Some("home.show") => {
@@ -4437,6 +4449,12 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         let _ = agent.child.wait();
         return Err(error);
     }
+    let goal_sessions = Arc::new(Mutex::new(HashMap::<String, GoalSession>::new()));
+    let goal_plans = Arc::new(Mutex::new(HashMap::<String, GoalPlanResult>::new()));
+    let active_guides = Arc::new(Mutex::new(HashMap::<String, ActiveGuide>::new()));
+    if let Ok(mut state) = browser_goal_directive.lock() {
+        state.goal_sessions = Some(Arc::clone(&goal_sessions));
+    }
     // Best-effort warm path: daemon startup never waits for Ollama and never
     // fails in cloud-only mode, but local requests avoid a cold model load.
     if config.privacy_mode != PrivacyMode::CloudOnly {
@@ -4491,9 +4509,6 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    let goal_sessions = Arc::new(Mutex::new(HashMap::<String, GoalSession>::new()));
-    let goal_plans = Arc::new(Mutex::new(HashMap::<String, GoalPlanResult>::new()));
-    let active_guides = Arc::new(Mutex::new(HashMap::<String, ActiveGuide>::new()));
     let mut selection_cache: Option<SelectionCache> = None;
     // At most one speculative deeper explanation runs at once. This keeps a
     // local model responsive if someone makes several selections in a row.
@@ -4517,6 +4532,28 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 AgentCommand::PaletteShow {
                     session_id: session_id.into(),
                     prefill: Some("plan ".into()),
+                },
+            )?;
+        } else if msg.method == "palette.request" {
+            // The everyday Ask MICE gesture is another entry point into the
+            // same resumable Goal Guide state as "goal.request". A blank
+            // local palette must never silently stand in for an active plan
+            // that is still planning or awaiting review.
+            if resume_reviewed_goal(
+                &mut agent_writer.lock().unwrap(),
+                &goal_sessions.lock().unwrap(),
+            )? {
+                continue;
+            }
+            let session_id = msg.params["sessionId"]
+                .as_str()
+                .ok_or("MICE received a palette request without a session ID")?;
+            let prefill = msg.params["prefill"].as_str().map(|s| s.to_string());
+            send_command(
+                &mut agent_writer.lock().unwrap(),
+                AgentCommand::PaletteShow {
+                    session_id: session_id.into(),
+                    prefill,
                 },
             )?;
         } else if msg.method == "prompt.submitted" {
@@ -6388,6 +6425,7 @@ fn handle_palette_ask(
     let selected = route(&request)?.model;
     let mut stream = PaletteStream::new(writer, session_id);
     if selected.locality == mice_providers::Locality::Local {
+        let _ = ensure_ollama_server();
         mice_providers::ollama_model_ready("http://127.0.0.1:11434", selected.id)?;
         stream_ollama(selected.id, &instruction, None, |chunk| stream.push(chunk))?;
     } else if is_groq_model(selected.id) {
@@ -6430,7 +6468,14 @@ fn looks_like_goal_statement(value: &str) -> bool {
     ]
     .iter()
     .any(|needle| value.contains(needle));
-    starts_with_creation || (starts_with_destination && has_follow_on_action)
+    // "Plan"/"planning" is the single most explicit signal a person can give
+    // short of typing the literal `plan` verb, and is otherwise checked
+    // nowhere in this classifier. Word-bounded (not `.contains`) so it
+    // doesn't fire on unrelated words like "explanation".
+    let mentions_plan = value
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == "plan" || word == "planning" || word == "plans");
+    starts_with_creation || mentions_plan || (starts_with_destination && has_follow_on_action)
 }
 
 fn goal_review_actions() -> Vec<mice_ipc::OverlayAction> {
@@ -7218,7 +7263,13 @@ fn agent_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     // A packaged install (MICE.app/Contents/MacOS) ships the agent beside the
     // CLI binary, so upgrades replace both together and never mix versions.
+    // `current_exe()` returns the path as invoked, not resolved through
+    // symlinks (macOS `_NSGetExecutablePath` semantics) — `mice install`'s
+    // own launcher at `~/.local/bin/mice` is exactly such a symlink, so this
+    // must canonicalize first or every install-launched run silently misses
+    // its bundled sibling and falls through to the dev-workspace fallback.
     if let Ok(executable) = env::current_exe()
+        && let Ok(executable) = std::fs::canonicalize(&executable)
         && let Some(sibling) = executable
             .parent()
             .map(|directory| directory.join("mice-mac-agent"))
@@ -8525,6 +8576,20 @@ mod hover_tests {
         assert!(!looks_like_goal_statement("OpenAI pricing"));
         assert!(!looks_like_goal_statement(
             "help me understand Rust lifetimes"
+        ));
+        // Natural phrasing that mentions "plan" without a leading command
+        // verb must still route into the reviewed Goal Guide, not a
+        // one-shot Ask whose answer cannot be resumed after Escape.
+        assert!(looks_like_goal_statement(
+            "I want to design a wedding invitation in Canva. Help me plan that for my brother's wedding."
+        ));
+        assert!(looks_like_goal_statement(
+            "can you help me plan a trip to Japan"
+        ));
+        assert!(looks_like_goal_statement("I need a plan for onboarding"));
+        // "explanation" contains "plan" as a substring but not as a word.
+        assert!(!looks_like_goal_statement(
+            "give me an explanation of lifetimes"
         ));
     }
 

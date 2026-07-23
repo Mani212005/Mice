@@ -865,6 +865,21 @@ struct MiceMacAgent {
         writeFrame(data)
     }
 
+    /// The everyday Ask MICE gesture must not open a blank local palette out
+    /// from under an active Goal Guide plan. Core owns that state, so ask it
+    /// first; core replies with either the resumed plan or a fresh palette.
+    static func requestPalette(prefill: String? = nil) {
+        var params: [String: Any] = ["sessionId": UUID().uuidString]
+        if let prefill { params["prefill"] = prefill }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": "palette.request",
+            "params": params,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        writeFrame(data)
+    }
+
     /// Home is a display-only helper when a resident daemon already owns the
     /// core/agent IPC loop. Forward its explicit Open Palette button through
     /// the user's configured global gesture, which the resident agent already
@@ -2115,7 +2130,7 @@ private final class OverlayController: NSObject {
 
     static func showPaletteActive(prefill: String? = nil) {
         guard daemonMode else { return }
-        active?.showPalette(sessionID: nil, prefill: prefill)
+        MiceMacAgent.requestPalette(prefill: prefill)
     }
 
     private func showHome(_ text: String) {
