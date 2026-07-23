@@ -501,6 +501,8 @@ pub struct AutopilotConfig {
     pub careful_mode: bool,
     #[serde(default = "default_autopilot_first_run")]
     pub first_run: bool,
+    #[serde(default = "default_autopilot_checkpoint_batch_size")]
+    pub checkpoint_batch_size: usize,
 }
 
 fn default_autopilot_persona() -> String {
@@ -512,6 +514,9 @@ fn default_autopilot_careful_mode() -> bool {
 fn default_autopilot_first_run() -> bool {
     true
 }
+fn default_autopilot_checkpoint_batch_size() -> usize {
+    3
+}
 
 impl Default for AutopilotConfig {
     fn default() -> Self {
@@ -519,6 +524,7 @@ impl Default for AutopilotConfig {
             persona: default_autopilot_persona(),
             careful_mode: default_autopilot_careful_mode(),
             first_run: default_autopilot_first_run(),
+            checkpoint_batch_size: default_autopilot_checkpoint_batch_size(),
         }
     }
 }

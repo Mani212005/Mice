@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en" data-theme="luxury">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MICE at 4B — Record, Replay, Repair</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :where(.grid, .flex) > * { min-width: 0; }
+  :where(p, h1, h2, h3, h4, li, dd, blockquote, figcaption, td, th, .badge, .label) { overflow-wrap: anywhere; }
+  :where(img, svg, video, canvas, iframe) { max-width: 100%; height: auto; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .cite { font-size: 0.75rem; opacity: 0.65; }
+  .pillar-card { border: 1px solid var(--color-base-300, #3b3b3b); }
+</style>
+</head>
+<body>
+
+<main class="mx-auto max-w-6xl p-6 lg:p-10 space-y-14">
+
+  <!-- HERO -->
+  <section class="hero bg-base-200 rounded-box">
+    <div class="hero-content flex-col text-center py-14 px-6">
+      <div class="badge badge-soft badge-primary mb-3">Architecture proposal — no code changed yet</div>
+      <h1 class="text-4xl lg:text-5xl font-bold tracking-tight">MICE at 4 billion parameters</h1>
+      <p class="max-w-2xl mt-4 text-base-content/80 text-lg">
+        Gemma3:4b is not the bottleneck. Asking it to make an independent, correct decision on
+        <strong>every single step of every single run</strong> is. The fix is architectural, not a bigger model —
+        and most of the pieces already exist in this repo.
+      </p>
+      <div class="stats stats-vertical sm:stats-horizontal shadow mt-8 bg-base-100">
+        <div class="stat">
+          <div class="stat-title">Hard constraint</div>
+          <div class="stat-value text-primary text-3xl">≤ 4–5B</div>
+          <div class="stat-desc">local, private, $0 marginal cost</div>
+        </div>
+        <div class="stat">
+          <div class="stat-title">Target task</div>
+          <div class="stat-value text-3xl">1,000 rows</div>
+          <div class="stat-desc">"restaurants in Delhi" → Google Sheet</div>
+        </div>
+        <div class="stat">
+          <div class="stat-title">Core reframe</div>
+          <div class="stat-value text-3xl">Record → Replay → Repair</div>
+          <div class="stat-desc">the model drives rarely, not always</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CURRENT STATE -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">Where this actually stands today</h2>
+    <p class="text-base-content/70 mb-6 max-w-3xl">
+      All three symptoms you named trace to specific, findable code — not to vague "the model is dumb."
+      Verified against the working tree, not assumed.
+    </p>
+
+    <div class="grid md:grid-cols-3 gap-4">
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-error badge-soft mb-2">Bottleneck 1</span>
+          <h3 class="card-title text-base">A confirmation on every click</h3>
+          <p class="text-sm text-base-content/80">
+            <span class="mono text-xs bg-base-200 px-1 rounded">autopilot_axi()</span> prints
+            <span class="mono text-xs bg-base-200 px-1 rounded">"Do this one action? [y/N]"</span>
+            before <em>every</em> action, capped at 6 actions per run — regardless of whether the action
+            is a harmless scroll or a real click. It doesn't consult the
+            <span class="mono text-xs bg-base-200 px-1 rounded">ToolKind::ReadOnly</span> /
+            <span class="mono text-xs bg-base-200 px-1 rounded">Mutating</span> split that already exists one
+            file over.
+          </p>
+          <p class="cite mt-2">crates/mice-cli/src/main.rs — autopilot_axi(); crates/mice-cli/src/tools.rs — ToolKind</p>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-error badge-soft mb-2">Bottleneck 2</span>
+          <h3 class="card-title text-base">Hallucinated clicks, lost state</h3>
+          <p class="text-sm text-base-content/80">
+            Not an impression — measured. Your own research doc benchmarks gemma3:4b at
+            <strong>19.6</strong> on the Berkeley Function-Calling Leaderboard's agentic/multi-turn score,
+            against Claude Haiku's <strong>68.7</strong>. Recent commits (<span class="mono text-xs bg-base-200 px-1 rounded">86ca1f0</span>
+            "clarify fill action JSON instruction", <span class="mono text-xs bg-base-200 px-1 rounded">127e269</span>
+            "remove pedantic DOM context checks to fix looping") are prompt-level patches on a
+            structural mismatch: a 4B model is being asked to freehand-decide a fresh action on every
+            single turn, which is exactly the job class it scores worst on.
+          </p>
+          <p class="cite mt-2">plan/mice_research_industry_landscape.md — BFCL table</p>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-warning badge-soft mb-2">Bottleneck 3</span>
+          <h3 class="card-title text-base">CAPTCHAs / anti-bot walls</h3>
+          <p class="text-sm text-base-content/80">
+            Not addressed in code yet. But the two building blocks it needs —
+            <span class="mono text-xs bg-base-200 px-1 rounded">AgentAction::Handoff</span> and an
+            "attach to my real Chrome profile" mode — already exist for other reasons. This is mostly
+            wiring, covered under Pillar D below.
+          </p>
+          <p class="cite mt-2">crates/mice-core/src/lib.rs — AgentAction; plan/mice_planv7_slm_tool_manager.md — CHROME_DEVTOOLS_AXI_AUTO_CONNECT</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="alert alert-info alert-soft mt-6">
+      <span class="text-sm">
+        <strong>What's already good and shouldn't be rebuilt:</strong> chrome-devtools-axi's snapshots are
+        already close to the accessibility-tree observation format the research below converges on
+        (uid-based, not raw DOM), and already surface a clean deterministic failure signal
+        (<span class="mono">STALE_REF</span>, via generation-prefixed uids like <span class="mono">g3:</span>).
+        There's also already a local→cloud escalation cascade
+        (<span class="mono">ExecutionLane::Local → CheapCloud → Frontier</span>,
+        <span class="mono">AXI_LOCAL_UNCERTAINTY_LIMIT = 2</span> uncertain turns before falling back).
+        None of that gets thrown away — the proposal below builds directly on it.
+      </span>
+    </div>
+  </section>
+
+  <!-- CORE INSIGHT -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">The core reframe: Record → Replay → Repair</h2>
+    <p class="text-base-content/70 mb-6 max-w-3xl">
+      This is the single highest-leverage idea in the research, and it predates LLMs entirely. IBM's
+      <strong>CoScripter</strong> (2007) and its spreadsheet successor <strong>Vegemite</strong> recorded a browser
+      demonstration <em>once</em> and replayed it across many rows of input — structurally identical to
+      "find 1,000 restaurants." Modern commercial RPA (UiPath's "Healing Agent") does the same thing with
+      an LLM added at exactly one point: <em>only when a selector breaks</em>, to repair it — never to drive
+      routine steps. Applied to MICE, gemma3:4b stops being the thing that decides step 2 through step
+      1,000. It becomes the thing that decides step 1, and the thing that gets called back in for the rare
+      step where something changed.
+    </p>
+
+    <div class="mermaid">
+flowchart TD
+    G["Goal: '1,000 restaurants in Delhi&lt;br/&gt;→ Google Sheet'"] --> P
+
+    subgraph PLAN["Plan pass — one local call, higher effort"]
+        P["gemma3:4b: break goal into a&lt;br/&gt;step-shaped plan (existing GoalSession&lt;br/&gt;Planning phase, already built)"]
+    end
+
+    P --> L{"Recipe library:&lt;br/&gt;seen 'search Google + extract&lt;br/&gt;listing' before?"}
+
+    L -- "hit" --> R["Replay recorded recipe&lt;br/&gt;deterministically — zero LLM calls"]
+    L -- "miss (first row)" --> D["gemma3:4b decides ONE step&lt;br/&gt;(ReAct + grammar-constrained JSON)"]
+
+    D --> T{"ToolKind:&lt;br/&gt;ReadOnly or Mutating?"}
+    T -- ReadOnly --> X
+    T -- Mutating --> C{"Checkpoint batch:&lt;br/&gt;confirm every N steps,&lt;br/&gt;not every step"}
+    C -- approved --> X["Execute via chrome-devtools-axi"]
+
+    R --> V["Pre-flight verify:&lt;br/&gt;does this uid still exist&lt;br/&gt;in the current snapshot?"]
+    X --> V
+
+    V -- "yes" --> OK["Action succeeds"]
+    V -- "STALE_REF / no" --> RP["Repair: one gemma3:4b call&lt;br/&gt;re-grounds just this step"]
+    RP --> V
+
+    OK --> S{"New recipe step?"}
+    S -- yes --> SAVE["Save to local recipe library&lt;br/&gt;(embedding-keyed, on-disk)"]
+    S -- no --> N
+    SAVE --> N["Next row"]
+    N -- "more rows" --> L
+    N -- "done" --> DONE["Sheet complete"]
+    </div>
+
+    <p class="text-sm text-base-content/70 mt-4">
+      The model is in the loop for the plan, the first row, and any repair. For rows 2 through 1,000 it
+      is, by design, mostly out of the loop — which directly targets the failure mode you're hitting: a
+      4B model doesn't get a chance to hallucinate or lose track of state on a page it isn't being asked
+      to freshly reason about.
+    </p>
+  </section>
+
+  <!-- FOUR PILLARS -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">Four supporting pillars</h2>
+    <p class="text-base-content/70 mb-6 max-w-3xl">Each maps to a specific, findable line in this repo — none of these require a bigger model.</p>
+
+    <div class="grid lg:grid-cols-2 gap-5">
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-primary badge-soft mb-2">Pillar A</span>
+          <h3 class="card-title">Tiered, batched confirmation</h3>
+          <p class="text-sm">
+            Fixes the "[y/N] on every click" complaint directly. Wire the existing
+            <span class="mono text-xs bg-base-200 px-1 rounded">ToolKind</span> split into the axi confirm
+            gate: read-only/navigation auto-runs and logs; mutating actions batch into a checkpoint
+            ("about to do these 4 things — proceed?") instead of confirming per-action. Do
+            <strong>not</strong> gate on the model's own self-reported confidence — the research is explicit
+            that models learn to report high confidence below their actual competence
+            ("Behavioral Credibility Trilemma"). Gate on the action's <em>reversibility</em>, a property
+            of the tool, not the model's opinion of itself. Risk-tiered autonomy of this shape measured a
+            66.9% incident reduction vs. unrestricted autonomy in the AURA framework — and your own
+            plan v5 already specified almost exactly this UX ("consent once per goal… Esc stops
+            instantly… per-action confirmation survives as an opt-in careful mode") before the axi engine
+            hardened it back into confirm-everything. This pillar is largely <em>finishing what plan v5
+            already decided</em>, not inventing new UX.
+          </p>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-primary badge-soft mb-2">Pillar B</span>
+          <h3 class="card-title">Make hallucinated actions structurally impossible</h3>
+          <p class="text-sm">
+            Two changes, both cheap. First: grammar-constrained decoding (GBNF, native to llama.cpp /
+            usable through Ollama) forces the sampler to only emit tokens on a valid path through the
+            <span class="mono text-xs bg-base-200 px-1 rounded">ToolDecision</span> JSON schema — the model
+            <em>cannot</em> emit a malformed action, which is a harder guarantee than the current prompt-text
+            instruction ("clarify fill action JSON instruction for small models") can ever give. Second: a
+            free, deterministic pre-flight check — does this uid still exist in the current snapshot —
+            before firing the action, not after. This is the same idea as
+            <span class="mono text-xs bg-base-200 px-1 rounded">STALE_REF</span>, just proactive instead of
+            reactive, and it's the direct fix for the "tolerate dynamic UID shifts" and "looping" bugs
+            already in your commit history.
+          </p>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-primary badge-soft mb-2">Pillar C</span>
+          <h3 class="card-title">A local recipe library that compounds</h3>
+          <p class="text-sm">
+            Voyager (Minecraft agents, 2023) keeps a vector-indexed skill library so an agent retrieves
+            and adapts a previously-proven action program instead of re-deriving it cold every time.
+            Applied here: every time MICE figures out "how to search Google," "how to open a Sheet and
+            append a row," it's saved locally, keyed by an embedding of (site + goal shape). The next
+            time any goal needs that step, gemma3:4b's job shrinks from "invent this" to "does this
+            recipe still apply" — a classification-shaped task, which is close to what small models are
+            actually good at. This is also the feature that makes MICE feel like it's <em>learning</em> the
+            more you use it, with zero fine-tuning and zero data leaving the laptop.
+          </p>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 pillar-card">
+        <div class="card-body">
+          <span class="badge badge-primary badge-soft mb-2">Pillar D</span>
+          <h3 class="card-title">CAPTCHA posture: reduce, then hand off</h3>
+          <p class="text-sm">
+            No evasion — the honest finding from the research is that the only reliable answer to an
+            actual challenge is a clean human handoff at that exact moment, which
+            <span class="mono text-xs bg-base-200 px-1 rounded">AgentAction::Handoff</span> already models.
+            What's worth adding: default autopilot to the existing
+            <span class="mono text-xs bg-base-200 px-1 rounded">CHROME_DEVTOOLS_AXI_AUTO_CONNECT</span>
+            attach-to-real-Chrome mode (a logged-in, cookie-bearing, non-headless profile is the biggest
+            single anti-bot-trigger reducer) and detect CAPTCHA-shaped pages specifically to trigger
+            handoff rather than burning retries against them.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- WORKED EXAMPLE -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">Worked example: 1,000 restaurants in Delhi</h2>
+    <p class="text-base-content/70 mb-6 max-w-3xl">Walking your own example through the pipeline above, and what it costs in local model calls.</p>
+
+    <ul class="steps steps-vertical lg:steps-horizontal w-full mb-8">
+      <li class="step step-primary">Plan once</li>
+      <li class="step step-primary">Teach on row 1</li>
+      <li class="step step-primary">Replay rows 2–1,000</li>
+      <li class="step step-primary">Repair on breaks only</li>
+      <li class="step">Sheet complete</li>
+    </ul>
+
+    <div class="overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+      <table class="table">
+        <thead>
+          <tr><th>Stage</th><th>What happens</th><th>Local LLM calls</th><th>Confirmations shown</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="font-medium">Plan</td>
+            <td>gemma3:4b breaks the goal into: open Sheets → create sheet → search Google per restaurant → extract name/phone/PIN → append row → repeat</td>
+            <td class="mono">1</td>
+            <td>1 (review the plan)</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Teach (row 1)</td>
+            <td>Model drives row 1 for real — search, open result, extract fields, append. Every successful step is saved as a recipe.</td>
+            <td class="mono">~6–10</td>
+            <td>1 checkpoint ("do this pattern 999 more times?")</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Replay (rows 2–1,000)</td>
+            <td>Deterministic recipe replay through chrome-devtools-axi. Pre-flight uid check on every step; no freehand model decision unless something breaks.</td>
+            <td class="mono">0, unless a break</td>
+            <td>0 — batched into periodic progress checkpoints</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Repair (as needed)</td>
+            <td>A restaurant's listing looks different, or Google changes layout mid-run → one bounded gemma3:4b call re-grounds just that row, recipe optionally updated.</td>
+            <td class="mono">~1 per break (estimate: low tens, not 1,000)</td>
+            <td>0, unless the repair itself is ambiguous</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cite mt-2">Call counts are estimates for illustration, not a benchmark result — the real number depends on how often Google/site layout actually varies row to row.</p>
+  </section>
+
+  <!-- COMPARISON -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">Current vs. proposed</h2>
+    <div class="overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+      <table class="table">
+        <thead>
+          <tr><th></th><th>Today (autopilot_axi, M14)</th><th>Proposed (R³ on top of M14)</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="font-medium">Confirmation</td>
+            <td>[y/N] before every action, capped at 6/run</td>
+            <td>Auto-run read-only, checkpoint-confirm mutating batches</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Model's job per step</td>
+            <td>Freehand-decide every step, every time</td>
+            <td>Decide once, replay many, repair rarely</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Invalid actions</td>
+            <td>Reduced by prompt wording (probabilistic)</td>
+            <td>Structurally blocked by grammar + pre-flight check</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Repeat tasks</td>
+            <td>No memory — re-reasons from scratch every run</td>
+            <td>Recipe library — gets faster/more reliable with use</td>
+          </tr>
+          <tr>
+            <td class="font-medium">CAPTCHA</td>
+            <td>Not handled</td>
+            <td>Reduced via real-profile attach; clean handoff on hit</td>
+          </tr>
+          <tr>
+            <td class="font-medium">Privacy / cost</td>
+            <td>100% local, $0</td>
+            <td>Unchanged — 100% local, $0</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- BUILD SEQUENCE -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">Suggested build order</h2>
+    <p class="text-base-content/70 mb-6 max-w-3xl">
+      Numbered to continue the existing plan-doc series (M13 tool registry and M14 axi engine are already
+      built). Ordered by relief-per-line-of-code — A is the smallest change with the most immediate effect
+      on your stated complaint.
+    </p>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card bg-base-100 pillar-card"><div class="card-body">
+        <span class="badge badge-outline mb-2">M17a</span>
+        <h4 class="font-semibold">Wire ToolKind into the confirm gate</h4>
+        <p class="text-sm text-base-content/70">Smallest change, biggest immediate relief — the two pieces already exist, they're just not connected. Add checkpoint batching.</p>
+      </div></div>
+      <div class="card bg-base-100 pillar-card"><div class="card-body">
+        <span class="badge badge-outline mb-2">M17b</span>
+        <h4 class="font-semibold">Grammar-constrained decisions + pre-flight verify</h4>
+        <p class="text-sm text-base-content/70">Replace the prompt-text JSON instruction with a real GBNF grammar; add the uid-exists check before execution, not after.</p>
+      </div></div>
+      <div class="card bg-base-100 pillar-card"><div class="card-body">
+        <span class="badge badge-outline mb-2">M17c</span>
+        <h4 class="font-semibold">Recipe / skill library</h4>
+        <p class="text-sm text-base-content/70">On-disk, embedding-keyed store of successful step sequences; record on every success, retrieve-and-adapt before asking the model to plan cold.</p>
+      </div></div>
+      <div class="card bg-base-100 pillar-card"><div class="card-body">
+        <span class="badge badge-outline mb-2">M17d</span>
+        <h4 class="font-semibold">CAPTCHA-aware handoff</h4>
+        <p class="text-sm text-base-content/70">Default to attach-to-real-Chrome for autopilot; detect challenge pages and hand off cleanly instead of retrying.</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- RISKS -->
+  <section>
+    <h2 class="text-2xl font-bold mb-2">Risks and open questions</h2>
+    <div class="space-y-3">
+      <div class="collapse collapse-arrow bg-base-100 pillar-card">
+        <input type="checkbox" />
+        <div class="collapse-title font-medium">Recipes go stale when a site redesigns</div>
+        <div class="collapse-content text-sm text-base-content/80">
+          <p>Expected, not a flaw — this is exactly what the STALE_REF-triggered repair path is for. A stale recipe fails loudly and gets one bounded repair call, not a silent wrong action. Worth deciding: does a repaired step overwrite the old recipe automatically, or queue for a quick human glance first?</p>
+        </div>
+      </div>
+      <div class="collapse collapse-arrow bg-base-100 pillar-card">
+        <input type="checkbox" />
+        <div class="collapse-title font-medium">This doesn't make gemma3:4b smarter at novel sites</div>
+        <div class="collapse-content text-sm text-base-content/80">
+          <p>Honest framing: the win here is architectural — fewer chances for the model to be wrong, not a higher ceiling on how well it reasons about a page it's never seen. First-time-on-a-new-site tasks still hit the model's real limits. This is why the plan pass and teach-on-row-1 still matter, and why escalation to the existing CheapCloud/Frontier lane on repeated uncertainty stays in place as the safety valve.</p>
+        </div>
+      </div>
+      <div class="collapse collapse-arrow bg-base-100 pillar-card">
+        <input type="checkbox" />
+        <div class="collapse-title font-medium">Recipe retrieval needs local embeddings</div>
+        <div class="collapse-content text-sm text-base-content/80">
+          <p>Still small and feasible (embedding models in the tens-of-millions-of-parameters range run fine alongside gemma3:4b), but it's a new local dependency worth sizing before M17c starts, not assumed for free.</p>
+        </div>
+      </div>
+      <div class="collapse collapse-arrow bg-base-100 pillar-card">
+        <input type="checkbox" />
+        <div class="collapse-title font-medium">Ollama grammar support needs local verification</div>
+        <div class="collapse-content text-sm text-base-content/80">
+          <p>GBNF is native to llama.cpp; Ollama's own API surface for constrained JSON output should be re-checked against the currently installed Ollama version before M17b is scoped as "just wire it up."</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- REFERENCES -->
+  <section>
+    <h2 class="text-xl font-bold mb-3">References</h2>
+    <div class="text-xs text-base-content/60 leading-relaxed space-x-1">
+      <a class="link" href="https://arxiv.org/pdf/2307.13854" target="_blank">WebArena</a> ·
+      <a class="link" href="https://arxiv.org/html/2511.21398" target="_blank">Prune4Web</a> ·
+      <a class="link" href="https://arxiv.org/html/2510.03204" target="_blank">FocusAgent</a> ·
+      <a class="link" href="https://arxiv.org/html/2605.07134" target="_blank">Region4Web</a> ·
+      <a class="link" href="https://arxiv.org/html/2508.04412v1" target="_blank">Beyond Pixels: DOM Downsampling</a> ·
+      <a class="link" href="https://arxiv.org/html/2507.00210v1" target="_blank">LineRetriever</a> ·
+      <a class="link" href="https://github.com/microsoft/SoM" target="_blank">Set-of-Mark</a> ·
+      <a class="link" href="https://osu-nlp-group.github.io/SeeAct/" target="_blank">SeeAct</a> ·
+      <a class="link" href="https://arxiv.org/pdf/2401.01614" target="_blank">GPT-4V is a Generalist Web Agent, if Grounded</a> ·
+      <a class="link" href="https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md" target="_blank">llama.cpp grammars</a> ·
+      <a class="link" href="https://arxiv.org/abs/2305.16291" target="_blank">Voyager</a> ·
+      <a class="link" href="https://arxiv.org/pdf/2504.06188" target="_blank">SkillFlow</a> ·
+      <a class="link" href="https://en.wikipedia.org/wiki/CoScripter" target="_blank">CoScripter</a> ·
+      <a class="link" href="https://dl.acm.org/doi/10.1145/1502650.1502667" target="_blank">Vegemite</a> ·
+      <a class="link" href="https://dl.acm.org/doi/pdf/10.1145/1622176.1622213" target="_blank">Sikuli</a> ·
+      <a class="link" href="https://www.uipath.com/blog/product-and-updates/technical-tuesday-how-healing-agent-solves-ui-automation-challenges" target="_blank">UiPath Healing Agent</a> ·
+      <a class="link" href="https://dl.acm.org/doi/10.1145/3637528.3671620" target="_blank">AutoWebGLM</a> ·
+      <a class="link" href="https://arxiv.org/pdf/2312.08914" target="_blank">CogAgent</a> ·
+      <a class="link" href="https://arxiv.org/abs/2509.26539" target="_blank">Ferret-UI Lite</a> ·
+      <a class="link" href="https://www.langchain.com/blog/planning-agents" target="_blank">Plan-and-Execute Agents</a> ·
+      <a class="link" href="https://arxiv.org/pdf/2511.02424" target="_blank">ReAcTree</a> ·
+      <a class="link" href="https://arxiv.org/pdf/2510.15739" target="_blank">AURA Risk Framework</a> ·
+      <a class="link" href="https://arxiv.org/html/2605.25739" target="_blank">Behavioral Credibility Trilemma</a> ·
+      <a class="link" href="https://www.digitalapplied.com/blog/human-in-the-loop-escalation-design-ai-agents-2026" target="_blank">Human-in-the-Loop Escalation Design</a> ·
+      <a class="link" href="https://scrapingant.com/blog/human-like-browsing-patterns" target="_blank">Human-like browsing patterns</a>
+    </div>
+  </section>
+
+</main>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
+  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  const paint = document.createElement("canvas").getContext("2d");
+  function toRgba(color) {
+    paint.clearRect(0, 0, 1, 1);
+    paint.fillStyle = "#000";
+    paint.fillStyle = color;
+    paint.fillRect(0, 0, 1, 1);
+    return paint.getImageData(0, 0, 1, 1).data;
+  }
+  function compositeRgba(foreground, background) {
+    const foregroundAlpha = foreground[3] / 255;
+    const backgroundAlpha = background[3] / 255;
+    const alpha = foregroundAlpha + backgroundAlpha * (1 - foregroundAlpha);
+    if (alpha === 0) return [0, 0, 0, 0];
+    return [
+      (foreground[0] * foregroundAlpha + background[0] * backgroundAlpha * (1 - foregroundAlpha)) / alpha,
+      (foreground[1] * foregroundAlpha + background[1] * backgroundAlpha * (1 - foregroundAlpha)) / alpha,
+      (foreground[2] * foregroundAlpha + background[2] * backgroundAlpha * (1 - foregroundAlpha)) / alpha,
+      alpha * 255,
+    ];
+  }
+  function pageIsDark() {
+    const root = document.documentElement;
+    const rootBackground = toRgba(getComputedStyle(root).backgroundColor);
+    const bodyBackground = document.body ? toRgba(getComputedStyle(document.body).backgroundColor) : [0, 0, 0, 0];
+    const [r, g, b, a] = compositeRgba(bodyBackground, rootBackground);
+    if (a > 0) return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5;
+    const colorScheme = getComputedStyle(root).colorScheme;
+    if (colorScheme.includes("dark") && !colorScheme.includes("light")) return true;
+    if (colorScheme.includes("light") && !colorScheme.includes("dark")) return false;
+    return darkQuery.matches;
+  }
+  const diagrams = [...document.querySelectorAll(".mermaid")].map((el) => ({ el, src: el.textContent }));
+  let applied;
+  let rendering = false;
+  let queued = false;
+  function queueRender() {
+    queued = true;
+    if (rendering) return;
+    void render();
+  }
+  async function render() {
+    rendering = true;
+    try {
+      while (queued) {
+        queued = false;
+        const theme = pageIsDark() ? "dark" : "default";
+        if (theme === applied) continue;
+        mermaid.initialize({ startOnLoad: false, theme, securityLevel: "strict" });
+        for (const { el, src } of diagrams) {
+          el.removeAttribute("data-processed");
+          el.textContent = src;
+        }
+        try {
+          await mermaid.run({ nodes: diagrams.map((d) => d.el) });
+        } catch (error) {
+          console.error("Mermaid diagram render failed:", error);
+          return;
+        }
+        applied = theme;
+      }
+    } finally {
+      rendering = false;
+      if (queued) queueRender();
+    }
+  }
+  if (document.readyState === "complete") queueRender();
+  else window.addEventListener("load", queueRender, { once: true });
+  const themeObserver = new MutationObserver(queueRender);
+  for (const el of [document.documentElement, document.body]) {
+    if (!el) continue;
+    themeObserver.observe(el, { attributes: true, attributeFilter: ["data-theme", "class", "style"] });
+  }
+  document.addEventListener("change", queueRender, true);
+  document.addEventListener("transitionend", ({ propertyName }) => { if (propertyName === "background-color") queueRender(); }, true);
+  darkQuery.addEventListener("change", queueRender);
+</script>
+</body>
+</html>

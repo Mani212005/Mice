@@ -1898,7 +1898,7 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let primary_lane = axi_model_lane(&config, local_tool_model_available(&config, &runner))?;
     println!("MICE AXI guide: {goal}");
     println!(
-        "Every browser action will be shown and requires your confirmation. MICE never fills credentials or payment data, and never clicks sign-in, payment, transfer, or final-submission controls."
+        "Read-only actions run automatically. Mutating actions will ask for confirmation in batches. MICE never fills credentials or payment data, and never clicks sign-in, payment, transfer, or final-submission controls."
     );
     if matches!(
         primary_lane,
@@ -1914,6 +1914,7 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut history = Vec::new();
     let mut local_uncertainties = 0_u8;
     let mut completed_actions = 0_usize;
+    let mut mutating_budget = 0_usize;
     while completed_actions < 6 {
         // A stale retry belongs to this proposed action, not to the whole
         // guide. A replan does not use up a successfully-dispatched action.
@@ -1981,18 +1982,34 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             };
 
+            let tool_kind = tools::specs().iter().find(|s| s.name == call.name).map(|s| s.kind).unwrap_or(tools::ToolKind::Mutating);
+
             println!(
                 "Proposed action {}/6: {}",
                 completed_actions + 1,
                 observed.snapshot.approval_summary(&call)
             );
-            print!("Do this one action? [y/N] ");
-            std::io::stdout().flush()?;
-            let mut consent = String::new();
-            std::io::stdin().read_line(&mut consent)?;
-            if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                println!("MICE did not act. You can continue manually or run a narrower goal.");
-                return Ok(());
+
+            if tool_kind == tools::ToolKind::Mutating {
+                if mutating_budget == 0 {
+                    let batch_size = config.autopilot.checkpoint_batch_size;
+                    if batch_size <= 1 {
+                        print!("Do this one action? [y/N] ");
+                    } else {
+                        print!("Allow this and up to {} more mutating actions automatically? [y/N] ", batch_size.saturating_sub(1));
+                    }
+                    std::io::stdout().flush()?;
+                    let mut consent = String::new();
+                    std::io::stdin().read_line(&mut consent)?;
+                    if !matches!(consent.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        println!("MICE did not act. You can continue manually or run a narrower goal.");
+                        return Ok(());
+                    }
+                    mutating_budget = batch_size;
+                }
+                mutating_budget = mutating_budget.saturating_sub(1);
+            } else {
+                println!("(Auto-approving read-only action)");
             }
 
             // Re-observe after confirmation so a stale model reference can
