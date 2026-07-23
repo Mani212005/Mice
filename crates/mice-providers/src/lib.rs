@@ -405,18 +405,23 @@ pub fn ollama_chat_payload(
     instruction: &str,
     text: Option<&str>,
     num_ctx: usize,
+    format: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let content = match text {
         Some(text) => format!("{instruction}\n\nContent:\n{text}"),
         None => instruction.into(),
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": model,
         "stream": true,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "messages": [{"role": "user", "content": content}],
         "options": {"num_ctx": num_ctx},
-    })
+    });
+    if let Some(format) = format {
+        payload.as_object_mut().unwrap().insert("format".into(), format);
+    }
+    payload
 }
 
 /// Minimal non-streaming request for daemon startup. Failure is deliberately
@@ -461,11 +466,12 @@ pub fn stream_ollama_chat(
     instruction: &str,
     text: Option<&str>,
     num_ctx: usize,
+    format: Option<serde_json::Value>,
     mut on_chunk: impl FnMut(&str) -> Result<(), OllamaError>,
 ) -> Result<(), OllamaError> {
     let response = ollama_agent()
         .post(endpoint)
-        .send_json(ollama_chat_payload(model, instruction, text, num_ctx))
+        .send_json(ollama_chat_payload(model, instruction, text, num_ctx, format))
         .map_err(ollama_request_error)?;
     for line in BufReader::new(response.into_reader()).lines() {
         let line = line?;
@@ -981,6 +987,7 @@ mod tests {
             "Summarize",
             Some("input"),
             16_384,
+            None,
             |chunk| {
                 output.push_str(chunk);
                 Ok(())
@@ -1002,7 +1009,7 @@ mod tests {
 
     #[test]
     fn ollama_payloads_keep_the_daemon_model_warm() {
-        let chat = ollama_chat_payload("gemma3:4b", "Summarize", Some("text"), 4096);
+        let chat = ollama_chat_payload("gemma3:4b", "Summarize", Some("text"), 4096, None);
         assert_eq!(chat["keep_alive"], OLLAMA_KEEP_ALIVE);
         let warmup = ollama_warmup_payload("gemma3:4b");
         assert_eq!(warmup["model"], "gemma3:4b");
@@ -1056,6 +1063,7 @@ mod tests {
             "Summarize",
             Some("input"),
             16_384,
+            None,
             |_| Ok(()),
         )
         .unwrap_err();

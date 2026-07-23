@@ -181,7 +181,10 @@ impl BrowserSnapshot {
         // If the bridge finds the node, it is mathematically guaranteed to be the same element.
         // Checking if the attributes (like aria-expanded) changed is overly pedantic and
         // causes infinite loops on dynamic pages.
-        true
+        let Some(uid) = call.args.get("uid").and_then(Value::as_str) else {
+            return true; // No UID to check, action is inherently resilient or page-level
+        };
+        other.target(uid).is_some()
     }
 }
 

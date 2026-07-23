@@ -2294,12 +2294,29 @@ fn call_axi_agent_turn(
     let output = if lane == ExecutionLane::Local {
         let mut output = String::new();
         let instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing.";
-        stream_ollama(
+        
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "say_to_user": { "type": "string" },
+                "action": { "type": "string", "enum": ["click", "fill", "open_url", "scroll", "done", "handoff", "ask_user"] },
+                "candidate_id": { "type": ["string", "null"] },
+                "url": { "type": ["string", "null"] },
+                "value": { "type": ["string", "null"] },
+                "done_summary": { "type": ["string", "null"] },
+                "question": { "type": ["string", "null"] }
+            },
+            "required": ["say_to_user", "action"],
+            "additionalProperties": false
+        });
+
+        stream_ollama_with_format(
             &config.tool_model,
             instruction,
             Some(&format!(
                 "Goal: {goal}\n\nCurrent AXI snapshot:\n{observation}\n\nPrior actions:\n{history}"
             )),
+            Some(schema),
             |chunk| {
                 output.push_str(chunk);
                 Ok(())
@@ -8238,6 +8255,16 @@ fn stream_ollama(
     model: &str,
     instruction: &str,
     text: Option<&str>,
+    on_chunk: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stream_ollama_with_format(model, instruction, text, None, on_chunk)
+}
+
+fn stream_ollama_with_format(
+    model: &str,
+    instruction: &str,
+    text: Option<&str>,
+    format: Option<serde_json::Value>,
     mut on_chunk: impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let num_ctx = mice_providers::model_descriptor(model)
@@ -8249,6 +8276,7 @@ fn stream_ollama(
         instruction,
         text,
         num_ctx,
+        format,
         |chunk| on_chunk(chunk).map_err(|error| OllamaError::Consumer(error.to_string())),
     )?;
     Ok(())
