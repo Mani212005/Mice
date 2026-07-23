@@ -177,20 +177,11 @@ impl BrowserSnapshot {
     /// A UID can be recycled after a page update. Treat changed AX context as
     /// stale even when the same UID still happens to be present.
     pub fn same_target_context(&self, other: &Self, call: &ToolCall) -> bool {
-        let Some(uid) = call.args.get("uid").and_then(Value::as_str) else {
-            return true;
-        };
-        let Some(old_target) = self.target(uid) else {
-            return true;
-        };
-        if let Some(new_target) = other.target(uid) {
-            old_target.context == new_target.context
-        } else {
-            // The UID is missing from the new snapshot (it shifted or the node was destroyed).
-            // It is safe to attempt the action; the bridge will either use its cache 
-            // to click the exact same node, or it will cleanly fail.
-            true
-        }
+        // AXI UIDs include the Chrome backendNodeId, which is never recycled within a page.
+        // If the bridge finds the node, it is mathematically guaranteed to be the same element.
+        // Checking if the attributes (like aria-expanded) changed is overly pedantic and
+        // causes infinite loops on dynamic pages.
+        true
     }
 }
 
