@@ -651,7 +651,7 @@ pub fn agent_loop_payload_with_image_and_persona(
 ) -> serde_json::Value {
     let mut content = vec![serde_json::json!({
         "type":"input_text",
-        "text":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Goal: {goal}\n\nCurrent page observation:\n{observation}\n\nRecent action history:\n{history}\n\nChoose exactly one next action. Use supplied candidate_id values exactly; never invent selectors. Narrate in plain language. Prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")
+        "text":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Goal: {goal}\n\nCurrent page observation:\n{observation}\n\nRecent action history:\n{history}\n\nChoose exactly one next action. Use supplied candidate_id values exactly; never invent selectors. Narrate in plain language. For the 'fill' action, you MUST put the text to type into the 'value' field. Prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")
     })];
     if let Some(image_data_url) = image_data_url {
         content.push(serde_json::json!({"type":"input_image", "image_url":image_data_url}));
@@ -726,7 +726,7 @@ pub fn ollama_agent_loop_payload_with_persona(
     serde_json::json!({
         "model": model,
         "messages": [
-            {"role":"system", "content":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Return only one JSON object with exactly these fields: say_to_user (string), action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id (string or null), url (string or null), value (string or null), done_summary (string or null), question (string or null). Choose exactly one action. Copy candidate_id exactly from the supplied candidates; never invent selectors. Narrate plainly and prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")},
+            {"role":"system", "content":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Return only one JSON object with exactly these fields: say_to_user (string), action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id (string or null), url (string or null), value (string or null), done_summary (string or null), question (string or null). Choose exactly one action. For the 'fill' action, you MUST put the text to type into the 'value' field. Copy candidate_id exactly from the supplied candidates; never invent selectors. Narrate plainly and prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")},
             user_msg
         ],
         "format": "json",
@@ -747,7 +747,7 @@ pub fn groq_agent_loop_payload_with_persona(
     serde_json::json!({
         "model": model,
         "messages": [
-            {"role":"system", "content":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Return only one JSON object with exactly these fields: say_to_user (string), action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id (string or null), url (string or null), value (string or null), done_summary (string or null), question (string or null). Choose exactly one action. Copy candidate_id exactly from the supplied candidates; never invent selectors. Narrate plainly and prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")},
+            {"role":"system", "content":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Return only one JSON object with exactly these fields: say_to_user (string), action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id (string or null), url (string or null), value (string or null), done_summary (string or null), question (string or null). Choose exactly one action. For the 'fill' action, you MUST put the text to type into the 'value' field. Copy candidate_id exactly from the supplied candidates; never invent selectors. Narrate plainly and prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")},
             {"role":"user", "content":format!("Goal: {goal}\n\nCurrent page observation:\n{observation}\n\nRecent action history:\n{history}")}
         ],
         "response_format": {"type":"json_object"},
