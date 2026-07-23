@@ -705,6 +705,38 @@ pub fn groq_agent_loop_payload(
     groq_agent_loop_payload_with_persona(model, goal, observation, history, "patient")
 }
 
+pub fn ollama_agent_loop_payload_with_persona(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    image_data_url: Option<&str>,
+    persona: &str,
+) -> serde_json::Value {
+    let mut user_msg = serde_json::json!({
+        "role": "user",
+        "content": format!("Goal: {goal}\n\nCurrent page observation:\n{observation}\n\nRecent action history:\n{history}")
+    });
+    if let Some(data_url) = image_data_url
+        && let Some(idx) = data_url.find("base64,")
+    {
+        let base64_str = &data_url[idx + 7..];
+        user_msg["images"] = serde_json::json!([base64_str]);
+    }
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role":"system", "content":format!("You are MICE, a careful browser helper. Your speaking style is {persona}. Return only one JSON object with exactly these fields: say_to_user (string), action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id (string or null), url (string or null), value (string or null), done_summary (string or null), question (string or null). Choose exactly one action. Copy candidate_id exactly from the supplied candidates; never invent selectors. Narrate plainly and prefer handoff rather than guessing. Never fill passwords, one-time codes, or payment fields; never click login, payment, purchase, transfer, final-submit, or file-return controls.")},
+            user_msg
+        ],
+        "format": "json",
+        "stream": false,
+        "options": {
+            "temperature": 0
+        }
+    })
+}
+
 pub fn groq_agent_loop_payload_with_persona(
     model: &str,
     goal: &str,

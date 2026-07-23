@@ -1321,11 +1321,10 @@ fn advance_autopilot(
     }
     // Escalate to a screenshot when the DOM is sparse OR the agent has stalled
     // on one page for two turns (common on canvas/app UIs like Canva where
-    // clickable tiles are divs the DOM snapshot cannot expose). Only worth doing
-    // when vision is actually reachable.
-    let vision_possible = provider_api_key("OPENAI_API_KEY").is_ok();
+    // clickable tiles are divs the DOM snapshot cannot expose).
+    let openai_vision_possible = provider_api_key("OPENAI_API_KEY").is_ok();
+    let use_local_vision = config.privacy_mode == PrivacyMode::LocalOnly || !openai_vision_possible;
     let needs_screenshot = screenshot.is_none()
-        && vision_possible
         && (candidates.len() <= 3 || stuck_turns >= 2)
         && bridge.lock().ok().is_some_and(|mut state| {
             state.autopilot.as_mut().is_some_and(|run| {
@@ -1354,19 +1353,32 @@ fn advance_autopilot(
         "interactive_elements": candidates,
     }))?;
     let usable_screenshot = screenshot.filter(|image| image.starts_with("data:image/"));
-    let vision_unavailable = usable_screenshot.is_some() && !vision_possible;
-    if vision_unavailable {
-        let notice = "I cannot use the visual view because OpenAI is not configured. I will continue from the page controls I can read.";
-        eprintln!("[MICE autopilot] {notice}");
-        native_overlay(bridge, notice);
-    }
-    let output = if usable_screenshot.is_some() && !vision_unavailable {
+
+    let output = if usable_screenshot.is_some() && use_local_vision {
+        call_ollama_agent_turn(
+            &config.local_model,
+            &goal,
+            &observation,
+            &history,
+            usable_screenshot,
+            &config.autopilot.persona,
+        )?
+    } else if usable_screenshot.is_some() && openai_vision_possible {
         call_openai_agent_turn(
             "gpt-5.6-sol",
             &goal,
             &observation,
             &history,
             usable_screenshot,
+            &config.autopilot.persona,
+        )?
+    } else if config.privacy_mode == PrivacyMode::LocalOnly {
+        call_ollama_agent_turn(
+            &config.local_model,
+            &goal,
+            &observation,
+            &history,
+            None,
             &config.autopilot.persona,
         )?
     } else if is_groq_model(&config.cloud_model) {
@@ -1401,7 +1413,7 @@ fn advance_autopilot(
     // button the DOM did not expose. Retry once (only when vision was not used
     // this turn); in_flight stays set so the screenshot re-entry continues.
     if screenshot.is_none()
-        && vision_possible
+        && (openai_vision_possible || use_local_vision)
         && decision.candidate_id.is_none()
         && matches!(decision.action, AgentAction::Handoff | AgentAction::AskUser)
     {
@@ -2833,6 +2845,33 @@ fn call_groq_mission_plan(model: &str, prompt: &str) -> Result<String, Box<dyn s
         .and_then(|choice| choice["message"]["content"].as_str())
         .map(str::to_owned)
         .ok_or_else(|| "Groq Mission Control planner returned no JSON graph".into())
+}
+
+fn call_ollama_agent_turn(
+    model: &str,
+    goal: &str,
+    observation: &str,
+    history: &str,
+    image_data_url: Option<&str>,
+    persona: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let payload = mice_providers::ollama_agent_loop_payload_with_persona(
+        model,
+        goal,
+        observation,
+        history,
+        image_data_url,
+        persona,
+    )
+    .to_string();
+    let response = ureq::post("http://127.0.0.1:11434/api/chat")
+        .set("Content-Type", "application/json")
+        .send_string(&payload)?;
+    let body: serde_json::Value = serde_json::from_reader(response.into_reader())?;
+    body["message"]["content"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Ollama autopilot response did not contain text content.".into())
 }
 
 fn call_openai_agent_turn(
