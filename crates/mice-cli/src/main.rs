@@ -1874,7 +1874,7 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
     }
     if engine != "axi" {
         return Err(
-            "The legacy extension autopilot is retired. Use `mice autopilot --engine axi <goal>`; it requires confirmation for every action."
+            "The legacy extension autopilot is retired. Use `mice autopilot --engine axi <goal>`; it auto-runs read-only steps and confirms mutating actions in batches."
                 .into(),
         );
     }
@@ -1919,14 +1919,22 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut history = Vec::new();
     let mut local_uncertainties = 0_u8;
-    let mut completed_actions = 0_usize;
+    // Fresh, model-decided (or repaired) actions are the expensive/risky
+    // path and stay capped. Deterministic recipe replay is a separate,
+    // much larger budget: it is pre-flight-verified per step and is the
+    // entire point of Pillar C (many rows replaying without burning the
+    // fresh-decision budget a single freehand run would need).
+    let mut fresh_actions = 0_usize;
+    let mut replay_actions = 0_usize;
     let mut mutating_budget = 0_usize;
-    
-    let mut goal_embedding: Option<Vec<f32>> = None;
-    let mut active_recipe_steps: Vec<tools::ToolCall> = Vec::new();
-    let mut current_sequence: Vec<tools::ToolCall> = Vec::new();
 
-    while completed_actions < 6 {
+    let mut goal_embedding: Option<Vec<f32>> = None;
+    let mut active_recipe_steps: Vec<RecipeStep> = Vec::new();
+    let mut current_sequence: Vec<RecipeStep> = Vec::new();
+
+    while fresh_actions < AXI_FRESH_DECISION_LIMIT
+        || (replay_actions < AXI_REPLAY_ACTION_LIMIT && !active_recipe_steps.is_empty())
+    {
         // A stale retry belongs to this proposed action, not to the whole
         // guide. A replan does not use up a successfully-dispatched action.
         let mut recovery = AxiActionRecovery::default();
@@ -1942,9 +1950,12 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if goal_embedding.is_none() {
-                let site = observed.text.lines().find(|l| l.starts_with("url: ")).map(|l| l.strip_prefix("url: ").unwrap().trim()).unwrap_or("");
-                let pattern = format!("{}|{}", site, goal);
-                let embed = mice_providers::ollama_embed(&format!("{OLLAMA_ENDPOINT}/api/embed"), "nomic-embed-text", &pattern).unwrap_or_default();
+                // Keyed on the goal text alone. The tab open at *start* of a
+                // run is often blank/leftover and has no reliable relation
+                // to the site the goal will end up on, so folding it into
+                // the match key (as an earlier version of this did) made
+                // retrieval and the save-time key below almost never agree.
+                let embed = mice_providers::ollama_embed(&format!("{OLLAMA_ENDPOINT}/api/embed"), "nomic-embed-text", goal).unwrap_or_default();
                 goal_embedding = Some(embed.clone());
                 
                 if !embed.is_empty() {
@@ -1966,9 +1977,46 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let call = if let Some(recipe_step) = active_recipe_steps.pop() {
-                println!("MICE: Replaying recipe step '{}'...", recipe_step.name);
-                recipe_step
+            let (call, is_replay) = if let Some(recipe_step) = active_recipe_steps.pop() {
+                // A recipe's uid only ever meant something in the session it
+                // was recorded in (see `same_target_context`'s note on
+                // backendNodeIds). Re-resolve it against the *current*
+                // snapshot by (role, accessible name) before proposing it,
+                // the same anchor-matching CoScripter/UiPath rely on,
+                // instead of trusting a stale cross-session uid string.
+                let resolved_call = match recipe_step.call.args.get("uid").and_then(Value::as_str)
+                {
+                    Some(_) => {
+                        let resolved_uid = match (
+                            recipe_step.target_role.as_deref(),
+                            recipe_step.target_context.as_deref(),
+                        ) {
+                            (Some(role), Some(context)) => {
+                                observed.snapshot.find_uid_by_identity(role, context)
+                            }
+                            _ => None,
+                        };
+                        resolved_uid.map(|uid| {
+                            let mut resolved = recipe_step.call.clone();
+                            if let Some(object) = resolved.args.as_object_mut() {
+                                object.insert("uid".into(), Value::String(uid));
+                            }
+                            resolved
+                        })
+                    }
+                    None => Some(recipe_step.call.clone()),
+                };
+                let Some(resolved_call) = resolved_call else {
+                    println!(
+                        "MICE: Recipe step '{}' no longer matches this page ({} queued recipe step(s) discarded). Falling back to guided decisions for the rest of this task.",
+                        recipe_step.call.name,
+                        active_recipe_steps.len()
+                    );
+                    active_recipe_steps.clear();
+                    continue;
+                };
+                println!("MICE: Replaying recipe step '{}'...", resolved_call.name);
+                (resolved_call, true)
             } else {
                 let observation = observed.text.clone();
                 let lane = if primary_lane == ExecutionLane::Local
@@ -2012,10 +2060,9 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                             if !current_sequence.is_empty() {
                                 if let Some(embed) = goal_embedding.clone() {
                                     if !embed.is_empty() {
-                                        let site = observed.text.lines().find(|l| l.starts_with("url: ")).map(|l| l.strip_prefix("url: ").unwrap().trim()).unwrap_or("");
                                         let new_recipe = AxiRecipe {
                                             recipe_id: format!("recipe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
-                                            goal_pattern: format!("{}|{}", site, goal),
+                                            goal_pattern: goal.to_string(),
                                             goal_embedding: embed,
                                             steps: current_sequence.clone(),
                                         };
@@ -2045,18 +2092,25 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     return Ok(());
                 };
-                call
+                (call, false)
             };
-            
-            current_sequence.push(call.clone());
 
             let tool_kind = tools::specs().iter().find(|s| s.name == call.name).map(|s| s.kind).unwrap_or(tools::ToolKind::Mutating);
 
-            println!(
-                "Proposed action {}/6: {}",
-                completed_actions + 1,
-                observed.snapshot.approval_summary(&call)
-            );
+            if is_replay {
+                println!(
+                    "Proposed replay action ({} queued after this): {}",
+                    active_recipe_steps.len(),
+                    observed.snapshot.approval_summary(&call)
+                );
+            } else {
+                println!(
+                    "Proposed action {}/{}: {}",
+                    fresh_actions + 1,
+                    AXI_FRESH_DECISION_LIMIT,
+                    observed.snapshot.approval_summary(&call)
+                );
+            }
 
             if tool_kind == tools::ToolKind::Mutating {
                 if mutating_budget == 0 {
@@ -2075,7 +2129,9 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     mutating_budget = batch_size;
                 }
-                mutating_budget = mutating_budget.saturating_sub(1);
+                // Budget is only spent once the action below actually
+                // succeeds (see the `continue` sites): a replan or a stale
+                // retry must not silently shrink an already-approved batch.
             } else {
                 println!("(Auto-approving read-only action)");
             }
@@ -2120,15 +2176,43 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 bounded_for_model(&result.text, 300)
             };
             history.push(format!("{} {} => {outcome}", call.name, call.args));
-            completed_actions += 1;
+
+            if tool_kind == tools::ToolKind::Mutating {
+                mutating_budget = mutating_budget.saturating_sub(1);
+            }
+            if is_replay {
+                replay_actions += 1;
+            } else {
+                fresh_actions += 1;
+            }
+            // Record the step that actually ran, anchored by the identity
+            // it resolved to just now, so a future recipe replay can
+            // re-resolve it against a different page instead of reusing
+            // this run's raw (session-scoped) uid.
+            let identity = call
+                .args
+                .get("uid")
+                .and_then(Value::as_str)
+                .and_then(|uid| current.snapshot.identity_of(uid));
+            current_sequence.push(RecipeStep {
+                call: call.clone(),
+                target_role: identity.as_ref().map(|(role, _)| role.clone()),
+                target_context: identity.as_ref().map(|(_, context)| context.clone()),
+            });
             break;
         }
     }
     Err(
-        "MICE AXI guide reached its six-action limit. Continue with a narrower follow-up goal."
+        "MICE AXI guide reached its fresh-decision limit with no matching recipe to replay. Continue with a narrower follow-up goal."
             .into(),
     )
 }
+
+const AXI_FRESH_DECISION_LIMIT: usize = 6;
+// Generous but bounded: a recorded recipe can have at most as many steps as
+// the fresh-decision run that taught it, so this ceiling only matters as a
+// safety valve against a corrupted or hand-edited recipe file.
+const AXI_REPLAY_ACTION_LIMIT: usize = 200;
 
 const AXI_LOCAL_UNCERTAINTY_LIMIT: u8 = 2;
 
@@ -8993,7 +9077,18 @@ pub struct AxiRecipe {
     pub recipe_id: String,
     pub goal_pattern: String,
     pub goal_embedding: Vec<f32>,
-    pub steps: Vec<tools::ToolCall>,
+    pub steps: Vec<RecipeStep>,
+}
+
+/// A recorded action plus the (role, accessible-name) identity its target
+/// resolved to when the step was taught. The uid inside `call` is only
+/// valid for the session it was recorded in; replay re-resolves a live uid
+/// from `target_role`/`target_context` instead of reusing it directly.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct RecipeStep {
+    pub call: tools::ToolCall,
+    pub target_role: Option<String>,
+    pub target_context: Option<String>,
 }
 
 pub fn recipes_dir() -> PathBuf {
@@ -9037,5 +9132,27 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         0.0
     } else {
         dot / (mag_a * mag_b)
+    }
+}
+
+#[cfg(test)]
+mod recipe_matching_tests {
+    use super::*;
+
+    #[test]
+    fn cosine_similarity_ranks_identical_over_orthogonal_over_opposite() {
+        let identical = cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]);
+        let orthogonal = cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]);
+        let opposite = cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]);
+        assert!((identical - 1.0).abs() < 1e-6);
+        assert!(orthogonal.abs() < 1e-6);
+        assert!((opposite + 1.0).abs() < 1e-6);
+        assert!(identical > orthogonal && orthogonal > opposite);
+    }
+
+    #[test]
+    fn cosine_similarity_treats_a_zero_vector_as_no_match_not_a_panic() {
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
     }
 }

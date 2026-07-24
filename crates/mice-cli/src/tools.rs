@@ -167,9 +167,34 @@ impl BrowserSnapshot {
         self.targets.values().any(|target| {
             let label = target.context.to_ascii_lowercase();
             label.contains("recaptcha")
-                || label.contains("hcaptcha widget")
+                || label.contains("hcaptcha")
                 || label.contains("cloudflare security challenge")
+                || label.contains("turnstile")
         })
+    }
+
+    /// Stable (role, label) fingerprint for a target, used to re-resolve a
+    /// recorded recipe step against a freshly loaded page. A uid alone is
+    /// only meaningful within the page/session it came from (see
+    /// `same_target_context`'s note on backendNodeIds); this is the anchor
+    /// a recipe carries across sessions instead. `context` is the raw
+    /// snapshot line and therefore still contains this session's own
+    /// `uid=...` marker (see the `multiline`/`escaped_newline` tests below
+    /// for why `context` itself must stay raw) — strip it here so the
+    /// fingerprint doesn't trivially fail to match across sessions.
+    pub fn identity_of(&self, uid: &str) -> Option<(String, String)> {
+        self.target(uid)
+            .map(|target| (target.role.clone(), label_without_uid(&target.context)))
+    }
+
+    /// Find the current uid for a target last seen with this (role, label)
+    /// fingerprint. Returns the first match; ambiguous duplicates are a
+    /// known limitation of anchor-based matching.
+    pub fn find_uid_by_identity(&self, role: &str, label: &str) -> Option<String> {
+        self.targets
+            .iter()
+            .find(|(_, target)| target.role == role && label_without_uid(&target.context) == label)
+            .map(|(uid, _)| uid.clone())
     }
 
     /// Human-readable target context shown before the user confirms an AXI
@@ -263,6 +288,18 @@ fn quoted_span_state(line: &str, mut in_quote: bool) -> bool {
         }
     }
     in_quote
+}
+
+/// Strip a trailing `uid=...` marker from a target's raw context line, for
+/// building a cross-session identity fingerprint only. Uses the *last*
+/// occurrence so a malicious label that itself contains literal `uid=`
+/// text (see `page_controlled_labels_cannot_forge_safe_inputs_or_targets`)
+/// stays part of the label rather than being mistaken for the real marker.
+fn label_without_uid(context: &str) -> String {
+    match context.rfind("uid=") {
+        Some(index) => context[..index].trim().to_string(),
+        None => context.trim().to_string(),
+    }
 }
 
 fn snapshot_attribute(line: &str, name: &str) -> Option<String> {
@@ -548,7 +585,7 @@ pub fn specs() -> &'static [ToolSpec] {
         ToolSpec {
             name: "browser.scroll",
             description: "Scroll the Chrome AXI session.",
-            kind: ToolKind::Mutating,
+            kind: ToolKind::ReadOnly,
             distill: DistillPolicy::Never,
             cache: CachePolicy::Never,
             program: "npx",
@@ -1668,5 +1705,67 @@ mod tests {
         assert!(names.contains(&"browser.snapshot"));
         assert!(!names.contains(&"browser.click"));
         assert!(!names.contains(&"browser.fill"));
+    }
+
+    #[test]
+    fn scroll_is_read_only_so_it_never_blocks_on_a_checkpoint_prompt() {
+        let scroll = specs().iter().find(|spec| spec.name == "browser.scroll").unwrap();
+        assert_eq!(scroll.kind, ToolKind::ReadOnly);
+        // The actions the axi decision loop can actually propose that do
+        // change page/account state must stay gated.
+        for mutating in ["browser.open", "browser.click", "browser.fill"] {
+            let spec = specs().iter().find(|spec| spec.name == mutating).unwrap();
+            assert_eq!(spec.kind, ToolKind::Mutating, "{mutating} should stay gated");
+        }
+    }
+
+    #[test]
+    fn captcha_detection_matches_common_challenge_iframe_titles() {
+        let benign = BrowserSnapshot::from_axi_output("button \"Sign in\" uid=g0:1");
+        assert!(!benign.is_captcha());
+
+        let recaptcha = BrowserSnapshot::from_axi_output("iframe \"reCAPTCHA\" uid=g0:1");
+        assert!(recaptcha.is_captcha());
+
+        // Real-world hCaptcha iframe title: the word order is "Widget ...
+        // hCaptcha", not "hCaptcha widget" — a prior version of this check
+        // looked for the reversed order and never matched it.
+        let hcaptcha = BrowserSnapshot::from_axi_output(
+            "iframe \"Widget containing checkbox for hCaptcha security challenge\" uid=g0:1",
+        );
+        assert!(hcaptcha.is_captcha());
+
+        let turnstile = BrowserSnapshot::from_axi_output(
+            "iframe \"Widget containing a Cloudflare security challenge\" uid=g0:1",
+        );
+        assert!(turnstile.is_captcha());
+    }
+
+    #[test]
+    fn recipe_replay_resolves_a_stale_uid_by_role_and_accessible_name() {
+        let taught = BrowserSnapshot::from_axi_output("button \"Search\" uid=g0:5");
+        let identity = taught.identity_of("g0:5").unwrap();
+        // The identity fingerprint must not embed this session's own uid
+        // (unlike `context`, which deliberately stays raw for display).
+        assert_eq!(identity, ("button".to_string(), "button \"Search\"".to_string()));
+        assert!(!identity.1.contains("g0:5"));
+
+        // A different session assigns a different uid to the same logical
+        // control. Replay must re-resolve by (role, accessible name), not
+        // by reusing the uid recorded in a prior session.
+        let replayed_page = BrowserSnapshot::from_axi_output("button \"Search\" uid=g2:91");
+        assert_eq!(
+            replayed_page.find_uid_by_identity(&identity.0, &identity.1),
+            Some("g2:91".to_string())
+        );
+        assert!(replayed_page.target("g0:5").is_none());
+
+        // No control with that identity on this page: replay must report a
+        // miss rather than silently matching something else.
+        let redesigned_page = BrowserSnapshot::from_axi_output("button \"Go\" uid=g3:1");
+        assert_eq!(
+            redesigned_page.find_uid_by_identity(&identity.0, &identity.1),
+            None
+        );
     }
 }
