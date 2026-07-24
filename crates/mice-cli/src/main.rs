@@ -92,6 +92,7 @@ fn main() {
         Some("doctor") => doctor(),
         Some("settings") => settings(),
         Some("keys") | Some("key") => keys(),
+        Some("knowledge") => knowledge(),
         Some("actions") => actions(),
         Some("tools") => list_tools(),
         Some("do") => do_goal(),
@@ -135,7 +136,7 @@ fn usage() -> Result<(), Box<dyn std::error::Error>> {
         "\nAsk and screen\n  mice ask [--action <preset>] <instruction>\n  mice see [--display|--sheet] <question>\n  mice history [query] | mice history --clear | mice plans\n  mice actions | route"
     );
     println!(
-        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
+        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
     );
     println!(
         "\nIntegrations\n  mice connect <codex|claude|all> [--yes]\n  mice disconnect <codex|claude|all> [--yes]\n  mice integrations\n  mice mcp-server | mice mcp <list|call>"
@@ -1875,8 +1876,31 @@ fn setup_browser() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Extracts a `--flag value` pair from anywhere in `arguments` (not just the
+/// front, unlike `--engine`'s existing parsing), removing both tokens so
+/// the remainder can still be joined into the goal text unaffected.
+fn extract_flag_value(arguments: &mut Vec<String>, flag: &str) -> Option<String> {
+    let position = arguments.iter().position(|argument| argument == flag)?;
+    if position + 1 >= arguments.len() {
+        return None;
+    }
+    arguments.remove(position);
+    Some(arguments.remove(position))
+}
+
 fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(2).collect::<Vec<_>>();
+    // Present only when a `mice autopilot-multi` orchestrator spawned this
+    // as one site's own subprocess (see JobProgressGuard) — absent for a
+    // normal standalone `mice autopilot <goal>` run, which has no job to
+    // track and behaves exactly as before.
+    let job_context = match (
+        extract_flag_value(&mut arguments, "--job-id"),
+        extract_flag_value(&mut arguments, "--site-index").and_then(|value| value.parse::<usize>().ok()),
+    ) {
+        (Some(job_id), Some(site_index)) => Some(JobContext { job_id, site_index }),
+        _ => None,
+    };
     let engine = if arguments
         .first()
         .is_some_and(|argument| argument == "--engine")
@@ -1903,15 +1927,21 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    autopilot_axi(&goal)
+    autopilot_axi(&goal, job_context)
 }
 
 /// Browser autopilot v2: the registry shells out to chrome-devtools-axi, so no
 /// Chrome extension/native-host chain is involved. The same bounded local tool
 /// loop supplies observe → act → verify turns through browser.snapshot/actions.
-fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let runner = SystemRunner;
+    // Constructed before anything else can early-return, so a crash on
+    // *any* later exit path still marks this site Crashed rather than
+    // leaving it looking InProgress forever to an orchestrator reading
+    // the job file (see JobProgressGuard's own Drop impl).
+    let mut job_progress_guard =
+        job_context.map(|context| JobProgressGuard::new(context.job_id, context.site_index));
     
     // Reduce CAPTCHA/anti-bot triggers via a persistent Chrome profile:
     // cookies/session state survive across runs, so MICE looks like a
@@ -1991,7 +2021,7 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    let mut history = Vec::new();
+    let mut history = CompactingHistory::new(AXI_HISTORY_WINDOW);
     let mut local_uncertainties = 0_u8;
     // Fresh, model-decided (or repaired) actions are the expensive/risky
     // path and stay capped. Deterministic recipe replay is a separate,
@@ -2006,6 +2036,17 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut active_recipe_steps: Vec<RecipeStep> = Vec::new();
     let mut current_sequence: Vec<RecipeStep> = Vec::new();
     let mut tried_goal_navigation_shortcut = false;
+    // Set when a recipe match is found, so a successful run overwrites that
+    // recipe (accumulating negative_constraints/steps onto it) instead of
+    // always minting a new near-duplicate file.
+    let mut matched_recipe_id: Option<String> = None;
+    // Pre-seeded from the matched recipe's own constraints (if any) and
+    // appended to live by the repetition detector below, so a run both
+    // benefits from and grows what's already been learned for this goal.
+    let mut negative_constraints: Vec<NegativeConstraint> = Vec::new();
+    let mut knowledge_facts: Vec<String> = Vec::new();
+    let mut last_action_identity: Option<(String, String)> = None;
+    let mut last_action_repeat_count: u32 = 0;
 
     while fresh_actions < AXI_FRESH_DECISION_LIMIT
         || (replay_actions < AXI_REPLAY_ACTION_LIMIT && !active_recipe_steps.is_empty())
@@ -2020,6 +2061,7 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
         // same step is normal, not a bug; an unbounded run of them means
         // the page is genuinely too unstable to act on safely right now.
         let mut consecutive_replans = 0_u8;
+        history.compact_if_needed(&config);
         loop {
             let observed = match observe_axi(&runner, &context) {
                 Ok(observed) => observed,
@@ -2053,9 +2095,21 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Some(recipe) = best_recipe {
                         println!("MICE: Found a matching recipe (score {:.2}). Replaying {} steps.", best_sim, recipe.steps.len());
+                        matched_recipe_id = Some(recipe.recipe_id.clone());
+                        negative_constraints = recipe.negative_constraints.clone();
                         active_recipe_steps = recipe.steps.clone();
                         active_recipe_steps.reverse();
                     }
+                }
+
+                // Independent of whether a recipe matched: a fact learned
+                // about this site on a *different* goal is still useful
+                // context here. Cheap domain prefilter is a substring check
+                // against the observation text itself (which contains the
+                // live `url: ...` line), not a separate extraction step.
+                if !embed.is_empty() {
+                    knowledge_facts =
+                        matching_knowledge_facts(&observed.text, &embed, &load_knowledge_snippets());
                 }
             }
 
@@ -2152,8 +2206,17 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 // Treat that the same as every other "the model's
                 // proposal didn't pan out" case (a soft, capped retry),
                 // not a hard `?` crash that kills the whole run.
-                let decision = match call_axi_agent_turn(&config, lane, goal, &observation, &history)
-                {
+                let constraint_rules: Vec<String> =
+                    negative_constraints.iter().map(|c| c.rule.clone()).collect();
+                let decision = match call_axi_agent_turn(
+                    &config,
+                    lane,
+                    goal,
+                    &observation,
+                    &history.as_prompt_text(),
+                    &constraint_rules,
+                    &knowledge_facts,
+                ) {
                     Ok(decision) => decision,
                     Err(error) => {
                         consecutive_replans += 1;
@@ -2226,14 +2289,89 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 if !current_sequence.is_empty() {
                                     if let Some(embed) = goal_embedding.clone() {
                                         if !embed.is_empty() {
+                                            // Overwrite the matched recipe
+                                            // (accumulating its steps/
+                                            // negative_constraints) instead
+                                            // of always minting a new
+                                            // near-duplicate file — without
+                                            // this, negative constraints
+                                            // would fragment across
+                                            // recipe-<timestamp> files
+                                            // instead of accumulating onto
+                                            // the one recipe this goal
+                                            // shape actually uses.
+                                            let recipe_id = matched_recipe_id.clone().unwrap_or_else(|| {
+                                                format!(
+                                                    "recipe-{}",
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_secs()
+                                                )
+                                            });
                                             let new_recipe = AxiRecipe {
-                                                recipe_id: format!("recipe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                                recipe_id,
                                                 goal_pattern: goal.to_string(),
                                                 goal_embedding: embed,
                                                 steps: current_sequence.clone(),
+                                                negative_constraints: negative_constraints.clone(),
                                             };
                                             if save_recipe(&new_recipe).is_ok() {
                                                 println!("MICE: Saved successful sequence as a new recipe.");
+                                            }
+                                            // Auto-capture one factual tip
+                                            // on a genuine first teach only
+                                            // (not a replay/repeat run) —
+                                            // deterministically templated
+                                            // from the taught step's own
+                                            // identity, never from asking
+                                            // the model to self-report what
+                                            // it learned (this session found
+                                            // that unreliable for other
+                                            // fields, e.g. done_summary).
+                                            if matched_recipe_id.is_none()
+                                                && let Some(step) = new_recipe
+                                                    .steps
+                                                    .iter()
+                                                    .rev()
+                                                    .find(|step| step.target_role.is_some() && step.target_context.is_some())
+                                            {
+                                                let domain = observed
+                                                    .text
+                                                    .lines()
+                                                    .find(|line| line.starts_with("url: "))
+                                                    .and_then(|line| line.strip_prefix("url: "))
+                                                    .and_then(|url| url.split('/').nth(2))
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                if !domain.is_empty() {
+                                                    let fact = format!(
+                                                        "{domain}'s primary interactive element for this kind of goal is a {} labeled \"{}\".",
+                                                        step.target_role.as_deref().unwrap_or_default(),
+                                                        step.target_context.as_deref().unwrap_or_default()
+                                                    );
+                                                    let fact_embedding = mice_providers::ollama_embed(
+                                                        &format!("{OLLAMA_ENDPOINT}/api/embed"),
+                                                        AXI_RECIPE_EMBEDDING_MODEL,
+                                                        &fact,
+                                                    )
+                                                    .unwrap_or_default();
+                                                    if !fact_embedding.is_empty() {
+                                                        let _ = save_knowledge_snippet(&KnowledgeSnippet {
+                                                            snippet_id: format!(
+                                                                "knowledge-{}",
+                                                                std::time::SystemTime::now()
+                                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                                    .unwrap()
+                                                                    .as_secs()
+                                                            ),
+                                                            site_pattern: domain,
+                                                            fact,
+                                                            fact_embedding,
+                                                            source: KnowledgeSource::AutoCapturedFromRun,
+                                                        });
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -2245,15 +2383,28 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                                         .as_deref()
                                         .unwrap_or("The requested step is complete.")
                                 );
+                                if let Some(guard) = job_progress_guard.as_mut() {
+                                    guard.mark_done(None);
+                                }
                             },
-                            AgentAction::AskUser => println!(
-                                "MICE needs your input: {}",
-                                decision
-                                    .question
-                                    .as_deref()
-                                    .unwrap_or("Please clarify the next step.")
-                            ),
-                            AgentAction::Handoff => println!("MICE has handed this step back to you."),
+                            AgentAction::AskUser => {
+                                println!(
+                                    "MICE needs your input: {}",
+                                    decision
+                                        .question
+                                        .as_deref()
+                                        .unwrap_or("Please clarify the next step.")
+                                );
+                                if let Some(guard) = job_progress_guard.as_mut() {
+                                    guard.mark_failed("needed clarification from the user".into());
+                                }
+                            }
+                            AgentAction::Handoff => {
+                                println!("MICE has handed this step back to you.");
+                                if let Some(guard) = job_progress_guard.as_mut() {
+                                    guard.mark_failed("handed off to the user".into());
+                                }
+                            }
                             _ => unreachable!("action conversion handles executable actions"),
                         }
                         return Ok(());
@@ -2284,6 +2435,23 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 history.push(format!(
                     "{} referenced a target no longer on this page; re-observing without asking.",
                     call.name
+                ));
+                continue;
+            }
+
+            if let Some(constraint) =
+                violates_negative_constraint(&call, &observed.snapshot, &negative_constraints)
+            {
+                consecutive_replans += 1;
+                if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
+                    println!(
+                        "MICE paused: MICE kept proposing steps already known not to help, even after retrying several times. Try again, or ask for one narrower step at a time."
+                    );
+                    return Ok(());
+                }
+                history.push(format!(
+                    "{} avoided: {}",
+                    call.name, constraint.rule
                 ));
                 continue;
             }
@@ -2478,6 +2646,39 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 target_role: identity.as_ref().map(|(role, _)| role.clone()),
                 target_context: identity.as_ref().map(|(_, context)| context.clone()),
             });
+            // The same identity succeeding twice in a row with nothing to
+            // show for it (no Done, no URL change reached yet) is exactly
+            // the unproductive-repetition pattern watched live this session
+            // (re-toggling "Main menu"). Record it once so a later proposal
+            // of the same identity gets vetoed pre-confirmation instead of
+            // repeating a third time.
+            if let Some(identity) = &identity {
+                if last_action_identity.as_ref() == Some(identity) {
+                    last_action_repeat_count += 1;
+                } else {
+                    last_action_identity = Some(identity.clone());
+                    last_action_repeat_count = 1;
+                }
+                if last_action_repeat_count == 2
+                    && !negative_constraints.iter().any(|constraint| {
+                        constraint.forbidden_role.as_deref() == Some(identity.0.as_str())
+                            && constraint.forbidden_context.as_deref() == Some(identity.1.as_str())
+                    })
+                {
+                    negative_constraints.push(NegativeConstraint {
+                        rule: format!(
+                            "Do not repeat {} on {} \"{}\" — it was already tried twice in a row with no progress.",
+                            call.name, identity.0, identity.1
+                        ),
+                        forbidden_role: Some(identity.0.clone()),
+                        forbidden_context: Some(identity.1.clone()),
+                        observed_count: last_action_repeat_count,
+                    });
+                }
+            } else {
+                last_action_identity = None;
+                last_action_repeat_count = 0;
+            }
             break;
         }
     }
@@ -2501,6 +2702,11 @@ const AXI_REPLAY_ACTION_LIMIT: usize = 200;
 // right now rather than "try once more" — pause with a clear reason
 // instead of spinning silently.
 const AXI_MAX_CONSECUTIVE_REPLANS: u8 = 4;
+// Below this, CompactingHistory behaves exactly like a plain growing log;
+// AXI_FRESH_DECISION_LIMIT(6) means a single run rarely reaches this even
+// once, so this mainly matters once recipe replay (a much larger budget)
+// is in the mix on a long multi-step task.
+const AXI_HISTORY_WINDOW: usize = 8;
 
 const AXI_LOCAL_UNCERTAINTY_LIMIT: u8 = 2;
 
@@ -2527,6 +2733,166 @@ impl Drop for AxiSessionGuard {
     }
 }
 
+/// Present only when a `mice autopilot-multi` orchestrator (M19c) spawned
+/// this run as one site's own subprocess.
+struct JobContext {
+    job_id: String,
+    site_index: usize,
+}
+
+pub fn jobs_dir() -> PathBuf {
+    // recipes_dir() is always `<config's parent>/recipes`, so it always
+    // has a parent — same guarantee axi_chrome_profile_dir() relies on.
+    recipes_dir().parent().unwrap().join("jobs")
+}
+
+pub fn job_dir(job_id: &str) -> PathBuf {
+    jobs_dir().join(job_id)
+}
+
+pub fn job_progress_path(job_id: &str) -> PathBuf {
+    job_dir(job_id).join("progress.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobProgress {
+    pub job_id: String,
+    pub goal: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub sites: Vec<SiteProgress>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SiteProgress {
+    pub site_index: usize,
+    pub sub_goal: String,
+    pub status: SiteStatus,
+    pub result_path: Option<String>,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteStatus {
+    Pending,
+    InProgress,
+    Done,
+    Failed,
+    Crashed,
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Atomic write-then-rename with owner-only permissions, mirroring
+/// `crates/mice-cli/src/mission.rs`'s `Ledger::record` exactly (reused via
+/// its now-`pub(crate)` `restrict_file_to_user`/`restrict_directory_to_user`)
+/// rather than a second ad hoc implementation of the same discipline.
+pub fn save_job_progress(progress: &JobProgress) -> std::io::Result<()> {
+    let dir = job_dir(&progress.job_id);
+    std::fs::create_dir_all(&dir)?;
+    mission::restrict_directory_to_user(&dir)?;
+    let bytes = serde_json::to_vec_pretty(progress)?;
+    let temporary = dir.join(format!(".progress.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, &bytes)?;
+    mission::restrict_file_to_user(&temporary)?;
+    std::fs::rename(&temporary, job_progress_path(&progress.job_id))
+}
+
+pub fn load_job_progress(job_id: &str) -> Option<JobProgress> {
+    let content = std::fs::read_to_string(job_progress_path(job_id)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Updates only `site_index`'s own entry, read-modify-write. Safe for
+/// M19c's v1 (sites run strictly serially — see `axi_chrome_profile_dir`'s
+/// own single-shared-profile constraint — so there is never a second
+/// writer racing this one); not safe as written for a future parallel
+/// version without real file locking.
+fn update_job_site_status(
+    job_id: &str,
+    site_index: usize,
+    status: SiteStatus,
+    result_path: Option<String>,
+    error: Option<String>,
+) -> std::io::Result<()> {
+    let Some(mut progress) = load_job_progress(job_id) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no job progress file for job {job_id}"),
+        ));
+    };
+    if let Some(site) = progress.sites.get_mut(site_index) {
+        site.status = status;
+        site.attempts += 1;
+        if result_path.is_some() {
+            site.result_path = result_path;
+        }
+        if error.is_some() {
+            site.last_error = error;
+        }
+    }
+    progress.updated_at = unix_timestamp();
+    save_job_progress(&progress)
+}
+
+/// Marks this run's site `Crashed` when dropped unless `mark_done`/
+/// `mark_failed` already ran — covers a panic, or any exit path that was
+/// never taught to finalize explicitly, the same way `AxiSessionGuard`
+/// already handles cleanup for those cases.
+///
+/// Does **not** cover SIGKILL — confirmed live (kill -KILL against a real
+/// subprocess mid-run): no process can intercept SIGKILL, so `Drop` simply
+/// never runs and the site is left looking `InProgress`. Rust's Drop only
+/// fires on ordinary unwinding (a normal return or a panic), never on an
+/// OS-level hard kill. The M19c orchestrator is the actual authority for
+/// that case: it observes subprocess exit directly via `Child::wait()`
+/// (which *does* return reliably regardless of how the child died), so
+/// after a site's process exits, the orchestrator must itself check
+/// whether that site is still `InProgress` and reconcile it to `Crashed`
+/// if so — this guard is the fast, common-case path, not the only one.
+struct JobProgressGuard {
+    job_id: String,
+    site_index: usize,
+    finalized: bool,
+}
+
+impl JobProgressGuard {
+    fn new(job_id: String, site_index: usize) -> Self {
+        let _ = update_job_site_status(&job_id, site_index, SiteStatus::InProgress, None, None);
+        Self {
+            job_id,
+            site_index,
+            finalized: false,
+        }
+    }
+
+    fn mark_done(&mut self, result_path: Option<String>) {
+        self.finalized = true;
+        let _ = update_job_site_status(&self.job_id, self.site_index, SiteStatus::Done, result_path, None);
+    }
+
+    fn mark_failed(&mut self, reason: String) {
+        self.finalized = true;
+        let _ =
+            update_job_site_status(&self.job_id, self.site_index, SiteStatus::Failed, None, Some(reason));
+    }
+}
+
+impl Drop for JobProgressGuard {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _ = update_job_site_status(&self.job_id, self.site_index, SiteStatus::Crashed, None, None);
+        }
+    }
+}
+
 #[derive(Default)]
 struct AxiActionRecovery {
     stale_retried: bool,
@@ -2541,6 +2907,86 @@ impl AxiActionRecovery {
         } else {
             self.stale_retried = true;
             true
+        }
+    }
+}
+
+/// A bounded window of recent, uid-free history entries plus a running
+/// summary of anything older — structured state instead of a growing raw
+/// transcript, per the AgentProg finding (plan/auto_intelligence.md §2.2)
+/// that unbounded history "incurs substantial context overhead" over a
+/// long-running task. Behaves exactly like a plain history log until
+/// `recent` exceeds `window`; only then does compaction fire.
+struct CompactingHistory {
+    recent: std::collections::VecDeque<String>,
+    summary: Option<String>,
+    window: usize,
+}
+
+impl CompactingHistory {
+    fn new(window: usize) -> Self {
+        Self {
+            recent: std::collections::VecDeque::new(),
+            summary: None,
+            window,
+        }
+    }
+
+    fn push(&mut self, entry: String) {
+        self.recent.push_back(entry);
+    }
+
+    fn last(&self) -> Option<&str> {
+        self.recent.back().map(String::as_str)
+    }
+
+    /// Fold the oldest entries into `summary` via one bounded local model
+    /// call once `recent` exceeds `window`. Not fatal if it fails — the
+    /// entries are put back and `recent` just keeps its current size a
+    /// little longer, not lost, and never blocks the caller's own retry.
+    fn compact_if_needed(&mut self, config: &mice_core::Config) {
+        if self.recent.len() <= self.window {
+            return;
+        }
+        let overflow = self.recent.len() - self.window;
+        let to_fold: Vec<String> = (0..overflow).filter_map(|_| self.recent.pop_front()).collect();
+        let instruction = "Summarize these completed browser-automation steps in 2-3 short plain sentences. Keep only what a later step needs: which sites/pages were visited, what succeeded, and anything that did not work and should not be repeated. No quotation marks.";
+        let existing_summary = self.summary.clone().unwrap_or_default();
+        let text = format!("{existing_summary}\n{}", to_fold.join("\n"));
+        let mut folded = String::new();
+        let compacted = stream_ollama_with_format(
+            &config.tool_model,
+            instruction,
+            Some(&text),
+            None,
+            |chunk| {
+                folded.push_str(chunk);
+                Ok(())
+            },
+        )
+        .is_ok()
+            && !folded.trim().is_empty();
+        if compacted {
+            self.summary = Some(folded.trim().to_string());
+        } else {
+            for entry in to_fold.into_iter().rev() {
+                self.recent.push_front(entry);
+            }
+        }
+    }
+
+    fn as_prompt_text(&self) -> String {
+        match &self.summary {
+            None if self.recent.is_empty() => "No prior actions.".to_string(),
+            None => self.recent.iter().cloned().collect::<Vec<_>>().join("\n"),
+            Some(summary) => {
+                let recent = self.recent.iter().cloned().collect::<Vec<_>>().join("\n");
+                if recent.is_empty() {
+                    format!("Summary of earlier steps: {summary}")
+                } else {
+                    format!("Summary of earlier steps: {summary}\n{recent}")
+                }
+            }
         }
     }
 }
@@ -2725,7 +3171,7 @@ fn is_soft_execution_refusal(error: &impl std::fmt::Display) -> bool {
 
 fn pause_axi(
     goal: &str,
-    history: &[String],
+    history: &CompactingHistory,
     error: &impl std::fmt::Display,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let detail = error.to_string();
@@ -2734,7 +3180,7 @@ fn pause_axi(
     } else {
         "Chrome or the AXI browser bridge became unavailable"
     };
-    let last_history = history.last().map(String::as_str).unwrap_or("none");
+    let last_history = history.last().unwrap_or("none");
     println!(
         "MICE AXI guide paused for ‘{goal}’: {reason}. No further action was taken. Reopen Chrome if needed, then rerun this goal. Last safe history: {last_history}"
     );
@@ -2770,17 +3216,24 @@ fn call_axi_agent_turn(
     lane: ExecutionLane,
     goal: &str,
     observation: &str,
-    history: &[String],
+    history: &str,
+    negative_constraint_rules: &[String],
+    knowledge_facts: &[String],
 ) -> Result<AgentDecision, Box<dyn std::error::Error>> {
-    let history = if history.is_empty() {
-        "No prior actions.".into()
-    } else {
-        history.join("\n")
-    };
     let output = if lane == ExecutionLane::Local {
         let mut output = String::new();
-        let instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing. Only choose action 'done' once every concrete part of the goal is actually finished: if the goal says to search, fill, or extract something, navigating to the right page or clicking around it is not done by itself — the search/fill/extraction has to have actually happened. If unsure whether the goal is fully met yet, take the next concrete step toward it instead of declaring done.";
-        
+        let mut instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing. Only choose action 'done' once every concrete part of the goal is actually finished: if the goal says to search, fill, or extract something, navigating to the right page or clicking around it is not done by itself — the search/fill/extraction has to have actually happened. If unsure whether the goal is fully met yet, take the next concrete step toward it instead of declaring done.".to_string();
+        if !negative_constraint_rules.is_empty() {
+            instruction.push_str(
+                "\n\nThings already tried for this goal that did NOT help — do not repeat them: ",
+            );
+            instruction.push_str(&negative_constraint_rules.join("; "));
+        }
+        if !knowledge_facts.is_empty() {
+            instruction.push_str("\n\nKnown facts about this site that may help: ");
+            instruction.push_str(&knowledge_facts.join("; "));
+        }
+
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -2806,7 +3259,7 @@ fn call_axi_agent_turn(
         }
         stream_ollama_with_format(
             &config.tool_model,
-            instruction,
+            &instruction,
             Some(&prompt_text),
             Some(schema),
             |chunk| {
@@ -2823,7 +3276,7 @@ fn call_axi_agent_turn(
             &config.cloud_model,
             goal,
             observation,
-            &history,
+            history,
             &config.autopilot.persona,
         )?
     } else {
@@ -2831,7 +3284,7 @@ fn call_axi_agent_turn(
             &config.cloud_model,
             goal,
             observation,
-            &history,
+            history,
             None,
             &config.autopilot.persona,
         )?
@@ -3622,6 +4075,62 @@ fn keychain_api_key(variable: &str) -> Option<String> {
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+/// Manually seed or list the local factual-tip store `autopilot_axi`
+/// retrieves from (see `matching_knowledge_facts`). Most entries are
+/// captured automatically on a first successful teach; this is for adding
+/// a fact MICE hasn't learned on its own yet, or reviewing what's stored.
+fn knowledge() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    match arguments.first().map(String::as_str) {
+        Some("add") if arguments.len() == 3 => {
+            let site = arguments[1].trim().to_ascii_lowercase();
+            let fact = arguments[2].trim();
+            if site.is_empty() || fact.is_empty() {
+                return Err("Usage: mice knowledge add <site> \"<fact>\"".into());
+            }
+            let embed = mice_providers::ollama_embed(
+                &format!("{OLLAMA_ENDPOINT}/api/embed"),
+                AXI_RECIPE_EMBEDDING_MODEL,
+                fact,
+            )
+            .map_err(|error| format!("Could not embed the fact locally: {error}"))?;
+            save_knowledge_snippet(&KnowledgeSnippet {
+                snippet_id: format!(
+                    "knowledge-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                ),
+                site_pattern: site.clone(),
+                fact: fact.to_string(),
+                fact_embedding: embed,
+                source: KnowledgeSource::ManuallySeeded,
+            })?;
+            println!("Saved a fact for {site}.");
+            Ok(())
+        }
+        Some("list") if arguments.len() == 1 => {
+            let snippets = load_knowledge_snippets();
+            if snippets.is_empty() {
+                println!(
+                    "No facts saved yet. Add one with `mice knowledge add <site> \"<fact>\"`."
+                );
+            } else {
+                for snippet in &snippets {
+                    let source = match snippet.source {
+                        KnowledgeSource::AutoCapturedFromRun => "auto-captured",
+                        KnowledgeSource::ManuallySeeded => "manually added",
+                    };
+                    println!("[{}] {} ({source})", snippet.site_pattern, snippet.fact);
+                }
+            }
+            Ok(())
+        }
+        _ => Err("Usage: mice knowledge <add <site> \"<fact>\"|list>".into()),
+    }
 }
 
 fn keys() -> Result<(), Box<dyn std::error::Error>> {
@@ -9406,6 +9915,119 @@ mod hover_tests {
     }
 
     #[test]
+    fn compacting_history_behaves_like_a_plain_log_below_the_window() {
+        let mut history = CompactingHistory::new(8);
+        assert_eq!(history.as_prompt_text(), "No prior actions.");
+        assert_eq!(history.last(), None);
+
+        history.push("browser.open succeeded.".into());
+        history.push("browser.click link \"Jump to content\" succeeded.".into());
+        assert_eq!(
+            history.as_prompt_text(),
+            "browser.open succeeded.\nbrowser.click link \"Jump to content\" succeeded."
+        );
+        assert_eq!(history.last(), Some("browser.click link \"Jump to content\" succeeded."));
+    }
+
+    #[test]
+    fn job_progress_round_trips_through_json_with_every_site_status() {
+        // Pure serde correctness, deliberately not touching jobs_dir()/the
+        // real filesystem (that's a live-scripted verification instead,
+        // matching this session's established split for anything that
+        // needs a real environment — here, a real subprocess to SIGKILL).
+        for status in [
+            SiteStatus::Pending,
+            SiteStatus::InProgress,
+            SiteStatus::Done,
+            SiteStatus::Failed,
+            SiteStatus::Crashed,
+        ] {
+            let progress = JobProgress {
+                job_id: "job-test".into(),
+                goal: "search 3 sites".into(),
+                created_at: 1_000,
+                updated_at: 1_001,
+                sites: vec![SiteProgress {
+                    site_index: 0,
+                    sub_goal: "search site one".into(),
+                    status,
+                    result_path: Some("/tmp/site-0-result.json".into()),
+                    attempts: 1,
+                    last_error: None,
+                }],
+            };
+            let json = serde_json::to_string(&progress).unwrap();
+            let round_tripped: JobProgress = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped.sites[0].status, status);
+            assert_eq!(round_tripped.job_id, "job-test");
+        }
+    }
+
+    #[test]
+    fn extract_flag_value_removes_both_tokens_from_anywhere_in_the_list() {
+        let mut arguments: Vec<String> = ["--engine", "axi", "--job-id", "job-1", "go", "to", "x"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            extract_flag_value(&mut arguments, "--job-id"),
+            Some("job-1".to_string())
+        );
+        assert_eq!(
+            arguments,
+            vec!["--engine", "axi", "go", "to", "x"]
+        );
+        // Absent flag: no-op, nothing removed.
+        assert_eq!(extract_flag_value(&mut arguments, "--site-index"), None);
+        assert_eq!(arguments.len(), 5);
+        // Flag present but no value after it: no-op rather than panicking.
+        arguments.push("--job-id".into());
+        assert_eq!(extract_flag_value(&mut arguments, "--job-id"), None);
+    }
+
+    #[test]
+    fn compacting_history_prompt_text_stays_bounded_once_compacted() {
+        // Simulates the post-compaction state directly (compact_if_needed
+        // itself needs a live model call to fold entries, which is a
+        // live-verification concern, not a unit-test one, matching this
+        // session's established split) — the structural guarantee under
+        // test is that once older entries are represented by `summary`,
+        // the constructed prompt text's size no longer grows with total
+        // historical entry count, only with `window` + summary length.
+        let window = 4;
+        let mut history = CompactingHistory::new(window);
+        history.summary = Some("Opened Wikipedia and clicked through the main page.".into());
+        for index in 0..window {
+            history.recent.push_back(format!("step {index} succeeded."));
+        }
+        let text = history.as_prompt_text();
+        assert!(text.starts_with("Summary of earlier steps: Opened Wikipedia"));
+        for index in 0..window {
+            assert!(text.contains(&format!("step {index} succeeded.")));
+        }
+
+        // Doubling how many "historical" entries this simulates (as if
+        // 100 real steps had occurred, all but `window` folded into
+        // `summary`) must not double the prompt text size — this is the
+        // actual bound the acceptance criterion cares about, not entry
+        // count.
+        let baseline_tokens = mice_core::estimate_tokens(&text);
+        let mut long_run = CompactingHistory::new(window);
+        long_run.summary = Some(
+            "Opened Wikipedia, clicked through the main page, and repeated the search flow many times."
+                .into(),
+        );
+        for index in 0..window {
+            long_run.recent.push_back(format!("step {index} succeeded."));
+        }
+        let long_run_tokens = mice_core::estimate_tokens(&long_run.as_prompt_text());
+        // Same window size and a comparably-short summary: token estimate
+        // should be in the same ballpark regardless of how many steps a
+        // real run had folded into that summary, not scale with them.
+        assert!(long_run_tokens < baseline_tokens * 2);
+    }
+
+    #[test]
     fn validate_agent_decision_rejects_a_smart_quote_corrupted_value() {
         // The exact live reproduction: the model's `value` field ran on
         // through smart-quote-delimited fragments of the *next* field
@@ -9589,6 +10211,14 @@ pub struct AxiRecipe {
     pub goal_pattern: String,
     pub goal_embedding: Vec<f32>,
     pub steps: Vec<RecipeStep>,
+    /// Identities known to be unproductive for this goal shape — e.g. a
+    /// control that got clicked repeatedly with no progress in between.
+    /// `#[serde(default)]` so recipes already on disk from before this
+    /// field existed still deserialize (matches the forward-compat
+    /// convention `MissionTaskGraph`/`MissionRecord` already use in
+    /// mice-core).
+    #[serde(default)]
+    pub negative_constraints: Vec<NegativeConstraint>,
 }
 
 /// A recorded action plus the (role, accessible-name) identity its target
@@ -9602,12 +10232,48 @@ pub struct RecipeStep {
     pub target_context: Option<String>,
 }
 
+/// An identity (role + accessible-name) observed to be unproductive for a
+/// goal shape: the same action repeated back-to-back with nothing to show
+/// for it (no `Done`, no URL change). Recorded automatically, not
+/// hand-authored, and enforced deterministically before a proposal ever
+/// reaches the confirmation prompt — see `violates_negative_constraint`.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct NegativeConstraint {
+    pub rule: String,
+    pub forbidden_role: Option<String>,
+    pub forbidden_context: Option<String>,
+    pub observed_count: u32,
+}
+
+/// Whether a proposed call's target matches a known-unproductive identity
+/// for the active recipe. Checked before the confirmation prompt, in the
+/// same spirit as `proposal_is_dead`: don't spend a model call or a
+/// person's attention re-proposing something already known not to help.
+pub fn violates_negative_constraint<'a>(
+    call: &ToolCall,
+    snapshot: &tools::BrowserSnapshot,
+    constraints: &'a [NegativeConstraint],
+) -> Option<&'a NegativeConstraint> {
+    let uid = call.args.get("uid").and_then(Value::as_str)?;
+    let (role, context) = snapshot.identity_of(uid)?;
+    constraints.iter().find(|constraint| {
+        constraint.forbidden_role.as_deref() == Some(role.as_str())
+            && constraint.forbidden_context.as_deref() == Some(context.as_str())
+    })
+}
+
 pub fn recipes_dir() -> PathBuf {
     config_path()
         .unwrap_or_else(|| PathBuf::from("."))
         .parent()
         .unwrap()
         .join("recipes")
+}
+
+pub fn knowledge_dir() -> PathBuf {
+    // recipes_dir() is always `<config's parent>/recipes`, so it always has
+    // a parent — same guarantee axi_chrome_profile_dir() already relies on.
+    recipes_dir().parent().unwrap().join("knowledge")
 }
 
 fn axi_chrome_profile_dir() -> PathBuf {
@@ -9652,6 +10318,70 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (mag_a * mag_b)
     }
+}
+
+/// A short factual tip about a site, retrieved the same way recipes are
+/// (embedding similarity over `ollama_embed`/`cosine_similarity`, not a
+/// second retrieval mechanism) and injected into the model's instruction
+/// context alongside — not instead of — recipe replay. `site_pattern` is a
+/// cheap deterministic prefilter (domain match) before the embedding
+/// comparison even runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeSnippet {
+    pub snippet_id: String,
+    pub site_pattern: String,
+    pub fact: String,
+    pub fact_embedding: Vec<f32>,
+    pub source: KnowledgeSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeSource {
+    AutoCapturedFromRun,
+    ManuallySeeded,
+}
+
+pub fn save_knowledge_snippet(snippet: &KnowledgeSnippet) -> std::io::Result<()> {
+    let dir = knowledge_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", snippet.snippet_id));
+    let content = serde_json::to_string_pretty(snippet)?;
+    std::fs::write(path, content)
+}
+
+pub fn load_knowledge_snippets() -> Vec<KnowledgeSnippet> {
+    let mut snippets = Vec::new();
+    let dir = knowledge_dir();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("json")
+                && let Ok(content) = std::fs::read_to_string(entry.path())
+                && let Ok(snippet) = serde_json::from_str::<KnowledgeSnippet>(&content)
+            {
+                snippets.push(snippet);
+            }
+        }
+    }
+    snippets
+}
+
+/// Facts whose `site_pattern` matches `domain`, ranked by similarity to
+/// `goal_embedding`, best first. A cheap deterministic domain prefilter
+/// runs before the embedding comparison so an unrelated site's facts are
+/// never even scored.
+pub fn matching_knowledge_facts(
+    domain: &str,
+    goal_embedding: &[f32],
+    snippets: &[KnowledgeSnippet],
+) -> Vec<String> {
+    let mut scored: Vec<(f32, &KnowledgeSnippet)> = snippets
+        .iter()
+        .filter(|snippet| !snippet.site_pattern.is_empty() && domain.contains(&snippet.site_pattern))
+        .map(|snippet| (cosine_similarity(goal_embedding, &snippet.fact_embedding), snippet))
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.into_iter().map(|(_, snippet)| snippet.fact.clone()).collect()
 }
 
 #[cfg(test)]
@@ -9756,5 +10486,68 @@ mod recipe_matching_tests {
             describe_action_for_history(&open, &empty),
             "browser.open {\"url\":\"https://en.wikipedia.org/\"}"
         );
+    }
+
+    #[test]
+    fn violates_negative_constraint_matches_by_identity_not_uid() {
+        let snapshot = tools::BrowserSnapshot::from_axi_output(
+            "uid=g11:3_6 button \"Main menu\" haspopup=\"menu\"",
+        );
+        let call = ToolCall {
+            name: "browser.click".into(),
+            args: json!({"uid": "g11:3_6"}),
+        };
+        let constraints = vec![NegativeConstraint {
+            rule: "Do not repeat browser.click on button \"Main menu\" — already tried twice.".into(),
+            forbidden_role: Some("button".into()),
+            forbidden_context: Some("Main menu".into()),
+            observed_count: 2,
+        }];
+        // Same identity, a totally different (later-generation) uid than
+        // whatever was recorded when the constraint was synthesized —
+        // this must still match, since the whole point is the identity
+        // survives across snapshot generations even though uids don't.
+        assert!(violates_negative_constraint(&call, &snapshot, &constraints).is_some());
+
+        let unrelated_call = ToolCall {
+            name: "browser.click".into(),
+            args: json!({"uid": "g11:3_6"}),
+        };
+        assert!(violates_negative_constraint(&unrelated_call, &snapshot, &[]).is_none());
+
+        let no_uid_call = ToolCall {
+            name: "browser.scroll".into(),
+            args: json!({"direction": "down"}),
+        };
+        assert!(violates_negative_constraint(&no_uid_call, &snapshot, &constraints).is_none());
+    }
+
+    #[test]
+    fn matching_knowledge_facts_prefilters_by_domain_then_ranks_by_similarity() {
+        let wikipedia_fact = KnowledgeSnippet {
+            snippet_id: "k1".into(),
+            site_pattern: "en.wikipedia.org".into(),
+            fact: "Wikipedia's search box has role=searchbox near the top.".into(),
+            fact_embedding: vec![1.0, 0.0],
+            source: KnowledgeSource::ManuallySeeded,
+        };
+        let unrelated_fact = KnowledgeSnippet {
+            snippet_id: "k2".into(),
+            site_pattern: "example.com".into(),
+            fact: "example.com has a login form.".into(),
+            fact_embedding: vec![1.0, 0.0],
+            source: KnowledgeSource::ManuallySeeded,
+        };
+        let snippets = vec![wikipedia_fact.clone(), unrelated_fact];
+
+        let observation = "page:\n  url: \"https://en.wikipedia.org/wiki/Main_Page\"\nsnapshot:\nuid=g1:1_0 RootWebArea";
+        let goal_embedding = [1.0, 0.0];
+        let facts = matching_knowledge_facts(observation, &goal_embedding, &snippets);
+        assert_eq!(facts, vec![wikipedia_fact.fact.clone()]);
+
+        // An unrelated domain's observation must exclude even a
+        // perfectly-similar-embedding fact from a different site.
+        let unrelated_observation = "page:\n  url: \"https://example.org/\"\nsnapshot:\n";
+        assert!(matching_knowledge_facts(unrelated_observation, &goal_embedding, &snippets).is_empty());
     }
 }

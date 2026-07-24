@@ -3016,7 +3016,10 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-fn restrict_file_to_user(path: &Path) -> Result<(), std::io::Error> {
+/// `pub(crate)`: reused outside this module by the M19b job-progress log
+/// (`main.rs`), which needs the same atomic-write + owner-only-permission
+/// discipline this module already established for `Ledger::record`.
+pub(crate) fn restrict_file_to_user(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3029,7 +3032,7 @@ fn restrict_file_to_user(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
-fn restrict_directory_to_user(path: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn restrict_directory_to_user(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
