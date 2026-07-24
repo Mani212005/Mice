@@ -1998,6 +1998,29 @@ pub fn aggregate_site_results(goal: &str, results: &[SiteResult]) -> serde_json:
     })
 }
 
+/// Strict allowlist for a per-site `mice autopilot` child's own process
+/// environment (distinct from `tools::sanitized_env`, which shapes the
+/// environment for the chrome bridge subprocess one level further down).
+/// Deliberately excludes every credential variable
+/// (`GROQ_API_KEY`/`OPENAI_API_KEY`/`GOOGLE_SHEETS_*`): `provider_api_key`
+/// checks an env var override before falling back to Keychain, so without
+/// this allowlist an inherited environment could leak a credential into
+/// every browsing subprocess a job spawns.
+fn autopilot_subprocess_env() -> Vec<(String, String)> {
+    let mut allowed = Vec::new();
+    for key in ["PATH", "HOME", "TMPDIR"] {
+        if let Some(value) = env::var_os(key) {
+            allowed.push((key.into(), value.to_string_lossy().into_owned()));
+        }
+    }
+    for (key, value) in env::vars() {
+        if key.starts_with("CHROME_DEVTOOLS_AXI_") {
+            allowed.push((key, value));
+        }
+    }
+    allowed
+}
+
 fn autopilot_multi() -> Result<(), Box<dyn std::error::Error>> {
     let goal = env::args().skip(2).collect::<Vec<_>>().join(" ");
     if goal.trim().is_empty() {
@@ -2053,6 +2076,17 @@ fn autopilot_multi() -> Result<(), Box<dyn std::error::Error>> {
         );
         let result_path = site_result_path(&job_id, index);
         let status = Command::new(&current_exe)
+            // A per-site child must never inherit the orchestrator's full
+            // environment: credentials such as GOOGLE_SHEETS_REFRESH_TOKEN
+            // (see M19d) are looked up via `provider_api_key`, which checks
+            // an env var override before falling back to Keychain, so an
+            // inherited env could otherwise leak one site's push-back
+            // credential into every browsing subprocess. This allowlist is
+            // the same one `tools::sanitized_env` uses for the chrome
+            // bridge, applied here one level up, to the `mice autopilot`
+            // child itself.
+            .env_clear()
+            .envs(autopilot_subprocess_env())
             .args([
                 "autopilot",
                 "--engine",
