@@ -1921,6 +1921,11 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut local_uncertainties = 0_u8;
     let mut completed_actions = 0_usize;
     let mut mutating_budget = 0_usize;
+    
+    let mut goal_embedding: Option<Vec<f32>> = None;
+    let mut active_recipe_steps: Vec<tools::ToolCall> = Vec::new();
+    let mut current_sequence: Vec<tools::ToolCall> = Vec::new();
+
     while completed_actions < 6 {
         // A stale retry belongs to this proposed action, not to the whole
         // guide. A replan does not use up a successfully-dispatched action.
@@ -1936,63 +1941,114 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            let observation = observed.text.clone();
-            let lane = if primary_lane == ExecutionLane::Local
-                && local_uncertainties >= AXI_LOCAL_UNCERTAINTY_LIMIT
-            {
-                let fallback = axi_cloud_fallback_lane(&config)?;
-                confirm_axi_cloud_fallback(
-                    &config.cloud_model,
-                    "the local guide was uncertain twice on the current page",
-                )?;
-                fallback
-            } else {
-                primary_lane
-            };
-            let decision = call_axi_agent_turn(&config, lane, goal, &observation, &history)?;
-            validate_agent_decision(&decision)?;
-            println!("MICE: {}", decision.say_to_user);
-
-            let Some(call) = axi_call_from_decision(&decision)? else {
-                if lane == ExecutionLane::Local
-                    && config.privacy_mode == PrivacyMode::CloudAllowed
-                    && matches!(
-                        &decision.action,
-                        AgentAction::Handoff | AgentAction::AskUser
-                    )
-                {
-                    local_uncertainties += 1;
-                    history.push(format!(
-                        "local guide uncertainty {local_uncertainties}/{AXI_LOCAL_UNCERTAINTY_LIMIT}: {}",
-                        decision.say_to_user
-                    ));
-                    if local_uncertainties < AXI_LOCAL_UNCERTAINTY_LIMIT {
-                        println!(
-                            "MICE will take one more local-only look before considering a cloud fallback."
-                        );
+            if goal_embedding.is_none() {
+                let site = observed.text.lines().find(|l| l.starts_with("url: ")).map(|l| l.strip_prefix("url: ").unwrap().trim()).unwrap_or("");
+                let pattern = format!("{}|{}", site, goal);
+                let embed = mice_providers::ollama_embed(&format!("{OLLAMA_ENDPOINT}/api/embed"), "nomic-embed-text", &pattern).unwrap_or_default();
+                goal_embedding = Some(embed.clone());
+                
+                if !embed.is_empty() {
+                    let recipes = load_recipes();
+                    let mut best_sim = 0.0;
+                    let mut best_recipe = None;
+                    for recipe in &recipes {
+                        let sim = cosine_similarity(&embed, &recipe.goal_embedding);
+                        if sim > 0.85 && sim > best_sim {
+                            best_sim = sim;
+                            best_recipe = Some(recipe);
+                        }
                     }
-                    continue;
+                    if let Some(recipe) = best_recipe {
+                        println!("MICE: Found a matching recipe (score {:.2}). Replaying {} steps.", best_sim, recipe.steps.len());
+                        active_recipe_steps = recipe.steps.clone();
+                        active_recipe_steps.reverse();
+                    }
                 }
-                match decision.action {
-                    AgentAction::Done => println!(
-                        "MICE AXI guide complete: {}",
-                        decision
-                            .done_summary
-                            .as_deref()
-                            .unwrap_or("The requested step is complete.")
-                    ),
-                    AgentAction::AskUser => println!(
-                        "MICE needs your input: {}",
-                        decision
-                            .question
-                            .as_deref()
-                            .unwrap_or("Please clarify the next step.")
-                    ),
-                    AgentAction::Handoff => println!("MICE has handed this step back to you."),
-                    _ => unreachable!("action conversion handles executable actions"),
-                }
-                return Ok(());
+            }
+
+            let call = if let Some(recipe_step) = active_recipe_steps.pop() {
+                println!("MICE: Replaying recipe step '{}'...", recipe_step.name);
+                recipe_step
+            } else {
+                let observation = observed.text.clone();
+                let lane = if primary_lane == ExecutionLane::Local
+                    && local_uncertainties >= AXI_LOCAL_UNCERTAINTY_LIMIT
+                {
+                    let fallback = axi_cloud_fallback_lane(&config)?;
+                    confirm_axi_cloud_fallback(
+                        &config.cloud_model,
+                        "the local guide was uncertain twice on the current page",
+                    )?;
+                    fallback
+                } else {
+                    primary_lane
+                };
+                let decision = call_axi_agent_turn(&config, lane, goal, &observation, &history)?;
+                validate_agent_decision(&decision)?;
+                println!("MICE: {}", decision.say_to_user);
+
+                let Some(call) = axi_call_from_decision(&decision)? else {
+                    if lane == ExecutionLane::Local
+                        && config.privacy_mode == PrivacyMode::CloudAllowed
+                        && matches!(
+                            &decision.action,
+                            AgentAction::Handoff | AgentAction::AskUser
+                        )
+                    {
+                        local_uncertainties += 1;
+                        history.push(format!(
+                            "local guide uncertainty {local_uncertainties}/{AXI_LOCAL_UNCERTAINTY_LIMIT}: {}",
+                            decision.say_to_user
+                        ));
+                        if local_uncertainties < AXI_LOCAL_UNCERTAINTY_LIMIT {
+                            println!(
+                                "MICE will take one more local-only look before considering a cloud fallback."
+                            );
+                        }
+                        continue;
+                    }
+                    match decision.action {
+                        AgentAction::Done => {
+                            if !current_sequence.is_empty() {
+                                if let Some(embed) = goal_embedding.clone() {
+                                    if !embed.is_empty() {
+                                        let site = observed.text.lines().find(|l| l.starts_with("url: ")).map(|l| l.strip_prefix("url: ").unwrap().trim()).unwrap_or("");
+                                        let new_recipe = AxiRecipe {
+                                            recipe_id: format!("recipe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                            goal_pattern: format!("{}|{}", site, goal),
+                                            goal_embedding: embed,
+                                            steps: current_sequence.clone(),
+                                        };
+                                        if save_recipe(&new_recipe).is_ok() {
+                                            println!("MICE: Saved successful sequence as a new recipe.");
+                                        }
+                                    }
+                                }
+                            }
+                            println!(
+                                "MICE AXI guide complete: {}",
+                                decision
+                                    .done_summary
+                                    .as_deref()
+                                    .unwrap_or("The requested step is complete.")
+                            );
+                        },
+                        AgentAction::AskUser => println!(
+                            "MICE needs your input: {}",
+                            decision
+                                .question
+                                .as_deref()
+                                .unwrap_or("Please clarify the next step.")
+                        ),
+                        AgentAction::Handoff => println!("MICE has handed this step back to you."),
+                        _ => unreachable!("action conversion handles executable actions"),
+                    }
+                    return Ok(());
+                };
+                call
             };
+            
+            current_sequence.push(call.clone());
 
             let tool_kind = tools::specs().iter().find(|s| s.name == call.name).map(|s| s.kind).unwrap_or(tools::ToolKind::Mutating);
 
@@ -8929,5 +8985,57 @@ mod hover_tests {
         assert!(blocked_browser_action("fill", &password, "Enter password").is_some());
         assert!(blocked_browser_action("click", &payment, "Continue checkout").is_some());
         assert!(blocked_browser_action("click", &normal, "Continue to profile").is_none());
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct AxiRecipe {
+    pub recipe_id: String,
+    pub goal_pattern: String,
+    pub goal_embedding: Vec<f32>,
+    pub steps: Vec<tools::ToolCall>,
+}
+
+pub fn recipes_dir() -> PathBuf {
+    config_path()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .parent()
+        .unwrap()
+        .join("recipes")
+}
+
+pub fn save_recipe(recipe: &AxiRecipe) -> std::io::Result<()> {
+    let dir = recipes_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", recipe.recipe_id));
+    let content = serde_json::to_string_pretty(recipe)?;
+    std::fs::write(path, content)
+}
+
+pub fn load_recipes() -> Vec<AxiRecipe> {
+    let mut recipes = Vec::new();
+    let dir = recipes_dir();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(recipe) = serde_json::from_str::<AxiRecipe>(&content) {
+                        recipes.push(recipe);
+                    }
+                }
+            }
+        }
+    }
+    recipes
+}
+
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 {
+        0.0
+    } else {
+        dot / (mag_a * mag_b)
     }
 }

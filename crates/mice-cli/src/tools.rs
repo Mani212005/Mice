@@ -57,7 +57,7 @@ pub struct ToolSpec {
     pub availability_program: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub args: Value,
