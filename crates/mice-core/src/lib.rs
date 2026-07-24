@@ -1025,7 +1025,7 @@ pub enum AgentAction {
     AskUser,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AgentDecision {
     pub say_to_user: String,
@@ -1035,6 +1035,15 @@ pub struct AgentDecision {
     pub value: Option<String>,
     pub done_summary: Option<String>,
     pub question: Option<String>,
+    /// Populated only when `action == done` and the goal was
+    /// extraction-shaped (e.g. a multi-site job's per-site sub-goal, see
+    /// M19c's `SiteResult`). Absent for the ordinary single-goal
+    /// browsing loop, which has no structured result to report.
+    /// `#[serde(default)]` so a decision missing this field entirely
+    /// (every existing caller, and any local model that doesn't emit it)
+    /// still deserializes.
+    #[serde(default)]
+    pub extracted_data: Option<serde_json::Value>,
 }
 
 /// Model-neutral tool-loop turn. Models with native function calling are
@@ -2866,6 +2875,7 @@ mod tests {
             value: None,
             done_summary: None,
             question: None,
+            extracted_data: None,
         };
         loop_state.apply_decision(&click).unwrap();
         loop_state.record("click", "opened search");
@@ -2881,6 +2891,7 @@ mod tests {
             value: None,
             done_summary: None,
             question: None,
+            extracted_data: None,
         };
         handoff.apply_decision(&decision).unwrap();
         assert!(matches!(handoff.state, AgentLoopState::HandedOff(_)));

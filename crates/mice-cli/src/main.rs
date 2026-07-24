@@ -103,6 +103,7 @@ fn main() {
         Some("native-host") => native_host(),
         Some("setup-browser") => setup_browser(),
         Some("autopilot") => autopilot(),
+        Some("autopilot-multi") => autopilot_multi(),
         Some("start") => start(),
         Some("stop") => stop(),
         Some("route") => route_preview(),
@@ -136,7 +137,7 @@ fn usage() -> Result<(), Box<dyn std::error::Error>> {
         "\nAsk and screen\n  mice ask [--action <preset>] <instruction>\n  mice see [--display|--sheet] <question>\n  mice history [query] | mice history --clear | mice plans\n  mice actions | route"
     );
     println!(
-        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
+        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice autopilot-multi <goal>  (splits a goal across several sites, one subprocess per site)\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
     );
     println!(
         "\nIntegrations\n  mice connect <codex|claude|all> [--yes]\n  mice disconnect <codex|claude|all> [--yes]\n  mice integrations\n  mice mcp-server | mice mcp <list|call>"
@@ -1824,6 +1825,7 @@ fn handoff_decision(message: &str) -> AgentDecision {
         value: None,
         done_summary: None,
         question: None,
+        extracted_data: None,
     }
 }
 
@@ -1876,6 +1878,251 @@ fn setup_browser() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A goal decomposed into independent per-site sub-goals by one
+/// lightweight local model call (`decompose_multi_site_goal`). Each
+/// sub-goal must be fully self-contained — no sub-goal may depend on
+/// another's result — since M19c dispatches them as entirely separate
+/// `mice autopilot` subprocesses with no shared context.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MultiSitePlan {
+    pub sites: Vec<SubGoal>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubGoal {
+    pub url_hint: Option<String>,
+    pub sub_goal: String,
+}
+
+const MAX_MULTI_SITE_SUBGOALS: usize = 20;
+const MAX_SUBGOAL_CHARS: usize = 300;
+
+fn decompose_multi_site_goal(
+    config: &mice_core::Config,
+    goal: &str,
+) -> Result<MultiSitePlan, Box<dyn std::error::Error>> {
+    let instruction = format!(
+        "Break this goal down into a list of independent sub-goals, one per website that needs to be visited. Each sub-goal must be fully self-contained — a complete instruction on its own, mentioning the specific site if known — and must NOT depend on any other sub-goal's result, since each one runs separately with no shared context. Return only JSON: {{\"sites\": [{{\"url_hint\": string or null, \"sub_goal\": string}}, ...]}}. Produce at most {MAX_MULTI_SITE_SUBGOALS} sub-goals."
+    );
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "sites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "url_hint": { "type": ["string", "null"] },
+                        "sub_goal": { "type": "string" }
+                    },
+                    "required": ["sub_goal"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["sites"],
+        "additionalProperties": false
+    });
+    let mut output = String::new();
+    stream_ollama_with_format(
+        &config.tool_model,
+        &instruction,
+        Some(goal),
+        Some(schema),
+        |chunk| {
+            output.push_str(chunk);
+            Ok(())
+        },
+    )?;
+    serde_json::from_str(extract_json_object(&output)).map_err(|error| {
+        format!("Could not break the goal down into per-site sub-goals: {error}; output: {}", bounded_for_model(&output, 1_000)).into()
+    })
+}
+
+/// Deterministic, pre-flight validation before scheduling anything —
+/// mirrors `MissionTaskGraph::validate()`'s validate-before-schedule shape
+/// (`crates/mice-core/src/lib.rs`), but deliberately has no dependency-graph
+/// or cycle logic: M19c's sub-goals are required to be independent by
+/// construction, which is exactly what makes running each as a separate,
+/// isolated subprocess safe.
+fn validate_multi_site_plan(plan: &MultiSitePlan) -> Result<(), Box<dyn std::error::Error>> {
+    if plan.sites.is_empty() {
+        return Err("The goal could not be broken down into any sites to visit.".into());
+    }
+    if plan.sites.len() > MAX_MULTI_SITE_SUBGOALS {
+        return Err(format!(
+            "Too many sub-goals ({}, max {MAX_MULTI_SITE_SUBGOALS}) — narrow the goal.",
+            plan.sites.len()
+        )
+        .into());
+    }
+    for (index, sub) in plan.sites.iter().enumerate() {
+        if sub.sub_goal.trim().is_empty() {
+            return Err(format!("Sub-goal {index} is empty.").into());
+        }
+        if sub.sub_goal.chars().count() > MAX_SUBGOAL_CHARS {
+            return Err(format!(
+                "Sub-goal {index} is too long (max {MAX_SUBGOAL_CHARS} characters) — narrow it."
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+pub fn site_result_path(job_id: &str, site_index: usize) -> PathBuf {
+    job_dir(job_id).join(format!("site-{site_index}-result.json"))
+}
+
+/// Pure aggregation over already-loaded results — deliberately takes
+/// `&[SiteResult]` rather than reading `jobs_dir()` itself, so the
+/// aggregation logic is unit-testable without touching the filesystem;
+/// `autopilot_multi` is the thin, untested-by-unit-test wrapper that reads
+/// the files and calls this.
+pub fn aggregate_site_results(goal: &str, results: &[SiteResult]) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = results
+        .iter()
+        .map(|result| {
+            serde_json::json!({
+                "site_index": result.site_index,
+                "sub_goal": result.sub_goal,
+                "format": result.format,
+                "data": result.data,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "goal": goal,
+        "result_count": entries.len(),
+        "results": entries,
+    })
+}
+
+fn autopilot_multi() -> Result<(), Box<dyn std::error::Error>> {
+    let goal = env::args().skip(2).collect::<Vec<_>>().join(" ");
+    if goal.trim().is_empty() {
+        return Err(
+            "Provide a goal, for example: mice autopilot-multi \"search 3 restaurant review sites for X and collect one fact from each\""
+                .into(),
+        );
+    }
+    let config = config()?;
+    let plan = decompose_multi_site_goal(&config, &goal)?;
+    validate_multi_site_plan(&plan)?;
+
+    let job_id = format!("job-{}", unix_timestamp());
+    let now = unix_timestamp();
+    let sites: Vec<SiteProgress> = plan
+        .sites
+        .iter()
+        .enumerate()
+        .map(|(index, sub)| SiteProgress {
+            site_index: index,
+            sub_goal: sub.sub_goal.clone(),
+            status: SiteStatus::Pending,
+            result_path: None,
+            attempts: 0,
+            last_error: None,
+        })
+        .collect();
+    save_job_progress(&JobProgress {
+        job_id: job_id.clone(),
+        goal: goal.clone(),
+        created_at: now,
+        updated_at: now,
+        sites,
+    })?;
+    println!(
+        "MICE: Starting multi-site job {job_id} with {} site(s).",
+        plan.sites.len()
+    );
+
+    // Serial, deliberately not parallel: axi_chrome_profile_dir() is a
+    // single shared, persistent Chrome profile directory, and two Chrome
+    // instances cannot safely share one --userDataDir (this is exactly
+    // the profile-lock collision bug fixed earlier this session — true
+    // parallel dispatch would reintroduce it). Parallel dispatch is a
+    // stated non-goal until that directory is parameterized per job/site.
+    let current_exe = env::current_exe()?;
+    for (index, sub) in plan.sites.iter().enumerate() {
+        println!(
+            "MICE: [{}/{}] {}",
+            index + 1,
+            plan.sites.len(),
+            sub.sub_goal
+        );
+        let result_path = site_result_path(&job_id, index);
+        let status = Command::new(&current_exe)
+            .args([
+                "autopilot",
+                "--engine",
+                "axi",
+                "--job-id",
+                &job_id,
+                "--site-index",
+                &index.to_string(),
+                "--result-file",
+                &result_path.display().to_string(),
+                &sub.sub_goal,
+            ])
+            .status();
+        // Child::wait() (via .status()) returns reliably regardless of how
+        // the child died — normal exit, panic, or SIGKILL — unlike
+        // JobProgressGuard's own Drop, which cannot observe a SIGKILL at
+        // all (confirmed live: no process can intercept it). The
+        // orchestrator, which *can* reliably observe subprocess exit, is
+        // the actual authority for reconciling that specific case.
+        match status {
+            Ok(_) => {
+                let still_in_progress = load_job_progress(&job_id)
+                    .and_then(|progress| progress.sites.get(index).cloned())
+                    .is_some_and(|site| site.status == SiteStatus::InProgress);
+                if still_in_progress {
+                    let _ = update_job_site_status(
+                        &job_id,
+                        index,
+                        SiteStatus::Crashed,
+                        None,
+                        Some("subprocess exited without finalizing its status".into()),
+                    );
+                }
+            }
+            Err(error) => {
+                let _ = update_job_site_status(
+                    &job_id,
+                    index,
+                    SiteStatus::Failed,
+                    None,
+                    Some(format!("could not launch subprocess: {error}")),
+                );
+            }
+        }
+    }
+
+    let final_progress = load_job_progress(&job_id);
+    let results: Vec<SiteResult> = final_progress
+        .as_ref()
+        .map(|progress| {
+            progress
+                .sites
+                .iter()
+                .filter_map(|site| site.result_path.as_ref())
+                .filter_map(|path| load_site_result(Path::new(path)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let aggregate = aggregate_site_results(&goal, &results);
+    let aggregate_path = job_dir(&job_id).join("aggregate.json");
+    std::fs::write(&aggregate_path, serde_json::to_vec_pretty(&aggregate)?)?;
+    println!(
+        "MICE: Job {job_id} complete. {} of {} site(s) produced a result. Aggregate written to {}.",
+        results.len(),
+        plan.sites.len(),
+        aggregate_path.display()
+    );
+    Ok(())
+}
+
 /// Extracts a `--flag value` pair from anywhere in `arguments` (not just the
 /// front, unlike `--engine`'s existing parsing), removing both tokens so
 /// the remainder can still be joined into the goal text unaffected.
@@ -1897,8 +2144,13 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
     let job_context = match (
         extract_flag_value(&mut arguments, "--job-id"),
         extract_flag_value(&mut arguments, "--site-index").and_then(|value| value.parse::<usize>().ok()),
+        extract_flag_value(&mut arguments, "--result-file"),
     ) {
-        (Some(job_id), Some(site_index)) => Some(JobContext { job_id, site_index }),
+        (Some(job_id), Some(site_index), Some(result_file)) => Some(JobContext {
+            job_id,
+            site_index,
+            result_file: PathBuf::from(result_file),
+        }),
         _ => None,
     };
     let engine = if arguments
@@ -1940,6 +2192,8 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
     // *any* later exit path still marks this site Crashed rather than
     // leaving it looking InProgress forever to an orchestrator reading
     // the job file (see JobProgressGuard's own Drop impl).
+    let result_file = job_context.as_ref().map(|context| context.result_file.clone());
+    let site_index = job_context.as_ref().map(|context| context.site_index);
     let mut job_progress_guard =
         job_context.map(|context| JobProgressGuard::new(context.job_id, context.site_index));
     
@@ -2383,8 +2637,35 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
                                         .as_deref()
                                         .unwrap_or("The requested step is complete.")
                                 );
-                                if let Some(guard) = job_progress_guard.as_mut() {
-                                    guard.mark_done(None);
+                                if let (Some(guard), Some(path), Some(index)) = (
+                                    job_progress_guard.as_mut(),
+                                    result_file.as_ref(),
+                                    site_index,
+                                ) {
+                                    let (format, data) = match decision.extracted_data.clone() {
+                                        Some(value) => (ResultFormat::Structured, value),
+                                        None => (
+                                            ResultFormat::Unstructured,
+                                            serde_json::Value::String(
+                                                decision
+                                                    .done_summary
+                                                    .clone()
+                                                    .unwrap_or_else(|| "done".to_string()),
+                                            ),
+                                        ),
+                                    };
+                                    let site_result = SiteResult {
+                                        site_index: index,
+                                        sub_goal: goal.to_string(),
+                                        format,
+                                        data,
+                                    };
+                                    match save_site_result(path, &site_result) {
+                                        Ok(()) => guard.mark_done(Some(path.display().to_string())),
+                                        Err(error) => guard.mark_failed(format!(
+                                            "could not write result file: {error}"
+                                        )),
+                                    }
                                 }
                             },
                             AgentAction::AskUser => {
@@ -2738,6 +3019,7 @@ impl Drop for AxiSessionGuard {
 struct JobContext {
     job_id: String,
     site_index: usize,
+    result_file: PathBuf,
 }
 
 pub fn jobs_dir() -> PathBuf {
@@ -2781,6 +3063,43 @@ pub enum SiteStatus {
     Done,
     Failed,
     Crashed,
+}
+
+/// One site's result from a multi-site job, written by that site's own
+/// `mice autopilot` subprocess to its own file — never returned through
+/// any model's context, per the MACU-style "external scratchpad" pattern
+/// (plan/auto_intelligence.md §2.3). One file per site, mirroring the
+/// existing file-per-recipe convention, rather than a single shared
+/// append-only log multiple processes would need to coordinate writes to.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SiteResult {
+    pub site_index: usize,
+    pub sub_goal: String,
+    pub format: ResultFormat,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultFormat {
+    /// The model populated `extracted_data` directly.
+    Structured,
+    /// No `extracted_data`; `data` wraps `done_summary` as plain text so a
+    /// result is never silently lost even when the model didn't structure it.
+    Unstructured,
+}
+
+pub fn save_site_result(path: &Path, result: &SiteResult) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(result)?;
+    std::fs::write(path, bytes)
+}
+
+pub fn load_site_result(path: &Path) -> Option<SiteResult> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 fn unix_timestamp() -> u64 {
@@ -3222,7 +3541,7 @@ fn call_axi_agent_turn(
 ) -> Result<AgentDecision, Box<dyn std::error::Error>> {
     let output = if lane == ExecutionLane::Local {
         let mut output = String::new();
-        let mut instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing. Only choose action 'done' once every concrete part of the goal is actually finished: if the goal says to search, fill, or extract something, navigating to the right page or clicking around it is not done by itself — the search/fill/extraction has to have actually happened. If unsure whether the goal is fully met yet, take the next concrete step toward it instead of declaring done.".to_string();
+        let mut instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question, extracted_data. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing. Only choose action 'done' once every concrete part of the goal is actually finished: if the goal says to search, fill, or extract something, navigating to the right page or clicking around it is not done by itself — the search/fill/extraction has to have actually happened. If the goal asks you to find or extract specific information, set extracted_data to that information (as a short JSON object or plain string) when you choose action 'done'; leave it null otherwise. If unsure whether the goal is fully met yet, take the next concrete step toward it instead of declaring done.".to_string();
         if !negative_constraint_rules.is_empty() {
             instruction.push_str(
                 "\n\nThings already tried for this goal that did NOT help — do not repeat them: ",
@@ -3243,7 +3562,8 @@ fn call_axi_agent_turn(
                 "url": { "type": ["string", "null"] },
                 "value": { "type": ["string", "null"] },
                 "done_summary": { "type": ["string", "null"] },
-                "question": { "type": ["string", "null"] }
+                "question": { "type": ["string", "null"] },
+                "extracted_data": { "type": ["object", "string", "null"] }
             },
             "required": ["say_to_user", "action"],
             "additionalProperties": false
@@ -10047,6 +10367,7 @@ mod hover_tests {
             ),
             done_summary: None,
             question: None,
+            extracted_data: None,
         };
         assert!(validate_agent_decision(&corrupted).is_err());
 
@@ -10058,6 +10379,7 @@ mod hover_tests {
             value: Some("James Webb Space Telescope".into()),
             done_summary: None,
             question: None,
+            extracted_data: None,
         };
         assert!(validate_agent_decision(&clean).is_ok());
     }
@@ -10549,5 +10871,99 @@ mod recipe_matching_tests {
         // perfectly-similar-embedding fact from a different site.
         let unrelated_observation = "page:\n  url: \"https://example.org/\"\nsnapshot:\n";
         assert!(matching_knowledge_facts(unrelated_observation, &goal_embedding, &snippets).is_empty());
+    }
+
+    fn sub_goal(text: &str) -> SubGoal {
+        SubGoal {
+            url_hint: None,
+            sub_goal: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_multi_site_plan_rejects_an_empty_plan() {
+        let plan = MultiSitePlan { sites: vec![] };
+        let error = validate_multi_site_plan(&plan).unwrap_err();
+        assert!(error.to_string().contains("could not be broken down"));
+    }
+
+    #[test]
+    fn validate_multi_site_plan_rejects_more_than_the_cap() {
+        let sites = (0..MAX_MULTI_SITE_SUBGOALS + 1)
+            .map(|i| sub_goal(&format!("visit site {i}")))
+            .collect();
+        let plan = MultiSitePlan { sites };
+        let error = validate_multi_site_plan(&plan).unwrap_err();
+        assert!(error.to_string().contains("Too many sub-goals"));
+    }
+
+    #[test]
+    fn validate_multi_site_plan_rejects_an_empty_sub_goal() {
+        let plan = MultiSitePlan {
+            sites: vec![sub_goal("visit example.com"), sub_goal("   ")],
+        };
+        let error = validate_multi_site_plan(&plan).unwrap_err();
+        assert!(error.to_string().contains("Sub-goal 1 is empty"));
+    }
+
+    #[test]
+    fn validate_multi_site_plan_rejects_an_overlong_sub_goal() {
+        let plan = MultiSitePlan {
+            sites: vec![sub_goal(&"x".repeat(MAX_SUBGOAL_CHARS + 1))],
+        };
+        let error = validate_multi_site_plan(&plan).unwrap_err();
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn validate_multi_site_plan_accepts_a_well_formed_plan() {
+        let plan = MultiSitePlan {
+            sites: vec![sub_goal("visit example.com and find the price"), sub_goal("visit example.org and find the price")],
+        };
+        assert!(validate_multi_site_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn aggregate_site_results_collects_every_result_with_no_dedup_or_folding() {
+        let results = vec![
+            SiteResult {
+                site_index: 0,
+                sub_goal: "find the price on example.com".into(),
+                format: ResultFormat::Structured,
+                data: serde_json::json!({"price": "$12"}),
+            },
+            SiteResult {
+                site_index: 1,
+                sub_goal: "find the price on example.org".into(),
+                format: ResultFormat::Unstructured,
+                data: serde_json::Value::String("done".into()),
+            },
+        ];
+        let aggregate = aggregate_site_results("find prices on two sites", &results);
+        assert_eq!(aggregate["goal"], "find prices on two sites");
+        assert_eq!(aggregate["result_count"], 2);
+        let entries = aggregate["results"].as_array().expect("results array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["site_index"], 0);
+        assert_eq!(entries[0]["data"]["price"], "$12");
+        assert_eq!(entries[1]["site_index"], 1);
+        assert_eq!(entries[1]["data"], "done");
+    }
+
+    #[test]
+    fn aggregate_site_results_on_an_empty_slice_reports_zero_results_not_a_panic() {
+        let aggregate = aggregate_site_results("nothing to collect", &[]);
+        assert_eq!(aggregate["result_count"], 0);
+        assert!(aggregate["results"].as_array().expect("results array").is_empty());
+    }
+
+    #[test]
+    fn site_result_path_is_scoped_under_the_jobs_directory_and_named_by_index() {
+        let path = site_result_path("job-1234", 2);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("site-2-result.json")
+        );
+        assert!(path.to_string_lossy().contains("job-1234"));
     }
 }
