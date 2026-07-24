@@ -137,9 +137,17 @@ impl BrowserSnapshot {
                     };
                     targets.entry(uid.into()).or_insert_with(|| BrowserTarget {
                         context,
-                        role: line
+                        // A real snapshot line is `uid=<id> <role> "<label>"
+                        // [attrs...]` (uid first, confirmed against live
+                        // chrome-devtools-axi output) - taking the line's
+                        // first token unconditionally previously stored the
+                        // literal `uid=...` marker as "role" on every
+                        // target. Skip any uid= token(s) and take the first
+                        // real one instead; this is also correct for a
+                        // role-first line, so it covers both orderings.
+                        role: structural
                             .split_whitespace()
-                            .next()
+                            .find(|token| !token.starts_with("uid="))
                             .unwrap_or_default()
                             .to_ascii_lowercase(),
                         input_type: snapshot_attribute(structural, "type"),
@@ -181,28 +189,31 @@ impl BrowserSnapshot {
         })
     }
 
-    /// Stable (role, label) fingerprint for a target, used to re-resolve a
-    /// recorded recipe step against a freshly loaded page. A uid alone is
-    /// only meaningful within the snapshot generation it came from (see
-    /// `resolve_current_uid`'s note on chrome-devtools-axi's generation
-    /// counter); this is the anchor a recipe carries across sessions
-    /// instead. `context` is the raw
-    /// snapshot line and therefore still contains this session's own
-    /// `uid=...` marker (see the `multiline`/`escaped_newline` tests below
-    /// for why `context` itself must stay raw) — strip it here so the
-    /// fingerprint doesn't trivially fail to match across sessions.
+    /// Stable (role, accessible-name) fingerprint for a target, used to
+    /// re-resolve a recorded recipe step — or a proposed action's target —
+    /// against a freshly loaded page. A uid alone is only meaningful within
+    /// the snapshot generation it came from (see `resolve_current_uid`'s
+    /// note on chrome-devtools-axi's generation counter); this is the
+    /// anchor a recipe (or a live re-verification) carries across
+    /// generations instead. `context` is the raw snapshot line, which also
+    /// carries the uid marker and any other attributes (`haspopup=`,
+    /// `url=`, ...) alongside the label (see the `multiline`/
+    /// `escaped_newline` tests below for why `context` itself must stay
+    /// raw) — `accessible_label` pulls out just the quoted label text so
+    /// the fingerprint neither embeds this session's own uid nor breaks on
+    /// an unrelated attribute changing between snapshots.
     pub fn identity_of(&self, uid: &str) -> Option<(String, String)> {
         self.target(uid)
-            .map(|target| (target.role.clone(), label_without_uid(&target.context)))
+            .map(|target| (target.role.clone(), accessible_label(&target.context)))
     }
 
-    /// Find the current uid for a target last seen with this (role, label)
-    /// fingerprint. Returns the first match; ambiguous duplicates are a
-    /// known limitation of anchor-based matching.
+    /// Find the current uid for a target last seen with this (role,
+    /// accessible-name) fingerprint. Returns the first match; ambiguous
+    /// duplicates are a known limitation of anchor-based matching.
     pub fn find_uid_by_identity(&self, role: &str, label: &str) -> Option<String> {
         self.targets
             .iter()
-            .find(|(_, target)| target.role == role && label_without_uid(&target.context) == label)
+            .find(|(_, target)| target.role == role && accessible_label(&target.context) == label)
             .map(|(uid, _)| uid.clone())
     }
 
@@ -337,16 +348,40 @@ fn quoted_span_state(line: &str, mut in_quote: bool) -> bool {
     in_quote
 }
 
-/// Strip a trailing `uid=...` marker from a target's raw context line, for
-/// building a cross-session identity fingerprint only. Uses the *last*
-/// occurrence so a malicious label that itself contains literal `uid=`
-/// text (see `page_controlled_labels_cannot_forge_safe_inputs_or_targets`)
-/// stays part of the label rather than being mistaken for the real marker.
-fn label_without_uid(context: &str) -> String {
-    match context.rfind("uid=") {
-        Some(index) => context[..index].trim().to_string(),
-        None => context.trim().to_string(),
+/// Pull out just the first double-quoted span from a target's raw context
+/// line(s), for building a cross-session identity fingerprint. `context`
+/// always carries the uid marker (a real chrome-devtools-axi line is
+/// `uid=<id> <role> "<label>" [attrs...]` — uid *first*, confirmed against
+/// live output) plus any other attributes alongside the label, so an
+/// uid=-position-dependent strip (stripping only a trailing or only a
+/// leading marker) is fragile in one direction or the other; extracting
+/// the quoted span directly sidesteps uid position entirely and also
+/// keeps the fingerprint stable when an unrelated attribute (`haspopup=`,
+/// `aria-expanded=`, ...) changes between snapshots but the label itself
+/// does not. Honors backslash-escaping the same way `strip_quoted_spans`
+/// does, for the same reason: a label cannot use an escaped quote to
+/// truncate itself early.
+fn accessible_label(context: &str) -> String {
+    let mut label = String::new();
+    let mut in_quote = false;
+    let mut escaped = false;
+    for character in context.chars() {
+        if in_quote {
+            if escaped {
+                label.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                break;
+            } else {
+                label.push(character);
+            }
+        } else if character == '"' {
+            in_quote = true;
+        }
     }
+    label
 }
 
 fn snapshot_attribute(line: &str, name: &str) -> Option<String> {
@@ -1790,17 +1825,27 @@ mod tests {
 
     #[test]
     fn recipe_replay_resolves_a_stale_uid_by_role_and_accessible_name() {
-        let taught = BrowserSnapshot::from_axi_output("button \"Search\" uid=g0:5");
+        // Real chrome-devtools-axi lines are uid-*first*: `uid=<id> <role>
+        // "<label>" [attrs...]` (confirmed against live output — a role-first
+        // fixture would hide a role-parsing regression, since a naive
+        // "first whitespace token" parse happens to look correct on that
+        // ordering but not on the real one).
+        let taught = BrowserSnapshot::from_axi_output("uid=g0:5 button \"Search\"");
         let identity = taught.identity_of("g0:5").unwrap();
+        assert_eq!(identity.0, "button");
         // The identity fingerprint must not embed this session's own uid
         // (unlike `context`, which deliberately stays raw for display).
-        assert_eq!(identity, ("button".to_string(), "button \"Search\"".to_string()));
+        assert_eq!(identity, ("button".to_string(), "Search".to_string()));
         assert!(!identity.1.contains("g0:5"));
 
         // A different session assigns a different uid to the same logical
-        // control. Replay must re-resolve by (role, accessible name), not
-        // by reusing the uid recorded in a prior session.
-        let replayed_page = BrowserSnapshot::from_axi_output("button \"Search\" uid=g2:91");
+        // control, and an unrelated attribute the label never had is now
+        // present too. Replay must re-resolve by (role, accessible name),
+        // not by reusing the uid recorded in a prior session, and must not
+        // be thrown off by an attribute change that has nothing to do with
+        // the label itself.
+        let replayed_page =
+            BrowserSnapshot::from_axi_output("uid=g2:91 button \"Search\" haspopup=\"menu\"");
         assert_eq!(
             replayed_page.find_uid_by_identity(&identity.0, &identity.1),
             Some("g2:91".to_string())
@@ -1809,7 +1854,7 @@ mod tests {
 
         // No control with that identity on this page: replay must report a
         // miss rather than silently matching something else.
-        let redesigned_page = BrowserSnapshot::from_axi_output("button \"Go\" uid=g3:1");
+        let redesigned_page = BrowserSnapshot::from_axi_output("uid=g3:1 button \"Go\"");
         assert_eq!(
             redesigned_page.find_uid_by_identity(&identity.0, &identity.1),
             None
@@ -1817,25 +1862,49 @@ mod tests {
     }
 
     #[test]
+    fn role_is_parsed_correctly_when_uid_comes_before_the_role_token() {
+        // The specific regression this guards: `role` used to be "the
+        // line's first whitespace token", which silently became the
+        // literal `uid=...` marker on real, uid-first snapshot lines
+        // instead of the actual role - breaking every role-based check
+        // (identity matching, `looks_like_input`, the button-context
+        // fallback in `blocked_browser_action`) without ever failing loudly.
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "uid=g5:3_6 button \"Main menu\" haspopup=\"menu\"",
+        );
+        let target = snapshot.target("g5:3_6").unwrap();
+        assert_eq!(target.role, "button");
+        assert_eq!(accessible_label(&target.context), "Main menu");
+    }
+
+    #[test]
     fn resolve_current_uid_survives_an_incidental_generation_bump() {
         // chrome-devtools-axi bumps its generation counter (the uid's `g<N>:`
         // prefix) on *any* page mutation, not just ones affecting the
         // proposed target - simulated here by the same element reappearing
-        // under a new prefix while its role/label are unchanged.
-        let proposed = BrowserSnapshot::from_axi_output("link \"Jump to content\" uid=g9:3_2");
+        // under a new prefix while its role/label are unchanged. Fixtures
+        // use the real uid-first line format, and vary an unrelated
+        // attribute the way an actual re-render would (see the reproduction
+        // this is modeled on: MICE looping on Wikipedia's "Main menu"
+        // button because attribute noise defeated the identity match).
+        let proposed =
+            BrowserSnapshot::from_axi_output("uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"");
         let call = ToolCall {
             name: "browser.click".into(),
             args: json!({"uid": "g9:3_2"}),
         };
 
-        let unrelated_mutation = BrowserSnapshot::from_axi_output("link \"Jump to content\" uid=g11:3_2");
+        let unrelated_mutation = BrowserSnapshot::from_axi_output(
+            "uid=g11:3_2 link \"Jump to content\" url=\"#bodyContent\" data-rev=\"7\"",
+        );
         assert_eq!(
             proposed.resolve_current_uid(&unrelated_mutation, &call),
             TargetResolution::Resolved("g11:3_2".to_string())
         );
 
         // Nothing changed at all: the exact-match fast path still applies.
-        let unchanged = BrowserSnapshot::from_axi_output("link \"Jump to content\" uid=g9:3_2");
+        let unchanged =
+            BrowserSnapshot::from_axi_output("uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"");
         assert_eq!(
             proposed.resolve_current_uid(&unchanged, &call),
             TargetResolution::Resolved("g9:3_2".to_string())
@@ -1843,7 +1912,8 @@ mod tests {
 
         // The element itself is genuinely gone: must report Gone, not
         // silently match an unrelated control.
-        let real_change = BrowserSnapshot::from_axi_output("button \"Main menu\" uid=g11:9_1");
+        let real_change =
+            BrowserSnapshot::from_axi_output("uid=g11:9_1 button \"Main menu\" haspopup=\"menu\"");
         assert_eq!(
             proposed.resolve_current_uid(&real_change, &call),
             TargetResolution::Gone
