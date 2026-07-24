@@ -94,6 +94,7 @@ struct BrowserTarget {
     input_type: Option<String>,
     autocomplete: Option<String>,
     form_state: Option<String>,
+    value: Option<String>,
 }
 
 impl BrowserSnapshot {
@@ -153,6 +154,19 @@ impl BrowserSnapshot {
                         input_type: snapshot_attribute(structural, "type"),
                         autocomplete: snapshot_attribute(structural, "autocomplete"),
                         form_state: snapshot_attribute(structural, "form"),
+                        // Unlike the other attributes above, `value=` is
+                        // itself double-quoted and can legitimately
+                        // contain spaces/mixed case ("James Webb Space
+                        // Telescope") - snapshot_attribute's
+                        // whitespace-splitting would truncate it to one
+                        // lowercased word, and `structural` has already
+                        // had quoted spans blanked out by
+                        // strip_quoted_spans (correct for treating a
+                        // page-controlled *label* as untrusted, but this
+                        // is a real structural attribute that happens to
+                        // reuse the quote character) - read it from the
+                        // raw `line` with its own quote-aware extraction.
+                        value: snapshot_quoted_value(line, "value"),
                     });
                 }
             }
@@ -265,6 +279,19 @@ impl BrowserSnapshot {
             Some(resolved) => TargetResolution::Resolved(resolved),
             None => TargetResolution::Gone,
         }
+    }
+
+    /// Whether a target already holds exactly the value a `fill` is about
+    /// to write. Confirmed live: without this, a fill that already
+    /// succeeded looked identical to one that hadn't happened yet (the
+    /// model has no way to tell them apart just from being asked to fill
+    /// again), so gemma3:4b re-filled the same already-correct search box
+    /// three more times in a row instead of pressing Enter/clicking
+    /// Search, burning its whole action budget without ever submitting.
+    pub fn already_has_value(&self, uid: &str, requested: &str) -> bool {
+        self.target(uid)
+            .and_then(|target| target.value.as_deref())
+            .is_some_and(|current| current == requested)
     }
 }
 
@@ -396,6 +423,19 @@ fn snapshot_attribute(line: &str, name: &str) -> Option<String> {
         .unwrap_or_default()
         .trim();
     (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
+/// Extract a double-quoted attribute value verbatim (case and internal
+/// spaces preserved), unlike `snapshot_attribute` which is only correct
+/// for single-token attributes. Used for `value=`, which can legitimately
+/// be an entire typed phrase.
+fn snapshot_quoted_value(line: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=\"");
+    let start = line.find(&prefix)?.checked_add(prefix.len())?;
+    let rest = line.get(start..)?;
+    let end = rest.find('"')?;
+    let value = &rest[..end];
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1802,6 +1842,24 @@ mod tests {
             .text,
             "filled"
         );
+    }
+
+    #[test]
+    fn already_has_value_detects_a_redundant_fill() {
+        // The exact live reproduction: after a fill succeeds, the same
+        // field reappears in the next snapshot already carrying the
+        // requested text - re-proposing the identical fill should be
+        // recognized as redundant, not indistinguishable from a fresh one.
+        let filled = BrowserSnapshot::from_axi_output(
+            "uid=g10:9_1 combobox \"Search Wikipedia\" value=\"James Webb Space Telescope\"",
+        );
+        assert!(filled.already_has_value("g10:9_1", "James Webb Space Telescope"));
+        assert!(!filled.already_has_value("g10:9_1", "something else"));
+        assert!(!filled.already_has_value("g10:9_1", "james webb space telescope")); // case-sensitive
+        assert!(!filled.already_has_value("nonexistent", "James Webb Space Telescope"));
+
+        let empty = BrowserSnapshot::from_axi_output("uid=g10:9_1 combobox \"Search Wikipedia\"");
+        assert!(!empty.already_has_value("g10:9_1", "James Webb Space Telescope"));
     }
 
     #[test]

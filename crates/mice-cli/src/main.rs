@@ -2343,6 +2343,32 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             }
+            // A fill whose target already holds exactly the requested
+            // value is a no-op the model can't otherwise tell apart from
+            // one that hasn't happened yet — confirmed live: gemma3:4b
+            // re-filled Wikipedia's already-correct search box three more
+            // times in a row instead of clicking Search, burning its
+            // whole action budget without ever submitting. The model's
+            // own action vocabulary has no explicit "press Enter"/submit
+            // — only click/fill/open_url/scroll — so the concrete nudge
+            // has to be "click the search/submit control", not "press
+            // Enter".
+            if call.name == "browser.fill"
+                && let (Some(uid), Some(requested)) = (
+                    call.args.get("uid").and_then(Value::as_str),
+                    call.args.get("text").and_then(Value::as_str),
+                )
+                && current.snapshot.already_has_value(uid, requested)
+            {
+                history.push(format!(
+                    "{} already holds the requested value; click the search/submit control next instead of filling it again.",
+                    describe_action_for_history(&call, &current.snapshot)
+                ));
+                println!(
+                    "MICE: That field already has the right value — no need to fill it again. Deciding the next step instead."
+                );
+                continue;
+            }
             // execute_verified_browser_action's target/sensitivity checks
             // are specifically for Mutating actions and it refuses any
             // ToolKind::ReadOnly call outright (confirmed live: this broke
