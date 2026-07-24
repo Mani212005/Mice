@@ -1928,6 +1928,18 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
         session_name: format!("mice-autopilot-{}", std::process::id()),
         output_budget_tokens: tools::DEFAULT_RETURN_TOKENS,
     };
+    // The bridge (and the Chrome instance it launches) must be torn down
+    // when this run ends, on every exit path — a leaked one holds an
+    // OS-level lock on the shared persistent profile directory
+    // (axi_chrome_profile_dir), which silently breaks every *subsequent*
+    // invocation: it either fails outright to launch its own Chrome, or
+    // ends up observing whatever stale, unrelated tab the leaked process
+    // was left on. An RAII guard rather than a cleanup call before each
+    // `return` so a future new early-return can't reintroduce the leak.
+    let _axi_session_guard = AxiSessionGuard {
+        session_name: context.session_name.clone(),
+        working_dir: context.working_dir.clone(),
+    };
     let primary_lane = axi_model_lane(&config, local_tool_model_available(&config, &runner))?;
     println!("MICE AXI guide: {goal}");
     println!(
@@ -1958,6 +1970,7 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut goal_embedding: Option<Vec<f32>> = None;
     let mut active_recipe_steps: Vec<RecipeStep> = Vec::new();
     let mut current_sequence: Vec<RecipeStep> = Vec::new();
+    let mut tried_goal_navigation_shortcut = false;
 
     while fresh_actions < AXI_FRESH_DECISION_LIMIT
         || (replay_actions < AXI_REPLAY_ACTION_LIMIT && !active_recipe_steps.is_empty())
@@ -2011,7 +2024,33 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let (mut call, is_replay) = if let Some(recipe_step) = active_recipe_steps.pop() {
+            let goal_navigation_url = if tried_goal_navigation_shortcut {
+                None
+            } else {
+                tried_goal_navigation_shortcut = true;
+                goal_navigation_shortcut(goal, &observed.text)
+            };
+
+            let (mut call, is_replay) = if let Some(url) = goal_navigation_url {
+                // The single highest-hallucination-risk decision is the
+                // very first one: reasoning about "what to click" on a
+                // blank or unrelated starting page, where there is almost
+                // nothing to reason from (confirmed live: gemma3:4b picks
+                // the right open_url call most of the time here, but not
+                // reliably - it occasionally clicks the page's root node
+                // instead, which goes nowhere and burns the whole
+                // fresh-decision budget on retries). The goal text usually
+                // already names the destination outright, so skip asking
+                // the model to decide this one and navigate directly.
+                println!("MICE: Navigating to the site named in the goal.");
+                (
+                    ToolCall {
+                        name: "browser.open".into(),
+                        args: json!({"url": url}),
+                    },
+                    false,
+                )
+            } else if let Some(recipe_step) = active_recipe_steps.pop() {
                 // A recipe's uid only ever meant something in the snapshot
                 // generation it was recorded in (see `resolve_current_uid`'s
                 // note on chrome-devtools-axi's generation counter).
@@ -2306,6 +2345,29 @@ const AXI_MAX_CONSECUTIVE_REPLANS: u8 = 4;
 
 const AXI_LOCAL_UNCERTAINTY_LIMIT: u8 = 2;
 
+/// Stops this run's chrome-devtools-axi bridge (and the Chrome instance it
+/// launched) when dropped, so the shared persistent profile's OS-level
+/// lock is always released for the next invocation regardless of which
+/// path this function exits through.
+struct AxiSessionGuard {
+    session_name: String,
+    working_dir: PathBuf,
+}
+
+impl Drop for AxiSessionGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("npx")
+            .args(["-y", "chrome-devtools-axi", "stop"])
+            .current_dir(&self.working_dir)
+            .env_clear()
+            .envs(tools::sanitized_env(&self.session_name))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[derive(Default)]
 struct AxiActionRecovery {
     stale_retried: bool,
@@ -2552,18 +2614,27 @@ fn call_axi_agent_turn(
             "additionalProperties": false
         });
 
+        let prompt_text = format!(
+            "Goal: {goal}\n\nCurrent AXI snapshot:\n{observation}\n\nPrior actions:\n{history}"
+        );
+        if std::env::var_os("MICE_DEBUG_AXI_PROMPT").is_some() {
+            eprintln!("=== DEBUG instruction ===\n{instruction}");
+            eprintln!("=== DEBUG prompt_text ===\n{prompt_text}");
+            eprintln!("=== DEBUG schema ===\n{schema}");
+        }
         stream_ollama_with_format(
             &config.tool_model,
             instruction,
-            Some(&format!(
-                "Goal: {goal}\n\nCurrent AXI snapshot:\n{observation}\n\nPrior actions:\n{history}"
-            )),
+            Some(&prompt_text),
             Some(schema),
             |chunk| {
                 output.push_str(chunk);
                 Ok(())
             },
         )?;
+        if std::env::var_os("MICE_DEBUG_AXI_PROMPT").is_some() {
+            eprintln!("=== DEBUG raw model output ===\n{output}");
+        }
         output
     } else if is_groq_model(&config.cloud_model) {
         call_groq_agent_turn(
@@ -2591,6 +2662,65 @@ fn call_axi_agent_turn(
             )
         })?,
     )
+}
+
+/// If the goal clearly names a destination site and the current page
+/// isn't already there, return the URL to navigate to. Checked exactly
+/// once per run, on the first action, to skip asking the model to decide
+/// the single highest-hallucination-risk step. Returns None whenever it
+/// isn't confident, leaving every other case — including every action
+/// after the first — to the normal model-driven decision path.
+fn goal_navigation_shortcut(goal: &str, current_observation: &str) -> Option<String> {
+    let url = extract_goal_url(goal)?;
+    let domain = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    if current_observation.to_ascii_lowercase().contains(&domain.to_ascii_lowercase()) {
+        return None; // already there, or already navigating there
+    }
+    Some(url)
+}
+
+/// Best-effort, deterministic extraction of a URL from a goal's own text:
+/// an explicit `https://...`, or a bare domain following "go to"/"open"/
+/// "visit"/"navigate to" (e.g. "go to en.wikipedia.org and search for...").
+fn extract_goal_url(goal: &str) -> Option<String> {
+    let lower = goal.to_ascii_lowercase();
+    if let Some(start) = lower.find("http://").or_else(|| lower.find("https://")) {
+        let candidate = goal[start..]
+            .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | ','))
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(['.', ';', ':']);
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+    const TRIGGERS: [&str; 4] = ["go to ", "open ", "visit ", "navigate to "];
+    for trigger in TRIGGERS {
+        let Some(index) = lower.find(trigger) else {
+            continue;
+        };
+        let after = &goal[index + trigger.len()..];
+        let token = after
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ':'))
+            .trim_end_matches('.');
+        // A bare domain needs a dot and no scheme-illegal characters;
+        // skip anything that doesn't look like one rather than guess.
+        if token.contains('.')
+            && !token.contains('/')
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        {
+            return Some(format!("https://{token}/"));
+        }
+    }
+    None
 }
 
 fn axi_call_from_decision(
@@ -9281,5 +9411,52 @@ mod recipe_matching_tests {
     fn cosine_similarity_treats_a_zero_vector_as_no_match_not_a_panic() {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn extract_goal_url_recognizes_common_navigation_phrasing() {
+        assert_eq!(
+            extract_goal_url("go to en.wikipedia.org and search for the James Webb Space Telescope"),
+            Some("https://en.wikipedia.org/".to_string())
+        );
+        assert_eq!(
+            extract_goal_url("open google.com and search cats"),
+            Some("https://google.com/".to_string())
+        );
+        assert_eq!(
+            extract_goal_url("visit https://example.com/path?x=1 and click submit"),
+            Some("https://example.com/path?x=1".to_string())
+        );
+        assert_eq!(
+            extract_goal_url("navigate to shop.example.co.uk."),
+            Some("https://shop.example.co.uk/".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_goal_url_does_not_guess_when_nothing_looks_like_a_site() {
+        assert_eq!(extract_goal_url("summarize this page for me"), None);
+        assert_eq!(extract_goal_url("click the search button"), None);
+    }
+
+    #[test]
+    fn goal_navigation_shortcut_only_fires_once_and_not_when_already_there() {
+        let blank = "page:\n  refs: 1\nsnapshot:\nuid=g1:1_0 RootWebArea url=\"about:blank\"\n";
+        assert_eq!(
+            goal_navigation_shortcut("go to en.wikipedia.org and search", blank),
+            Some("https://en.wikipedia.org/".to_string())
+        );
+
+        let already_there =
+            "page:\n  title: \"Wikipedia\"\nsnapshot:\nuid=g1:1_0 RootWebArea url=\"https://en.wikipedia.org/wiki/Main_Page\"\n";
+        assert_eq!(
+            goal_navigation_shortcut("go to en.wikipedia.org and search", already_there),
+            None
+        );
+
+        assert_eq!(
+            goal_navigation_shortcut("click the search button", blank),
+            None
+        );
     }
 }

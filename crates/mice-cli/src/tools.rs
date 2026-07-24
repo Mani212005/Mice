@@ -887,10 +887,24 @@ fn sensitive_autocomplete(target: &BrowserTarget) -> bool {
     })
 }
 
+/// Whether a visible input makes the *page* look like it's handling
+/// sensitive data, for `page_form_context`'s "should a neutral button on
+/// this page fail closed" signal — deliberately narrower than
+/// `trusted_fill_type`, which gates directly *filling* a specific field
+/// and fails closed on any unverified type for good reason there.
+/// Reusing that same "unverified = sensitive" rule here (as a prior
+/// version of this function did) means any input whose role alone
+/// identifies it — an ARIA `searchbox`/`textbox` with no redundant
+/// `type=` attribute, which live chrome-devtools-axi output shows is the
+/// *common* case, not an edge case — silently marked the entire page
+/// Sensitive, fail-closing every unrelated button on it (confirmed live:
+/// Wikipedia's own native search box, no `type=` attribute, blocked
+/// clicking "Main menu"). A page-level sensitivity signal needs a real
+/// positive indicator instead: a flagged autocomplete hint or
+/// sensitive/code-like wording in the field's own label.
 fn input_is_sensitive(target: &BrowserTarget) -> bool {
     let context = target.context.to_ascii_lowercase();
-    !trusted_fill_type(target)
-        || sensitive_autocomplete(target)
+    sensitive_autocomplete(target)
         || SENSITIVE_FILL_TERMS
             .iter()
             .chain(CODE_LIKE_TERMS.iter())
@@ -1637,6 +1651,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("sensitive"), "{error}");
+    }
+
+    #[test]
+    fn ordinary_searchbox_without_a_type_attribute_does_not_fail_close_unrelated_buttons() {
+        // The exact live reproduction: Wikipedia's own native search box
+        // exposes role="searchbox" with no `type=` attribute at all (real
+        // chrome-devtools-axi output), and an unrelated "Main menu" button
+        // with no form metadata used to get fail-closed as a side effect,
+        // purely because the search box's type couldn't be *verified* -
+        // not because anything on the page was actually sensitive.
+        let runner = MockRunner {
+            output: "clicked".into(),
+        };
+        let context = ToolContext {
+            working_dir: PathBuf::from("."),
+            session_name: "s".into(),
+            output_budget_tokens: 300,
+        };
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "uid=g7:1_12 searchbox \"Search Wikipedia\" description=\"Search Wikipedia\"\nuid=g7:1_6 button \"Main menu\" haspopup=\"menu\"",
+        );
+        assert!(
+            execute_verified_browser_action(
+                &runner,
+                &ToolCall {
+                    name: "browser.click".into(),
+                    args: json!({"uid": "g7:1_6"}),
+                },
+                &context,
+                &snapshot,
+                true,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
