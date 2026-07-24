@@ -2401,6 +2401,18 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                     );
                     continue;
                 }
+                if is_soft_execution_refusal(&error) {
+                    consecutive_replans += 1;
+                    if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
+                        println!(
+                            "MICE paused: MICE kept refusing its own proposed actions after several attempts — it may not have a safe way to complete this goal right now. Try again, or ask for one narrower step at a time."
+                        );
+                        return Ok(());
+                    }
+                    history.push(format!("{} was refused: {error}", call.name));
+                    println!("MICE: {error} Deciding a different next step.");
+                    continue;
+                }
                 return pause_axi(goal, &history, &error);
             }
             // Uid-free by design: `call.args`/the executed action's own
@@ -2661,6 +2673,29 @@ fn is_axi_stale_error(error: &impl std::fmt::Display) -> bool {
     message.contains("stale_ref")
         || message.contains("stale ref")
         || message.contains("not in the current axi snapshot")
+}
+
+/// Whether an execution failure is a deterministic, pre-flight safety
+/// refusal from MICE's own validation (a blocked target, a malformed
+/// argument, an empty snapshot) rather than a genuine infrastructure
+/// failure (Chrome/npx/network — those are always shaped like "Could not
+/// run/wait/collect/read {program}...", "{program} timed out...", or
+/// "{program} failed: ..."). Confirmed live: a legitimate, correctly
+/// blocked action (the model targeting a plain "form" landmark for
+/// browser.fill, refused exactly as intended) was treated identically to
+/// Chrome crashing outright — killing the whole run instead of letting
+/// the model try something else, which is what should happen when the
+/// safety system does its job, not an error condition. Deliberately
+/// narrow and prefix-based rather than "everything that isn't a known
+/// infra shape": an error this doesn't recognize stays a hard pause,
+/// which is the fail-safe direction if a future new rejection message
+/// isn't listed here yet.
+fn is_soft_execution_refusal(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.starts_with("MICE will not ")
+        || message.starts_with("MICE needs a fresh AXI snapshot")
+        || message.starts_with("MICE only opens explicit http(s) URLs")
+        || message.contains("requires string argument")
 }
 
 fn pause_axi(
@@ -9316,6 +9351,33 @@ mod hover_tests {
         assert!(!is_axi_stale_error(
             &"Could not run npx: Chrome remote debugging port is unavailable"
         ));
+    }
+
+    #[test]
+    fn soft_execution_refusal_covers_every_pre_flight_rejection_but_not_infra_failures() {
+        // The exact live reproduction: a correctly blocked action (the
+        // model targeting a plain "form" landmark for browser.fill) used
+        // to be indistinguishable from Chrome crashing outright.
+        for refusal in [
+            "MICE will not fill this target: it appears to submit, authenticate, pay, file, or transfer.",
+            "MICE will not click this target: it is a button without trusted form metadata, so it could submit an unknown form.",
+            "MICE will not press Enter because it can submit an unknown form.",
+            "MICE needs a fresh AXI snapshot with target references before acting.",
+            "MICE only opens explicit http(s) URLs.",
+            "`browser.fill` requires string argument `uid`",
+        ] {
+            assert!(is_soft_execution_refusal(&refusal), "{refusal}");
+        }
+        // Genuine infrastructure failures must stay hard pauses, not get
+        // silently retried into an unbounded loop.
+        for infra_failure in [
+            "Could not run npx: No such file or directory",
+            "npx failed: Error: connect ECONNREFUSED 127.0.0.1:9224",
+            "npx timed out after 45 seconds",
+            "Could not collect npx stdout",
+        ] {
+            assert!(!is_soft_execution_refusal(&infra_failure), "{infra_failure}");
+        }
     }
 
     #[test]
