@@ -1926,7 +1926,17 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = ToolContext {
         working_dir: env::current_dir()?,
         session_name: format!("mice-autopilot-{}", std::process::id()),
-        output_budget_tokens: tools::DEFAULT_RETURN_TOKENS,
+        // DEFAULT_RETURN_TOKENS (300) is tuned for tools like repo grep;
+        // it's far too small for a real page's accessibility snapshot -
+        // confirmed live via MICE_DEBUG_AXI_PROMPT that at 300 tokens
+        // (~1200 characters), a content-rich page like Wikipedia's own
+        // main page gets cut off before reaching its search box at all,
+        // so the model was choosing among whatever survived truncation
+        // (a repeatedly-clickable "Main menu" button) rather than what
+        // the goal actually needed. gemma3:4b has a 12,000-token input
+        // budget (16,384 num_ctx) with plenty of headroom left for
+        // history/instruction/schema even at several times this size.
+        output_budget_tokens: AXI_OBSERVATION_TOKENS,
     };
     // The bridge (and the Chrome instance it launches) must be torn down
     // when this run ends, on every exit path — a leaked one holds an
@@ -2024,7 +2034,12 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let goal_navigation_url = if tried_goal_navigation_shortcut {
+            // A matched recipe's own first step already handles navigation
+            // (and more specifically than a generic domain guess would);
+            // confirmed live that without this check, the shortcut fired
+            // *in addition to* a recipe hit, producing two redundant
+            // browser.open calls to the same URL back to back.
+            let goal_navigation_url = if tried_goal_navigation_shortcut || !active_recipe_steps.is_empty() {
                 None
             } else {
                 tried_goal_navigation_shortcut = true;
@@ -2105,66 +2120,119 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     primary_lane
                 };
-                let decision = call_axi_agent_turn(&config, lane, goal, &observation, &history)?;
-                validate_agent_decision(&decision)?;
-                println!("MICE: {}", decision.say_to_user);
-
-                let Some(call) = axi_call_from_decision(&decision)? else {
-                    if lane == ExecutionLane::Local
-                        && config.privacy_mode == PrivacyMode::CloudAllowed
-                        && matches!(
-                            &decision.action,
-                            AgentAction::Handoff | AgentAction::AskUser
-                        )
-                    {
-                        local_uncertainties += 1;
-                        history.push(format!(
-                            "local guide uncertainty {local_uncertainties}/{AXI_LOCAL_UNCERTAINTY_LIMIT}: {}",
-                            decision.say_to_user
-                        ));
-                        if local_uncertainties < AXI_LOCAL_UNCERTAINTY_LIMIT {
+                // A small local model occasionally produces unusable
+                // output outright - confirmed live, gemma3:4b mixing
+                // Unicode "smart quotes" into what should be plain ASCII
+                // JSON string delimiters, breaking the parse entirely.
+                // Treat that the same as every other "the model's
+                // proposal didn't pan out" case (a soft, capped retry),
+                // not a hard `?` crash that kills the whole run.
+                let decision = match call_axi_agent_turn(&config, lane, goal, &observation, &history)
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        consecutive_replans += 1;
+                        if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
                             println!(
-                                "MICE will take one more local-only look before considering a cloud fallback."
+                                "MICE paused: the local guide couldn't produce a usable next step after several attempts. Try again, or ask for one narrower step at a time."
                             );
+                            return Ok(());
                         }
+                        history.push(format!("local guide produced an unusable decision: {error}"));
                         continue;
                     }
-                    match decision.action {
-                        AgentAction::Done => {
-                            if !current_sequence.is_empty() {
-                                if let Some(embed) = goal_embedding.clone() {
-                                    if !embed.is_empty() {
-                                        let new_recipe = AxiRecipe {
-                                            recipe_id: format!("recipe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
-                                            goal_pattern: goal.to_string(),
-                                            goal_embedding: embed,
-                                            steps: current_sequence.clone(),
-                                        };
-                                        if save_recipe(&new_recipe).is_ok() {
-                                            println!("MICE: Saved successful sequence as a new recipe.");
+                };
+                if let Err(error) = validate_agent_decision(&decision) {
+                    consecutive_replans += 1;
+                    if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
+                        println!(
+                            "MICE paused: the local guide couldn't produce a usable next step after several attempts. Try again, or ask for one narrower step at a time."
+                        );
+                        return Ok(());
+                    }
+                    history.push(format!("local guide's decision failed validation: {error}"));
+                    continue;
+                }
+                println!("MICE: {}", decision.say_to_user);
+
+                let call = match axi_call_from_decision(&decision) {
+                    Ok(Some(call)) => call,
+                    Err(error) => {
+                        // The decision was well-formed JSON but logically
+                        // incomplete (e.g. action=fill/click with no
+                        // candidate_id) - confirmed live this used to be
+                        // an unhandled `?` crash that killed the whole run
+                        // ("chose an action without a current target
+                        // reference"), instead of a graceful retry like
+                        // every other "the model's proposal didn't pan
+                        // out" case already gets.
+                        consecutive_replans += 1;
+                        if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
+                            println!(
+                                "MICE paused: MICE couldn't turn its own plan into a usable action after several attempts. Try again, or ask for one narrower step at a time."
+                            );
+                            return Ok(());
+                        }
+                        history.push(format!("decision could not be used: {error}"));
+                        continue;
+                    }
+                    Ok(None) => {
+                        if lane == ExecutionLane::Local
+                            && config.privacy_mode == PrivacyMode::CloudAllowed
+                            && matches!(
+                                &decision.action,
+                                AgentAction::Handoff | AgentAction::AskUser
+                            )
+                        {
+                            local_uncertainties += 1;
+                            history.push(format!(
+                                "local guide uncertainty {local_uncertainties}/{AXI_LOCAL_UNCERTAINTY_LIMIT}: {}",
+                                decision.say_to_user
+                            ));
+                            if local_uncertainties < AXI_LOCAL_UNCERTAINTY_LIMIT {
+                                println!(
+                                    "MICE will take one more local-only look before considering a cloud fallback."
+                                );
+                            }
+                            continue;
+                        }
+                        match decision.action {
+                            AgentAction::Done => {
+                                if !current_sequence.is_empty() {
+                                    if let Some(embed) = goal_embedding.clone() {
+                                        if !embed.is_empty() {
+                                            let new_recipe = AxiRecipe {
+                                                recipe_id: format!("recipe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                                goal_pattern: goal.to_string(),
+                                                goal_embedding: embed,
+                                                steps: current_sequence.clone(),
+                                            };
+                                            if save_recipe(&new_recipe).is_ok() {
+                                                println!("MICE: Saved successful sequence as a new recipe.");
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            println!(
-                                "MICE AXI guide complete: {}",
+                                println!(
+                                    "MICE AXI guide complete: {}",
+                                    decision
+                                        .done_summary
+                                        .as_deref()
+                                        .unwrap_or("The requested step is complete.")
+                                );
+                            },
+                            AgentAction::AskUser => println!(
+                                "MICE needs your input: {}",
                                 decision
-                                    .done_summary
+                                    .question
                                     .as_deref()
-                                    .unwrap_or("The requested step is complete.")
-                            );
-                        },
-                        AgentAction::AskUser => println!(
-                            "MICE needs your input: {}",
-                            decision
-                                .question
-                                .as_deref()
-                                .unwrap_or("Please clarify the next step.")
-                        ),
-                        AgentAction::Handoff => println!("MICE has handed this step back to you."),
-                        _ => unreachable!("action conversion handles executable actions"),
+                                    .unwrap_or("Please clarify the next step.")
+                            ),
+                            AgentAction::Handoff => println!("MICE has handed this step back to you."),
+                            _ => unreachable!("action conversion handles executable actions"),
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 };
                 (call, false)
             };
@@ -2275,13 +2343,25 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             }
-            let result = tools::execute_verified_browser_action(
-                &runner,
-                &call,
-                &context,
-                &current.snapshot,
-                true,
-            );
+            // execute_verified_browser_action's target/sensitivity checks
+            // are specifically for Mutating actions and it refuses any
+            // ToolKind::ReadOnly call outright (confirmed live: this broke
+            // scroll the moment the model actually chose it, the first
+            // time since scroll was reclassified ReadOnly for Pillar A).
+            // tools::run is the complementary path already used for every
+            // other ReadOnly tool (e.g. browser.snapshot in observe_axi)
+            // and is the mirror image: it refuses anything Mutating.
+            let result = if tool_kind == tools::ToolKind::Mutating {
+                tools::execute_verified_browser_action(
+                    &runner,
+                    &call,
+                    &context,
+                    &current.snapshot,
+                    true,
+                )
+            } else {
+                tools::run(&runner, &call, &context)
+            };
             if let Err(error) = result {
                 if is_axi_stale_error(&error) && recovery.retry_stale_once() {
                     // Not the raw error text: it repeats the stale uid
@@ -2345,6 +2425,9 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 const AXI_FRESH_DECISION_LIMIT: usize = 6;
+// See the AutopilotAxi ToolContext construction for why this needs to be
+// well above tools::DEFAULT_RETURN_TOKENS.
+const AXI_OBSERVATION_TOKENS: usize = 2_000;
 // Generous but bounded: a recorded recipe can have at most as many steps as
 // the fresh-decision run that taught it, so this ceiling only matters as a
 // safety valve against a corrupted or hand-edited recipe file.
@@ -2610,7 +2693,7 @@ fn call_axi_agent_turn(
     };
     let output = if lane == ExecutionLane::Local {
         let mut output = String::new();
-        let instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing.";
+        let instruction = "You are MICE, a careful browser guide. Return only one JSON object with exactly these snake_case fields: say_to_user, action (click|fill|open_url|scroll|done|handoff|ask_user), candidate_id, url, value, done_summary, question. Copy a candidate_id exactly from the AXI snapshot. Never fill passwords, codes, or payment data. Never click sign-in, payment, purchase, transfer, final-submit, or file-return controls. Prefer handoff instead of guessing. Only choose action 'done' once every concrete part of the goal is actually finished: if the goal says to search, fill, or extract something, navigating to the right page or clicking around it is not done by itself — the search/fill/extraction has to have actually happened. If unsure whether the goal is fully met yet, take the next concrete step toward it instead of declaring done.";
         
         let schema = serde_json::json!({
             "type": "object",

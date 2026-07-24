@@ -872,11 +872,39 @@ const SENSITIVE_AUTOCOMPLETE_TERMS: [&str; 5] = [
     "webauthn",
 ];
 
+/// Whether MICE can positively identify this as an ordinary free-text
+/// field, safe to fill. An explicit HTML `type=` attribute is one such
+/// signal, but real accessibility trees frequently omit it even for
+/// completely ordinary fields — confirmed live: Wikipedia's own native
+/// search box (role="searchbox") carries no `type=` attribute at all,
+/// which made this refuse to fill it ("MICE cannot establish this
+/// input's safe type"), blocking the exact use case being tested.
+///
+/// The ARIA role is trusted too, but *only* for `searchbox`/`combobox`
+/// specifically — both are ARIA-defined for search or select-from-a-list
+/// input, never for password/payment entry, so each is a positive,
+/// unambiguous signal on its own (confirmed live: Wikipedia's own search
+/// widget reports as `searchbox` at rest and becomes a `combobox` — an
+/// autocomplete popup listing suggestions — the moment it's focused/typed
+/// into; both stages of the same, clearly benign field need to be
+/// fillable). Deliberately does *not* extend this to the generic
+/// `textbox` role: unlike those two, `type=password` fields commonly
+/// report as role `textbox` too (ARIA has no distinct role for password
+/// entry, only the `type` attribute distinguishes it) — trusting bare
+/// `textbox` would have defeated the password check for any field whose
+/// label doesn't happen to mention "password" (confirmed against
+/// `opaque_or_password_fields_fail_closed_without_trusted_input_metadata`,
+/// which currently only stays blocked because its raw fixture text
+/// happens to leak the word "password" into `context` via the uid/type
+/// values — not something real-world labels are guaranteed to do). This
+/// stays fail-closed for everything else, and the separate
+/// sensitive-wording/autocomplete checks in `blocked_browser_action`
+/// still apply on top regardless.
 fn trusted_fill_type(target: &BrowserTarget) -> bool {
     matches!(
         target.input_type.as_deref(),
         Some("text" | "search" | "email" | "url")
-    )
+    ) || matches!(target.role.as_str(), "searchbox" | "combobox")
 }
 
 fn sensitive_autocomplete(target: &BrowserTarget) -> bool {
@@ -1738,6 +1766,112 @@ mod tests {
             .unwrap()
             .text,
             "filled"
+        );
+    }
+
+    #[test]
+    fn searchbox_role_alone_is_trusted_without_a_type_attribute() {
+        // The exact live reproduction: Wikipedia's own native search box
+        // (real chrome-devtools-axi output) has no `type=` attribute at
+        // all, only role="searchbox" - this used to refuse to fill it
+        // ("MICE cannot establish this input's safe type"), blocking the
+        // core search use case entirely.
+        let runner = MockRunner {
+            output: "filled".into(),
+        };
+        let context = ToolContext {
+            working_dir: PathBuf::from("."),
+            session_name: "s".into(),
+            output_budget_tokens: 300,
+        };
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "uid=g7:6_12 searchbox \"Search Wikipedia\" description=\"Search Wikipedia\"",
+        );
+        assert_eq!(
+            execute_verified_browser_action(
+                &runner,
+                &ToolCall {
+                    name: "browser.fill".into(),
+                    args: json!({"uid": "g7:6_12", "text": "James Webb Space Telescope"}),
+                },
+                &context,
+                &snapshot,
+                true,
+            )
+            .unwrap()
+            .text,
+            "filled"
+        );
+    }
+
+    #[test]
+    fn combobox_role_is_trusted_the_same_way_as_searchbox() {
+        // The exact live reproduction: Wikipedia's search widget becomes
+        // an autocomplete combobox (role="combobox", listbox popup) the
+        // moment it's focused/typed into, distinct from its at-rest
+        // searchbox role - both stages of the same benign field need to
+        // be fillable, not just the first one.
+        let runner = MockRunner {
+            output: "filled".into(),
+        };
+        let context = ToolContext {
+            working_dir: PathBuf::from("."),
+            session_name: "s".into(),
+            output_budget_tokens: 300,
+        };
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "uid=g10:10_1 combobox \"Search Wikipedia\" autocomplete=list",
+        );
+        assert_eq!(
+            execute_verified_browser_action(
+                &runner,
+                &ToolCall {
+                    name: "browser.fill".into(),
+                    args: json!({"uid": "g10:10_1", "text": "James Webb Space Telescope"}),
+                },
+                &context,
+                &snapshot,
+                true,
+            )
+            .unwrap()
+            .text,
+            "filled"
+        );
+    }
+
+    #[test]
+    fn generic_textbox_role_alone_does_not_trust_an_untyped_password_field() {
+        // The generic `textbox` role must NOT get the same trust as
+        // `searchbox`: a real `type=password` field commonly reports as
+        // role="textbox" too (ARIA has no distinct role for password
+        // entry), so trusting bare `textbox` would defeat this check for
+        // any password field whose label doesn't happen to say
+        // "password". Label deliberately avoids any sensitive wording so
+        // this only stays blocked via the type attribute itself, not a
+        // second, redundant signal.
+        let runner = MockRunner {
+            output: "should not run".into(),
+        };
+        let context = ToolContext {
+            working_dir: PathBuf::from("."),
+            session_name: "s".into(),
+            output_budget_tokens: 300,
+        };
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "uid=g1:secret textbox \"Enter value\" type=password",
+        );
+        assert!(
+            execute_verified_browser_action(
+                &runner,
+                &ToolCall {
+                    name: "browser.fill".into(),
+                    args: json!({"uid": "g1:secret", "text": "hunter2"}),
+                },
+                &context,
+                &snapshot,
+                true,
+            )
+            .is_err()
         );
     }
 
