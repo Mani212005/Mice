@@ -218,7 +218,19 @@ impl BrowserSnapshot {
         let Some(uid) = call.args.get("uid").and_then(Value::as_str) else {
             return true; // No UID to check, action is inherently resilient or page-level
         };
-        other.target(uid).is_some()
+        if other.target(uid).is_some() {
+            return true;
+        }
+        
+        // AXI UIDs format is typically `<prefix>:<backendNodeId>`. If the tree shifts 
+        // dynamically between proposal and confirmation, the prefix index might change 
+        // (e.g. g9:3_2 -> g11:3_2) but the backendNodeId remains strictly stable for that element.
+        if let Some((_, backend_id)) = uid.split_once(':') {
+            let suffix = format!(":{backend_id}");
+            return other.targets.keys().any(|k| k.ends_with(&suffix));
+        }
+
+        false
     }
 }
 
