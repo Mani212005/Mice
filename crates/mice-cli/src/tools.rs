@@ -159,6 +159,14 @@ impl BrowserSnapshot {
         self.targets.get(uid)
     }
 
+    /// Whether a uid resolves in this snapshot at all. Used to catch a
+    /// proposal that already references a target missing from the very
+    /// snapshot it was decided against (a copy/paste slip or a hallucinated
+    /// uid) before spending a person's attention on confirming it.
+    pub fn has_target(&self, uid: &str) -> bool {
+        self.targets.contains_key(uid)
+    }
+
     fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
@@ -175,9 +183,10 @@ impl BrowserSnapshot {
 
     /// Stable (role, label) fingerprint for a target, used to re-resolve a
     /// recorded recipe step against a freshly loaded page. A uid alone is
-    /// only meaningful within the page/session it came from (see
-    /// `same_target_context`'s note on backendNodeIds); this is the anchor
-    /// a recipe carries across sessions instead. `context` is the raw
+    /// only meaningful within the snapshot generation it came from (see
+    /// `resolve_current_uid`'s note on chrome-devtools-axi's generation
+    /// counter); this is the anchor a recipe carries across sessions
+    /// instead. `context` is the raw
     /// snapshot line and therefore still contains this session's own
     /// `uid=...` marker (see the `multiline`/`escaped_newline` tests below
     /// for why `context` itself must stay raw) — strip it here so the
@@ -208,30 +217,56 @@ impl BrowserSnapshot {
             .unwrap_or_else(|| format!("{} on unavailable target {uid}", call.name))
     }
 
-    /// A UID can be recycled after a page update. Treat changed AX context as
-    /// stale even when the same UID still happens to be present.
-    pub fn same_target_context(&self, other: &Self, call: &ToolCall) -> bool {
-        // AXI UIDs include the Chrome backendNodeId, which is never recycled within a page.
-        // If the bridge finds the node, it is mathematically guaranteed to be the same element.
-        // Checking if the attributes (like aria-expanded) changed is overly pedantic and
-        // causes infinite loops on dynamic pages.
+    /// Re-resolve a proposed action's target against a freshly captured
+    /// snapshot, returning the uid to actually execute with.
+    ///
+    /// chrome-devtools-axi's uid prefix (`g<N>:`) is not a tree-position
+    /// index — it is a page-wide snapshot generation counter that the tool
+    /// bumps via a `MutationObserver` on *any* DOM mutation anywhere on the
+    /// page (childList/subtree/attributes/characterData), then rejects any
+    /// uid whose generation doesn't equal the current one, full stop —
+    /// regardless of whether the specific element referenced actually
+    /// changed. A raw ad refresh, a lazy-loaded image, or a "you might also
+    /// like" widget updating anywhere on the page is enough to bump it. On
+    /// a live page like Wikipedia, the multi-second gap while a person
+    /// reads and confirms a proposed action is close to guaranteed to see
+    /// at least one such incidental mutation, so an exact-uid comparison
+    /// (or a same-suffix string match — the same problem, since matching
+    /// still leaves the *stale* uid string in the call) fails almost every
+    /// time even though nothing relevant to the click changed.
+    ///
+    /// The fix is to re-resolve by (role, label) identity in the fresh
+    /// snapshot and hand back a uid that is actually valid for it, not to
+    /// find a way to keep using the old one. `Gone` still means what it
+    /// always did: no element with that identity exists anymore — a real
+    /// change, not just an incidental mutation elsewhere on the page.
+    pub fn resolve_current_uid(&self, other: &Self, call: &ToolCall) -> TargetResolution {
         let Some(uid) = call.args.get("uid").and_then(Value::as_str) else {
-            return true; // No UID to check, action is inherently resilient or page-level
+            return TargetResolution::NoUidNeeded;
         };
         if other.target(uid).is_some() {
-            return true;
+            return TargetResolution::Resolved(uid.to_string());
         }
-        
-        // AXI UIDs format is typically `<prefix>:<backendNodeId>`. If the tree shifts 
-        // dynamically between proposal and confirmation, the prefix index might change 
-        // (e.g. g9:3_2 -> g11:3_2) but the backendNodeId remains strictly stable for that element.
-        if let Some((_, backend_id)) = uid.split_once(':') {
-            let suffix = format!(":{backend_id}");
-            return other.targets.keys().any(|k| k.ends_with(&suffix));
+        let Some((role, label)) = self.identity_of(uid) else {
+            return TargetResolution::Gone;
+        };
+        match other.find_uid_by_identity(&role, &label) {
+            Some(resolved) => TargetResolution::Resolved(resolved),
+            None => TargetResolution::Gone,
         }
-
-        false
     }
+}
+
+/// Result of re-resolving a proposed action's target against a fresh
+/// snapshot. See `BrowserSnapshot::resolve_current_uid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetResolution {
+    /// The action has no uid to verify (e.g. scroll) — proceed unchanged.
+    NoUidNeeded,
+    /// The target still exists, at this (possibly different) uid.
+    Resolved(String),
+    /// No element with a matching identity exists anymore — a real change.
+    Gone,
 }
 
 /// Replace every double-quoted span with a single space. Backslash-escaped
@@ -1778,6 +1813,50 @@ mod tests {
         assert_eq!(
             redesigned_page.find_uid_by_identity(&identity.0, &identity.1),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_current_uid_survives_an_incidental_generation_bump() {
+        // chrome-devtools-axi bumps its generation counter (the uid's `g<N>:`
+        // prefix) on *any* page mutation, not just ones affecting the
+        // proposed target - simulated here by the same element reappearing
+        // under a new prefix while its role/label are unchanged.
+        let proposed = BrowserSnapshot::from_axi_output("link \"Jump to content\" uid=g9:3_2");
+        let call = ToolCall {
+            name: "browser.click".into(),
+            args: json!({"uid": "g9:3_2"}),
+        };
+
+        let unrelated_mutation = BrowserSnapshot::from_axi_output("link \"Jump to content\" uid=g11:3_2");
+        assert_eq!(
+            proposed.resolve_current_uid(&unrelated_mutation, &call),
+            TargetResolution::Resolved("g11:3_2".to_string())
+        );
+
+        // Nothing changed at all: the exact-match fast path still applies.
+        let unchanged = BrowserSnapshot::from_axi_output("link \"Jump to content\" uid=g9:3_2");
+        assert_eq!(
+            proposed.resolve_current_uid(&unchanged, &call),
+            TargetResolution::Resolved("g9:3_2".to_string())
+        );
+
+        // The element itself is genuinely gone: must report Gone, not
+        // silently match an unrelated control.
+        let real_change = BrowserSnapshot::from_axi_output("button \"Main menu\" uid=g11:9_1");
+        assert_eq!(
+            proposed.resolve_current_uid(&real_change, &call),
+            TargetResolution::Gone
+        );
+
+        // No uid on the call (e.g. scroll): always proceeds unchanged.
+        let scroll = ToolCall {
+            name: "browser.scroll".into(),
+            args: json!({"direction": "down"}),
+        };
+        assert_eq!(
+            proposed.resolve_current_uid(&unrelated_mutation, &scroll),
+            TargetResolution::NoUidNeeded
         );
     }
 }

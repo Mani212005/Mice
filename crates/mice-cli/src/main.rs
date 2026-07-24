@@ -1893,6 +1893,16 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
         unsafe { std::env::set_var("CHROME_DEVTOOLS_AXI_AUTO_CONNECT", "1") };
     }
 
+    // So `mice autopilot "..."` works as a single command: start Ollama if
+    // it isn't already running, and best-effort pull the small embedding
+    // model recipe matching needs. Neither failure is fatal here — the
+    // lane-selection and local-model checks below still run afterward and
+    // produce a clear, specific error if the local path genuinely isn't
+    // usable; a missing embedding model just silently disables recipe
+    // matching (see its `.unwrap_or_default()` call site below).
+    let _ = ensure_ollama_server();
+    ensure_embedding_model_pulled(&runner);
+
     if !runner.available("npx") {
         return Err("AXI autopilot requires Node's `npx`. Install Node, then retry.".into());
     }
@@ -1938,6 +1948,13 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
         // A stale retry belongs to this proposed action, not to the whole
         // guide. A replan does not use up a successfully-dispatched action.
         let mut recovery = AxiActionRecovery::default();
+        // A live page (Wikipedia and similar) mutates constantly in the
+        // background for reasons that have nothing to do with the click
+        // MICE proposed, and every mutation invalidates the snapshot's
+        // refs (see `resolve_current_uid`). A handful of replans for the
+        // same step is normal, not a bug; an unbounded run of them means
+        // the page is genuinely too unstable to act on safely right now.
+        let mut consecutive_replans = 0_u8;
         loop {
             let observed = match observe_axi(&runner, &context) {
                 Ok(observed) => observed,
@@ -1955,7 +1972,7 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 // to the site the goal will end up on, so folding it into
                 // the match key (as an earlier version of this did) made
                 // retrieval and the save-time key below almost never agree.
-                let embed = mice_providers::ollama_embed(&format!("{OLLAMA_ENDPOINT}/api/embed"), "nomic-embed-text", goal).unwrap_or_default();
+                let embed = mice_providers::ollama_embed(&format!("{OLLAMA_ENDPOINT}/api/embed"), AXI_RECIPE_EMBEDDING_MODEL, goal).unwrap_or_default();
                 goal_embedding = Some(embed.clone());
                 
                 if !embed.is_empty() {
@@ -1977,13 +1994,14 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let (call, is_replay) = if let Some(recipe_step) = active_recipe_steps.pop() {
-                // A recipe's uid only ever meant something in the session it
-                // was recorded in (see `same_target_context`'s note on
-                // backendNodeIds). Re-resolve it against the *current*
-                // snapshot by (role, accessible name) before proposing it,
-                // the same anchor-matching CoScripter/UiPath rely on,
-                // instead of trusting a stale cross-session uid string.
+            let (mut call, is_replay) = if let Some(recipe_step) = active_recipe_steps.pop() {
+                // A recipe's uid only ever meant something in the snapshot
+                // generation it was recorded in (see `resolve_current_uid`'s
+                // note on chrome-devtools-axi's generation counter).
+                // Re-resolve it against the *current* snapshot by (role,
+                // accessible name) before proposing it, the same
+                // anchor-matching CoScripter/UiPath rely on, instead of
+                // trusting a stale cross-session uid string.
                 let resolved_call = match recipe_step.call.args.get("uid").and_then(Value::as_str)
                 {
                     Some(_) => {
@@ -2097,15 +2115,46 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             let tool_kind = tools::specs().iter().find(|s| s.name == call.name).map(|s| s.kind).unwrap_or(tools::ToolKind::Mutating);
 
+            // The proposal already references a target missing from the
+            // very snapshot it was decided against — asking a person to
+            // confirm something MICE already knows is dead just reads as a
+            // bug. Replan quietly instead of spending their attention on it.
+            let proposal_is_dead = call
+                .args
+                .get("uid")
+                .and_then(Value::as_str)
+                .is_some_and(|uid| !observed.snapshot.has_target(uid));
+            if proposal_is_dead {
+                consecutive_replans += 1;
+                if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
+                    println!(
+                        "MICE paused: this page kept changing faster than MICE could act on it, even before asking you to confirm anything. That's usually a busy/dynamic page (live content, ads, etc.), not a problem with your request — try again, or ask for one narrower step at a time."
+                    );
+                    return Ok(());
+                }
+                history.push(format!(
+                    "{} referenced a target no longer on this page; re-observing without asking.",
+                    call.name
+                ));
+                continue;
+            }
+
             if is_replay {
                 println!(
                     "Proposed replay action ({} queued after this): {}",
                     active_recipe_steps.len(),
                     observed.snapshot.approval_summary(&call)
                 );
-            } else {
+            } else if consecutive_replans == 0 {
                 println!(
                     "Proposed action {}/{}: {}",
+                    fresh_actions + 1,
+                    AXI_FRESH_DECISION_LIMIT,
+                    observed.snapshot.approval_summary(&call)
+                );
+            } else {
+                println!(
+                    "Proposed action {}/{} (retry {consecutive_replans}/{AXI_MAX_CONSECUTIVE_REPLANS} after a background page change): {}",
                     fresh_actions + 1,
                     AXI_FRESH_DECISION_LIMIT,
                     observed.snapshot.approval_summary(&call)
@@ -2137,20 +2186,38 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Re-observe after confirmation so a stale model reference can
-            // never be acted upon. A changed UID is rejected and replanned.
+            // never be acted upon. The uid MICE showed for confirmation may
+            // no longer be valid even for the *same* element (see
+            // `resolve_current_uid`); re-resolve it rather than reject it
+            // outright, and only replan if the target itself is gone.
             let current = match observe_axi(&runner, &context) {
                 Ok(current) => current,
                 Err(error) => return pause_axi(goal, &history, &error),
             };
-            if !observed
+            match observed
                 .snapshot
-                .same_target_context(&current.snapshot, &call)
+                .resolve_current_uid(&current.snapshot, &call)
             {
-                history.push("AXI target context changed after confirmation; replanning.".into());
-                println!(
-                    "The target changed after confirmation. Re-observing and replanning without acting."
-                );
-                continue;
+                tools::TargetResolution::NoUidNeeded => {}
+                tools::TargetResolution::Resolved(uid) => {
+                    if let Some(object) = call.args.as_object_mut() {
+                        object.insert("uid".into(), Value::String(uid));
+                    }
+                }
+                tools::TargetResolution::Gone => {
+                    consecutive_replans += 1;
+                    if consecutive_replans > AXI_MAX_CONSECUTIVE_REPLANS {
+                        println!(
+                            "MICE paused: this page kept changing before MICE could act, even after retrying several times. That's usually a busy/dynamic page (live content, ads, etc.), not a problem with your request — try again, or ask for one narrower step at a time."
+                        );
+                        return Ok(());
+                    }
+                    history.push("target changed after confirmation; re-observing.".into());
+                    println!(
+                        "MICE: That element changed on the page in the moment before acting — likely something updating in the background, not a problem with your request. Re-checking and trying again automatically; no action was taken."
+                    );
+                    continue;
+                }
             }
             let result = tools::execute_verified_browser_action(
                 &runner,
@@ -2213,6 +2280,12 @@ const AXI_FRESH_DECISION_LIMIT: usize = 6;
 // the fresh-decision run that taught it, so this ceiling only matters as a
 // safety valve against a corrupted or hand-edited recipe file.
 const AXI_REPLAY_ACTION_LIMIT: usize = 200;
+// A live page can legitimately need a retry or two (see
+// `resolve_current_uid`'s note on mutation-driven staleness), but an
+// unbounded run of them means the page is too unstable to act on safely
+// right now rather than "try once more" — pause with a clear reason
+// instead of spinning silently.
+const AXI_MAX_CONSECUTIVE_REPLANS: u8 = 4;
 
 const AXI_LOCAL_UNCERTAINTY_LIMIT: u8 = 2;
 
@@ -4310,6 +4383,27 @@ fn ensure_ollama_server() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(250));
     }
     Err("Ollama did not become ready within 20 seconds. Run `ollama serve` for diagnostics.".into())
+}
+
+const AXI_RECIPE_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+/// Best-effort pull of the small embedding model recipe matching (Pillar C)
+/// uses. It is a few hundred MiB, not a multi-GiB model choice, so this
+/// skips the disk/consent gate `ensure_local_model` applies to the main
+/// tool model. A failure here is silent: recipe matching just stays off
+/// (its call site already tolerates an empty embedding), it does not block
+/// autopilot from running.
+fn ensure_embedding_model_pulled(runner: &impl CommandRunner) {
+    if mice_providers::ollama_model_ready(OLLAMA_ENDPOINT, AXI_RECIPE_EMBEDDING_MODEL).is_ok() {
+        return;
+    }
+    if !runner.available("ollama") {
+        return;
+    }
+    let _ = Command::new("ollama")
+        .args(["pull", AXI_RECIPE_EMBEDDING_MODEL])
+        .stdin(Stdio::null())
+        .status();
 }
 
 /// Local Only is the one mode where MICE must make the local lane ready before
