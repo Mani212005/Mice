@@ -104,6 +104,7 @@ fn main() {
         Some("setup-browser") => setup_browser(),
         Some("autopilot") => autopilot(),
         Some("autopilot-multi") => autopilot_multi(),
+        Some("sheets") => sheets(),
         Some("start") => start(),
         Some("stop") => stop(),
         Some("route") => route_preview(),
@@ -137,7 +138,7 @@ fn usage() -> Result<(), Box<dyn std::error::Error>> {
         "\nAsk and screen\n  mice ask [--action <preset>] <instruction>\n  mice see [--display|--sheet] <question>\n  mice history [query] | mice history --clear | mice plans\n  mice actions | route"
     );
     println!(
-        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice autopilot-multi <goal>  (splits a goal across several sites, one subprocess per site)\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
+        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice autopilot-multi <goal>  (splits a goal across several sites, one subprocess per site)\n  mice sheets connect | disconnect | push <job-id> --sheet-id <id>\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
     );
     println!(
         "\nIntegrations\n  mice connect <codex|claude|all> [--yes]\n  mice disconnect <codex|claude|all> [--yes]\n  mice integrations\n  mice mcp-server | mice mcp <list|call>"
@@ -4385,6 +4386,13 @@ fn provider_key_name(variable: &str) -> Option<&'static str> {
     match variable {
         "GROQ_API_KEY" => Some("groq"),
         "OPENAI_API_KEY" => Some("openai"),
+        "GOOGLE_SHEETS_CLIENT_ID" => Some("google-sheets-client-id"),
+        "GOOGLE_SHEETS_CLIENT_SECRET" => Some("google-sheets-client-secret"),
+        // Never manually settable via `mice keys set` (see
+        // provider_key_variable below) — obtained only through the device
+        // flow in `sheets_connect`. Still needs an entry here so
+        // `keychain_api_key`'s gate accepts it for lookup.
+        "GOOGLE_SHEETS_REFRESH_TOKEN" => Some("google-sheets-refresh-token"),
         _ => None,
     }
 }
@@ -4393,6 +4401,10 @@ fn provider_key_variable(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "groq" => Some("GROQ_API_KEY"),
         "openai" | "open_ai" => Some("OPENAI_API_KEY"),
+        "google-sheets-client-id" | "google_sheets_client_id" => Some("GOOGLE_SHEETS_CLIENT_ID"),
+        "google-sheets-client-secret" | "google_sheets_client_secret" => {
+            Some("GOOGLE_SHEETS_CLIENT_SECRET")
+        }
         _ => None,
     }
 }
@@ -4491,7 +4503,13 @@ fn keys() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = env::args().skip(2).collect::<Vec<_>>();
     match arguments.first().map(String::as_str) {
         Some("status") if arguments.len() == 1 => {
-            for (label, variable) in [("Groq", "GROQ_API_KEY"), ("OpenAI", "OPENAI_API_KEY")] {
+            for (label, variable) in [
+                ("Groq", "GROQ_API_KEY"),
+                ("OpenAI", "OPENAI_API_KEY"),
+                ("Google Sheets client ID", "GOOGLE_SHEETS_CLIENT_ID"),
+                ("Google Sheets client secret", "GOOGLE_SHEETS_CLIENT_SECRET"),
+                ("Google Sheets connection", "GOOGLE_SHEETS_REFRESH_TOKEN"),
+            ] {
                 let source = if env::var_os(variable).is_some() {
                     "environment override"
                 } else if keychain_api_key(variable).is_some() {
@@ -4504,8 +4522,9 @@ fn keys() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("set") if arguments.len() == 2 => {
-            let name = provider_key_variable(&arguments[1])
-                .ok_or("Choose `groq` or `openai`.")?;
+            let name = provider_key_variable(&arguments[1]).ok_or(
+                "Choose `groq`, `openai`, `google-sheets-client-id`, or `google-sheets-client-secret`.",
+            )?;
             let secret = read_keychain_secret(&arguments[1])?;
             save_keychain_api_key(name, &secret)?;
             println!("Saved {} securely in your macOS Keychain.", arguments[1].to_ascii_uppercase());
@@ -4513,8 +4532,9 @@ fn keys() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("delete") | Some("remove") if arguments.len() == 2 => {
-            let variable = provider_key_variable(&arguments[1])
-                .ok_or("Choose `groq` or `openai`.")?;
+            let variable = provider_key_variable(&arguments[1]).ok_or(
+                "Choose `groq`, `openai`, `google-sheets-client-id`, or `google-sheets-client-secret`.",
+            )?;
             confirm_change(
                 &format!("Delete MICE's {} key from your macOS Keychain?", arguments[1]),
                 false,
@@ -4537,7 +4557,7 @@ fn keys() -> Result<(), Box<dyn std::error::Error>> {
             println!("Deleted MICE's {} key from your macOS Keychain.", arguments[1]);
             Ok(())
         }
-        _ => Err("Usage: mice keys <set|status|delete> <groq|openai> (use `mice keys status` without a provider)".into()),
+        _ => Err("Usage: mice keys <set|status|delete> <groq|openai|google-sheets-client-id|google-sheets-client-secret> (use `mice keys status` without a provider)".into()),
     }
 }
 
@@ -4608,6 +4628,339 @@ fn save_keychain_api_key(variable: &str, secret: &str) -> Result<(), Box<dyn std
             "macOS Keychain could not save the key. Unlock your login keychain and try again."
                 .into(),
         )
+    }
+}
+
+// --- M19d: Google Sheets write-back for autopilot-multi results ---
+//
+// MICE has no registered Google OAuth client of its own — every other
+// credential here (Groq, OpenAI) is 100% user-supplied via `mice keys
+// set`, with zero shared app/quota/liability on MICE's side, and Google
+// Sheets follows the same model: the user registers their own OAuth
+// client in Google Cloud Console (type "Desktop app" or "TVs and Limited
+// Input devices") and pastes its ID/secret in via `mice keys set
+// google-sheets-client-id` / `google-sheets-client-secret`. Google's
+// device-flow token endpoint requires that "client secret" be presented
+// even for these installed-app client types (it is not meant to be kept
+// fully secret — RFC 8628's model assumes it may be embedded in
+// distributed software — but Google's API still rejects requests missing
+// it), so both are stored, not just the ID.
+//
+// Auth uses the OAuth 2.0 Device Authorization Grant (RFC 8628): MICE
+// prints a short code and a URL, the user authorizes on any device, MICE
+// polls for the token. This needs zero local HTTP listener, unlike the
+// installed-app/loopback-callback flow every other "sign in with Google"
+// integration uses.
+
+const GOOGLE_DEVICE_CODE_ENDPOINT: &str = "https://oauth2.googleapis.com/device/code";
+const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets";
+
+/// Form-encoded POST with no `Authorization` header — the shape RFC 6749's
+/// token endpoint requires, distinct from `post_provider_request`'s
+/// `Authorization: Bearer` JSON POSTs (which the actual Sheets API call
+/// below fits exactly and reuses directly).
+fn post_google_oauth_form(
+    endpoint: &str,
+    form: &[(&str, &str)],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let response = ureq::post(endpoint).send_form(form).map_err(|error| match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            let detail = body.trim();
+            let message = if detail.is_empty() {
+                format!("Google OAuth request failed with HTTP {status}")
+            } else {
+                format!("Google OAuth request failed with HTTP {status}: {detail}")
+            };
+            std::io::Error::other(message)
+        }
+        ureq::Error::Transport(error) => {
+            std::io::Error::other(format!("Google OAuth request failed: {error}"))
+        }
+    })?;
+    Ok(serde_json::from_reader(response.into_reader())?)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GoogleDeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    // RFC 8628 names this field `verification_uri`; Google's own docs use
+    // `verification_url`. Both are accepted since which one Google's live
+    // endpoint returns isn't something to assume without checking.
+    #[serde(default)]
+    verification_uri: Option<String>,
+    #[serde(default)]
+    verification_url: Option<String>,
+    expires_in: u64,
+    interval: u64,
+}
+
+impl GoogleDeviceCodeResponse {
+    fn verification_link(&self) -> &str {
+        self.verification_uri
+            .as_deref()
+            .or(self.verification_url.as_deref())
+            .unwrap_or("https://www.google.com/device")
+    }
+}
+
+fn request_google_device_code(
+    client_id: &str,
+) -> Result<GoogleDeviceCodeResponse, Box<dyn std::error::Error>> {
+    let value = post_google_oauth_form(
+        GOOGLE_DEVICE_CODE_ENDPOINT,
+        &[("client_id", client_id), ("scope", GOOGLE_SHEETS_SCOPE)],
+    )?;
+    serde_json::from_value(value).map_err(|error| {
+        format!("Google's device-code response was not in the expected shape: {error}").into()
+    })
+}
+
+enum DevicePollOutcome {
+    AuthorizationPending,
+    SlowDown,
+    Success { refresh_token: String },
+}
+
+fn poll_google_device_token_once(
+    client_id: &str,
+    client_secret: &str,
+    device_code: &str,
+) -> Result<DevicePollOutcome, Box<dyn std::error::Error>> {
+    match ureq::post(GOOGLE_TOKEN_ENDPOINT).send_form(&[
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("device_code", device_code),
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+    ]) {
+        Ok(response) => {
+            let value: Value = serde_json::from_reader(response.into_reader())?;
+            let refresh_token = value["refresh_token"]
+                .as_str()
+                .ok_or("Google approved the request but did not return a refresh token.")?
+                .to_string();
+            Ok(DevicePollOutcome::Success { refresh_token })
+        }
+        Err(ureq::Error::Status(_, response)) => {
+            let body: Value = serde_json::from_reader(response.into_reader()).unwrap_or_default();
+            match body["error"].as_str() {
+                Some("authorization_pending") => Ok(DevicePollOutcome::AuthorizationPending),
+                Some("slow_down") => Ok(DevicePollOutcome::SlowDown),
+                Some(other) => Err(format!("Google device authorization failed: {other}").into()),
+                None => Err("Google device authorization failed with an unrecognized error.".into()),
+            }
+        }
+        Err(ureq::Error::Transport(error)) => Err(format!("Could not reach Google: {error}").into()),
+    }
+}
+
+fn sheets_connect() -> Result<(), Box<dyn std::error::Error>> {
+    let client_id = provider_api_key("GOOGLE_SHEETS_CLIENT_ID").map_err(|_| {
+        "GOOGLE_SHEETS_CLIENT_ID is not configured. Create a free OAuth client in Google Cloud \
+         Console (type \"Desktop app\"), then run `mice keys set google-sheets-client-id`."
+    })?;
+    let client_secret = provider_api_key("GOOGLE_SHEETS_CLIENT_SECRET").map_err(|_| {
+        "GOOGLE_SHEETS_CLIENT_SECRET is not configured. Run `mice keys set google-sheets-client-secret` \
+         with the secret from the same OAuth client."
+    })?;
+
+    let device_code_response = request_google_device_code(&client_id)?;
+    println!(
+        "To connect Google Sheets, visit {} and enter this code: {}",
+        device_code_response.verification_link(),
+        device_code_response.user_code
+    );
+    println!("Waiting for you to authorize...");
+
+    let deadline = Instant::now() + Duration::from_secs(device_code_response.expires_in);
+    let mut interval = Duration::from_secs(device_code_response.interval.max(1));
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                "The authorization code expired before it was approved. Run `mice sheets connect` again."
+                    .into(),
+            );
+        }
+        thread::sleep(interval);
+        match poll_google_device_token_once(
+            &client_id,
+            &client_secret,
+            &device_code_response.device_code,
+        )? {
+            DevicePollOutcome::Success { refresh_token } => {
+                save_keychain_api_key("GOOGLE_SHEETS_REFRESH_TOKEN", &refresh_token)?;
+                println!("Google Sheets connected.");
+                return Ok(());
+            }
+            DevicePollOutcome::AuthorizationPending => continue,
+            DevicePollOutcome::SlowDown => {
+                interval += Duration::from_secs(5);
+                continue;
+            }
+        }
+    }
+}
+
+fn sheets_disconnect() -> Result<(), Box<dyn std::error::Error>> {
+    confirm_change(
+        "Disconnect Google Sheets and delete the stored connection from your macOS Keychain?",
+        false,
+    )?;
+    let status = Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            MICE_KEYCHAIN_SERVICE,
+            "-a",
+            "GOOGLE_SHEETS_REFRESH_TOKEN",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("No Google Sheets connection was found in your macOS Keychain.".into());
+    }
+    println!("Disconnected Google Sheets.");
+    Ok(())
+}
+
+fn refresh_google_access_token(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let value = post_google_oauth_form(
+        GOOGLE_TOKEN_ENDPOINT,
+        &[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ],
+    )?;
+    value["access_token"].as_str().map(str::to_owned).ok_or_else(|| {
+        "Google did not return an access token. The stored connection may have been revoked; \
+         run `mice sheets connect` again."
+            .into()
+    })
+}
+
+/// Percent-encodes one path segment per RFC 3986's unreserved-character
+/// set. No crate for this is already a dependency, and the character set
+/// this needs to handle is narrow (spreadsheet IDs and A1-notation ranges
+/// like `Sheet1!A1`, whose `!` and any spaces are the only characters that
+/// actually need escaping in practice) — not worth a new dependency for.
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+pub fn sheets_append_url(spreadsheet_id: &str, range: &str) -> String {
+    format!(
+        "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+        percent_encode_path_segment(spreadsheet_id),
+        percent_encode_path_segment(range)
+    )
+}
+
+pub fn sheets_append_payload(rows: &[Vec<String>]) -> Value {
+    serde_json::json!({ "values": rows })
+}
+
+pub fn append_sheet_rows(
+    access_token: &str,
+    spreadsheet_id: &str,
+    range: &str,
+    rows: &[Vec<String>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = sheets_append_url(spreadsheet_id, range);
+    let payload = sheets_append_payload(rows).to_string();
+    post_provider_request("Google Sheets API", &url, access_token, &payload)?;
+    Ok(())
+}
+
+/// Flattens M19c's `aggregate.json` into sheet rows: a header row, then one
+/// row per site result. Structured `data` (an object) is serialized to
+/// compact JSON text, since a sheet cell is just a string — unstructured
+/// `data` (already a plain string) is used as-is.
+pub fn rows_from_aggregate(aggregate: &Value) -> Vec<Vec<String>> {
+    let mut rows = vec![vec![
+        "site_index".to_string(),
+        "sub_goal".to_string(),
+        "format".to_string(),
+        "data".to_string(),
+    ]];
+    if let Some(results) = aggregate["results"].as_array() {
+        for entry in results {
+            let site_index = entry["site_index"].as_u64().map(|n| n.to_string()).unwrap_or_default();
+            let sub_goal = entry["sub_goal"].as_str().unwrap_or_default().to_string();
+            let format = entry["format"].as_str().unwrap_or_default().to_string();
+            let data = match &entry["data"] {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            rows.push(vec![site_index, sub_goal, format, data]);
+        }
+    }
+    rows
+}
+
+/// The only place in the entire system that ever holds a Google access
+/// token, and it runs exclusively in the orchestrator's own process —
+/// never inside a per-site `mice autopilot` child, whose environment
+/// (`autopilot_subprocess_env`) never includes any GOOGLE_SHEETS_*
+/// variable at all. The isolation is structural, not a convention someone
+/// could accidentally violate later.
+pub fn push_aggregate_to_sheet(
+    job_id: &str,
+    spreadsheet_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let aggregate_path = job_dir(job_id).join("aggregate.json");
+    let bytes = std::fs::read(&aggregate_path).map_err(|error| {
+        format!(
+            "Could not read {}: {error}. Run `mice autopilot-multi` first to produce it.",
+            aggregate_path.display()
+        )
+    })?;
+    let aggregate: Value = serde_json::from_slice(&bytes)?;
+    let rows = rows_from_aggregate(&aggregate);
+
+    let client_id = provider_api_key("GOOGLE_SHEETS_CLIENT_ID")?;
+    let client_secret = provider_api_key("GOOGLE_SHEETS_CLIENT_SECRET")?;
+    let refresh_token = provider_api_key("GOOGLE_SHEETS_REFRESH_TOKEN")
+        .map_err(|_| "Google Sheets is not connected. Run `mice sheets connect` first.")?;
+    let access_token = refresh_google_access_token(&client_id, &client_secret, &refresh_token)?;
+    append_sheet_rows(&access_token, spreadsheet_id, "A1", &rows)
+}
+
+fn sheets() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments = env::args().skip(2).collect::<Vec<_>>();
+    match arguments.first().map(String::as_str) {
+        Some("connect") if arguments.len() == 1 => sheets_connect(),
+        Some("disconnect") if arguments.len() == 1 => sheets_disconnect(),
+        Some("push") if arguments.len() >= 2 => {
+            let job_id = arguments[1].clone();
+            let mut rest = arguments[2..].to_vec();
+            let spreadsheet_id = extract_flag_value(&mut rest, "--sheet-id")
+                .ok_or("Usage: mice sheets push <job-id> --sheet-id <id>")?;
+            push_aggregate_to_sheet(&job_id, &spreadsheet_id)?;
+            println!("Pushed job {job_id}'s results to Google Sheet {spreadsheet_id}.");
+            Ok(())
+        }
+        _ => Err(
+            "Usage: mice sheets <connect|disconnect|push <job-id> --sheet-id <id>>".into(),
+        ),
     }
 }
 
@@ -10999,5 +11352,119 @@ mod recipe_matching_tests {
             Some("site-2-result.json")
         );
         assert!(path.to_string_lossy().contains("job-1234"));
+    }
+
+    #[test]
+    fn percent_encode_path_segment_leaves_unreserved_characters_alone_and_escapes_the_rest() {
+        assert_eq!(percent_encode_path_segment("abcXYZ019-_.~"), "abcXYZ019-_.~");
+        assert_eq!(percent_encode_path_segment("Sheet1!A1"), "Sheet1%21A1");
+        assert_eq!(percent_encode_path_segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn sheets_append_url_encodes_the_spreadsheet_id_and_range_into_the_correct_endpoint_shape() {
+        let url = sheets_append_url("1a2B_c-3", "Sheet1!A1");
+        assert_eq!(
+            url,
+            "https://sheets.googleapis.com/v4/spreadsheets/1a2B_c-3/values/Sheet1%21A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS"
+        );
+    }
+
+    #[test]
+    fn sheets_append_payload_wraps_rows_under_a_values_key_unchanged() {
+        let rows = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string(), "d".to_string()],
+        ];
+        let payload = sheets_append_payload(&rows);
+        assert_eq!(payload, serde_json::json!({"values": [["a", "b"], ["c", "d"]]}));
+    }
+
+    #[test]
+    fn rows_from_aggregate_builds_a_header_row_plus_one_row_per_result_stringifying_structured_data() {
+        let aggregate = serde_json::json!({
+            "goal": "collect prices",
+            "result_count": 2,
+            "results": [
+                {"site_index": 0, "sub_goal": "find the price on a.com", "format": "structured", "data": {"price": "$12"}},
+                {"site_index": 1, "sub_goal": "find the price on b.com", "format": "unstructured", "data": "done"},
+            ]
+        });
+        let rows = rows_from_aggregate(&aggregate);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec!["site_index", "sub_goal", "format", "data"]);
+        assert_eq!(rows[1][0], "0");
+        assert_eq!(rows[1][1], "find the price on a.com");
+        assert_eq!(rows[1][2], "structured");
+        assert_eq!(rows[1][3], "{\"price\":\"$12\"}");
+        assert_eq!(rows[2], vec!["1", "find the price on b.com", "unstructured", "done"]);
+    }
+
+    #[test]
+    fn rows_from_aggregate_with_no_results_is_just_the_header_row_not_a_panic() {
+        let aggregate = serde_json::json!({"goal": "nothing", "result_count": 0, "results": []});
+        assert_eq!(rows_from_aggregate(&aggregate).len(), 1);
+    }
+
+    #[test]
+    fn google_device_code_response_prefers_the_rfc_field_name_over_googles_legacy_one() {
+        let both = GoogleDeviceCodeResponse {
+            device_code: "d".into(),
+            user_code: "u".into(),
+            verification_uri: Some("https://rfc.example/device".into()),
+            verification_url: Some("https://legacy.example/device".into()),
+            expires_in: 1800,
+            interval: 5,
+        };
+        assert_eq!(both.verification_link(), "https://rfc.example/device");
+
+        let legacy_only = GoogleDeviceCodeResponse {
+            device_code: "d".into(),
+            user_code: "u".into(),
+            verification_uri: None,
+            verification_url: Some("https://legacy.example/device".into()),
+            expires_in: 1800,
+            interval: 5,
+        };
+        assert_eq!(legacy_only.verification_link(), "https://legacy.example/device");
+    }
+
+    #[test]
+    fn provider_key_name_and_variable_round_trip_for_every_google_sheets_credential() {
+        for (variable, name) in [
+            ("GOOGLE_SHEETS_CLIENT_ID", "google-sheets-client-id"),
+            ("GOOGLE_SHEETS_CLIENT_SECRET", "google-sheets-client-secret"),
+        ] {
+            assert_eq!(provider_key_name(variable), Some(name));
+            assert_eq!(provider_key_variable(name), Some(variable));
+        }
+        // The refresh token is looked up (so keychain_api_key's gate must
+        // accept it) but is deliberately never settable through `mice keys
+        // set` — it only ever comes from the device flow in sheets_connect.
+        assert_eq!(
+            provider_key_name("GOOGLE_SHEETS_REFRESH_TOKEN"),
+            Some("google-sheets-refresh-token")
+        );
+        assert_eq!(provider_key_variable("google-sheets-refresh-token"), None);
+    }
+
+    #[test]
+    fn no_google_sheets_credential_is_ever_passed_via_command_env_or_arg() {
+        let source = include_str!("main.rs");
+        for credential in [
+            "GOOGLE_SHEETS_REFRESH_TOKEN",
+            "GOOGLE_SHEETS_CLIENT_ID",
+            "GOOGLE_SHEETS_CLIENT_SECRET",
+        ] {
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.contains(credential) {
+                    assert!(
+                        !trimmed.starts_with(".env(") && !trimmed.starts_with(".arg("),
+                        "found `{credential}` passed via .env()/.arg() on line: {line}"
+                    );
+                }
+            }
+        }
     }
 }
