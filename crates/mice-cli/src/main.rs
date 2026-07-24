@@ -2282,23 +2282,36 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
                 &current.snapshot,
                 true,
             );
-            let result = match result {
-                Ok(result) => result,
-                Err(error) if is_axi_stale_error(&error) && recovery.retry_stale_once() => {
-                    history.push(format!("stale AXI target: {error}"));
+            if let Err(error) = result {
+                if is_axi_stale_error(&error) && recovery.retry_stale_once() {
+                    // Not the raw error text: it repeats the stale uid
+                    // itself (`Target \`g5:3_2\` is not in the current
+                    // snapshot...`), which is exactly the same "old uid
+                    // token sitting in history" shape confirmed below to
+                    // get copied back out as a candidate on a later turn.
+                    history.push(format!("{} was stale; re-observed.", call.name));
                     println!(
                         "The page changed before MICE acted. Re-observing once and replanning safely."
                     );
                     continue;
                 }
-                Err(error) => return pause_axi(goal, &history, &error),
-            };
-            let outcome = if result.text.trim().is_empty() {
-                "action sent".into()
-            } else {
-                bounded_for_model(&result.text, 300)
-            };
-            history.push(format!("{} {} => {outcome}", call.name, call.args));
+                return pause_axi(goal, &history, &error);
+            }
+            // Uid-free by design: `call.args`/the executed action's own
+            // result both embed uid tokens from a specific, now-past
+            // snapshot generation, and confirmed live (MICE_DEBUG_AXI_PROMPT)
+            // that repeating them in history — even just as inert past
+            // context — gets copied back out as a `candidate_id` on a
+            // later turn instead of a uid from the *current* snapshot
+            // section, which can never resolve (see resolve_current_uid's
+            // note on chrome-devtools-axi's generation counter). History
+            // only needs to convey what happened, not which uid was used
+            // for it — the model gets a fresh, current snapshot at the
+            // top of every turn regardless.
+            history.push(format!(
+                "{} succeeded.",
+                describe_action_for_history(&call, &current.snapshot)
+            ));
 
             if tool_kind == tools::ToolKind::Mutating {
                 mutating_budget = mutating_budget.saturating_sub(1);
@@ -2721,6 +2734,24 @@ fn extract_goal_url(goal: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Uid-free description of an executed action for `history`. `call.args`
+/// carries a uid tied to one specific, already-past snapshot generation;
+/// describing it by (role, accessible name) instead keeps history useful
+/// context without a token the model could later mistake for something
+/// still current (see the history.push call site above for why this
+/// matters, not just style).
+fn describe_action_for_history(call: &ToolCall, snapshot: &tools::BrowserSnapshot) -> String {
+    match call.args.get("uid").and_then(Value::as_str) {
+        Some(uid) => match snapshot.identity_of(uid) {
+            Some((role, label)) if !label.is_empty() => {
+                format!("{} {role} \"{label}\"", call.name)
+            }
+            _ => call.name.clone(),
+        },
+        None => format!("{} {}", call.name, call.args),
+    }
 }
 
 fn axi_call_from_decision(
@@ -9457,6 +9488,42 @@ mod recipe_matching_tests {
         assert_eq!(
             goal_navigation_shortcut("click the search button", blank),
             None
+        );
+    }
+
+    #[test]
+    fn describe_action_for_history_never_repeats_a_uid() {
+        // The exact live repro: a history entry embedding a uid token got
+        // copied back out by the model on a later turn as a candidate_id
+        // that could never resolve, because it belonged to a past
+        // snapshot generation. Confirm the description this feeds into
+        // history contains neither the executed uid nor any `g<N>:`-shaped
+        // token at all.
+        let snapshot =
+            tools::BrowserSnapshot::from_axi_output("uid=g10:3_2 link \"Jump to content\" url=\"#bodyContent\"");
+        let call = ToolCall {
+            name: "browser.click".into(),
+            args: json!({"uid": "g10:3_2"}),
+        };
+        let description = describe_action_for_history(&call, &snapshot);
+        assert_eq!(description, "browser.click link \"Jump to content\"");
+        assert!(!description.contains("g10:3_2"));
+        assert!(!description.contains("uid"));
+
+        // No matching target (e.g. the identity lookup itself missed):
+        // falls back to just the action name, still uid-free.
+        let empty = tools::BrowserSnapshot::from_axi_output("");
+        assert_eq!(describe_action_for_history(&call, &empty), "browser.click");
+
+        // No uid on the call at all (open_url/scroll): described from its
+        // own args, which never contain a uid to begin with.
+        let open = ToolCall {
+            name: "browser.open".into(),
+            args: json!({"url": "https://en.wikipedia.org/"}),
+        };
+        assert_eq!(
+            describe_action_for_history(&open, &empty),
+            "browser.open {\"url\":\"https://en.wikipedia.org/\"}"
         );
     }
 }
