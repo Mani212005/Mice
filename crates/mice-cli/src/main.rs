@@ -1888,9 +1888,26 @@ fn autopilot_axi(goal: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = config()?;
     let runner = SystemRunner;
     
-    // Default to auto-connect for autopilot to reduce CAPTCHA triggers
-    if std::env::var_os("CHROME_DEVTOOLS_AXI_AUTO_CONNECT").is_none() {
-        unsafe { std::env::set_var("CHROME_DEVTOOLS_AXI_AUTO_CONNECT", "1") };
+    // Reduce CAPTCHA/anti-bot triggers via a persistent Chrome profile:
+    // cookies/session state survive across runs, so MICE looks like a
+    // returning user rather than a fresh session every time (plan/auto.md
+    // 2.6). This used to force CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1, but that
+    // only *attaches* to a Chrome window the person already has running
+    // with `chrome://inspect/#remote-debugging` manually enabled (Chrome
+    // 144+) — with nothing to attach to, it fails outright with no
+    // fallback to launching a browser, and silently ignores
+    // CHROME_DEVTOOLS_AXI_HEADED (that branch is only read on the
+    // self-launch path, which auto-connect skips). A persistent
+    // --userDataDir keeps the same "returning user" benefit while still
+    // reliably launching a working browser on every run.
+    if std::env::var_os("CHROME_DEVTOOLS_AXI_AUTO_CONNECT").is_none()
+        && std::env::var_os("CHROME_DEVTOOLS_AXI_BROWSER_URL").is_none()
+        && std::env::var_os("CHROME_DEVTOOLS_AXI_USER_DATA_DIR").is_none()
+    {
+        let profile_dir = axi_chrome_profile_dir();
+        if std::fs::create_dir_all(&profile_dir).is_ok() {
+            unsafe { std::env::set_var("CHROME_DEVTOOLS_AXI_USER_DATA_DIR", &profile_dir) };
+        }
     }
 
     // So `mice autopilot "..."` works as a single command: start Ollama if
@@ -4224,7 +4241,7 @@ fn doctor() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Browser setup: npx -y chrome-devtools-axi; optionally install chrome-devtools-mcp globally to avoid cold starts."
     );
-    println!("  Autopilot mode defaults to CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1 to attach to a running Chrome profile and reduce CAPTCHA triggers.");
+    println!("  Autopilot mode defaults to a persistent Chrome profile (CHROME_DEVTOOLS_AXI_USER_DATA_DIR) to reduce CAPTCHA triggers, and launches its own Chrome. Set CHROME_DEVTOOLS_AXI_AUTO_CONNECT=1 yourself to attach to an already-running Chrome 144+ with chrome://inspect/#remote-debugging enabled instead.");
     Ok(())
 }
 
@@ -4385,7 +4402,15 @@ fn ensure_ollama_server() -> Result<(), Box<dyn std::error::Error>> {
     Err("Ollama did not become ready within 20 seconds. Run `ollama serve` for diagnostics.".into())
 }
 
-const AXI_RECIPE_EMBEDDING_MODEL: &str = "nomic-embed-text";
+// Fully qualified: `ollama_model_ready` matches the exact name Ollama
+// reports back from `/api/tags`, which is `nomic-embed-text:latest`, not
+// the bare `nomic-embed-text` a plain `ollama pull nomic-embed-text`
+// resolves to. The bare name never matched, so this used to re-run
+// `ollama pull` (a manifest round-trip, not a re-download once cached, but
+// still needless work and needless "pulling manifest…" output) on every
+// single autopilot invocation regardless of whether the model was already
+// installed.
+const AXI_RECIPE_EMBEDDING_MODEL: &str = "nomic-embed-text:latest";
 
 /// Best-effort pull of the small embedding model recipe matching (Pillar C)
 /// uses. It is a few hundred MiB, not a multi-GiB model choice, so this
@@ -9191,6 +9216,14 @@ pub fn recipes_dir() -> PathBuf {
         .parent()
         .unwrap()
         .join("recipes")
+}
+
+fn axi_chrome_profile_dir() -> PathBuf {
+    config_path()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .parent()
+        .unwrap()
+        .join("chrome-profile")
 }
 
 pub fn save_recipe(recipe: &AxiRecipe) -> std::io::Result<()> {
