@@ -489,6 +489,34 @@ pub fn stream_ollama_chat(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f32>>,
+}
+
+/// Retrieve an embedding from Ollama's `/api/embed` endpoint.
+pub fn ollama_embed(
+    endpoint: &str,
+    model: &str,
+    input: &str,
+) -> Result<Vec<f32>, OllamaError> {
+    let response = ollama_agent()
+        .post(endpoint)
+        .send_json(serde_json::json!({
+            "model": model,
+            "input": input,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+        }))
+        .map_err(ollama_request_error)?;
+    let body: OllamaEmbedResponse = serde_json::from_reader(response.into_reader())?;
+    body.embeddings.into_iter().next().ok_or_else(|| {
+        OllamaError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "No embeddings returned",
+        ))
+    })
+}
+
 /// Verify both the local Ollama service and a named model before selecting a
 /// local tool-loop lane. A binary on PATH alone does not guarantee either.
 pub fn ollama_model_ready(endpoint: &str, model: &str) -> Result<(), OllamaError> {
@@ -1311,5 +1339,54 @@ mod tests {
             payload["text"]["format"]["schema"]["properties"]["action"]["enum"][0],
             "click"
         );
+    }
+    #[test]
+    fn ollama_embed_parses_json_and_returns_first_embedding() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1_024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4);
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            let body = r#"{"model":"nomic-embed-text","embeddings":[[0.1, 0.2, 0.3]]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let embedding = ollama_embed(
+            &endpoint,
+            "nomic-embed-text",
+            "test input",
+        )
+        .unwrap();
+        server.join().unwrap();
+        
+        assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
     }
 }
