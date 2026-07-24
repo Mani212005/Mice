@@ -1776,6 +1776,31 @@ fn validate_agent_decision(decision: &AgentDecision) -> Result<(), Box<dyn std::
     if decision.say_to_user.trim().is_empty() || decision.say_to_user.chars().count() > 500 {
         return Err("The autopilot decision did not include a safe narration.".into());
     }
+    // A Unicode "smart quote" in one of these fields is a strong signal
+    // the model's own JSON generation went off the rails mid-string —
+    // confirmed live: a `value` field meant to hold only the search
+    // phrase ran on through smart-quote-delimited fragments of the
+    // *next* field's name and content instead of stopping at its own
+    // closing quote (e.g. `"...Telescope”, “done_summary”: “Search for…”`
+    // as one string). This still parses as syntactically valid JSON — a
+    // smart quote is just an ordinary character to a JSON parser, so the
+    // earlier hard-JSON-parse-error retry never catches it — but a
+    // `value` this corrupted gets typed verbatim into the real page. None
+    // of these fields legitimately need typographic punctuation for this
+    // loop's purposes, so treat any occurrence as corrupted rather than
+    // risk it reaching the page.
+    let looks_corrupted =
+        |text: &str| text.contains(['\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}']);
+    if looks_corrupted(&decision.say_to_user)
+        || decision.value.as_deref().is_some_and(looks_corrupted)
+        || decision.done_summary.as_deref().is_some_and(looks_corrupted)
+        || decision.question.as_deref().is_some_and(looks_corrupted)
+    {
+        return Err(
+            "The autopilot decision's text looked corrupted (stray smart-quote characters)."
+                .into(),
+        );
+    }
     if matches!(decision.action, AgentAction::Fill)
         && decision.value.as_deref().unwrap_or_default().is_empty()
     {
@@ -9378,6 +9403,41 @@ mod hover_tests {
         ] {
             assert!(!is_soft_execution_refusal(&infra_failure), "{infra_failure}");
         }
+    }
+
+    #[test]
+    fn validate_agent_decision_rejects_a_smart_quote_corrupted_value() {
+        // The exact live reproduction: the model's `value` field ran on
+        // through smart-quote-delimited fragments of the *next* field
+        // instead of stopping at its own close, and that whole corrupted
+        // string then got typed verbatim into the real search box before
+        // this check existed. Still syntactically valid JSON — a smart
+        // quote is just an ordinary character — so this has to be caught
+        // by content inspection, not JSON parsing.
+        let corrupted = AgentDecision {
+            say_to_user: "Filling the search box".into(),
+            action: AgentAction::Fill,
+            candidate_id: Some("g10:9_1".into()),
+            url: None,
+            value: Some(
+                "James Webb Space Telescope\u{201D}, \u{201C}done_summary\u{201D}: \u{201C}Search initiated.\u{201D}"
+                    .into(),
+            ),
+            done_summary: None,
+            question: None,
+        };
+        assert!(validate_agent_decision(&corrupted).is_err());
+
+        let clean = AgentDecision {
+            say_to_user: "Filling the search box".into(),
+            action: AgentAction::Fill,
+            candidate_id: Some("g10:9_1".into()),
+            url: None,
+            value: Some("James Webb Space Telescope".into()),
+            done_summary: None,
+            question: None,
+        };
+        assert!(validate_agent_decision(&clean).is_ok());
     }
 
     #[test]
