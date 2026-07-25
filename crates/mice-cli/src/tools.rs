@@ -238,8 +238,21 @@ impl BrowserSnapshot {
             return format!("{} {}", call.name, call.args);
         };
         self.target(uid)
-            .map(|target| format!("{} on {uid}: {}", call.name, target.context))
-            .unwrap_or_else(|| format!("{} on unavailable target {uid}", call.name))
+            .map(|target| {
+                let label = accessible_label(&target.context);
+                let element_desc = if label.is_empty() {
+                    format!("{} (unlabeled)", target.role)
+                } else {
+                    format!("'{}' ({})", label, target.role)
+                };
+                
+                if let Some(text) = call.args.get("text").and_then(Value::as_str) {
+                    format!("{} \"{}\" into {}", call.name, text, element_desc)
+                } else {
+                    format!("{} on {}", call.name, element_desc)
+                }
+            })
+            .unwrap_or_else(|| format!("{} on unavailable target", call.name))
     }
 
     /// Re-resolve a proposed action's target against a freshly captured
@@ -265,17 +278,17 @@ impl BrowserSnapshot {
     /// find a way to keep using the old one. `Gone` still means what it
     /// always did: no element with that identity exists anymore — a real
     /// change, not just an incidental mutation elsewhere on the page.
-    pub fn resolve_current_uid(&self, other: &Self, call: &ToolCall) -> TargetResolution {
+    pub fn resolve_current_uid(&self, original_snapshot: &Self, call: &ToolCall) -> TargetResolution {
         let Some(uid) = call.args.get("uid").and_then(Value::as_str) else {
             return TargetResolution::NoUidNeeded;
         };
-        if other.target(uid).is_some() {
+        if self.target(uid).is_some() {
             return TargetResolution::Resolved(uid.to_string());
         }
-        let Some((role, label)) = self.identity_of(uid) else {
+        let Some((role, label)) = original_snapshot.identity_of(uid) else {
             return TargetResolution::Gone;
         };
-        match other.find_uid_by_identity(&role, &label) {
+        match self.find_uid_by_identity(&role, &label) {
             Some(resolved) => TargetResolution::Resolved(resolved),
             None => TargetResolution::Gone,
         }
@@ -2138,7 +2151,7 @@ mod tests {
             "uid=g11:3_2 link \"Jump to content\" url=\"#bodyContent\" data-rev=\"7\"",
         );
         assert_eq!(
-            proposed.resolve_current_uid(&unrelated_mutation, &call),
+            unrelated_mutation.resolve_current_uid(&proposed, &call),
             TargetResolution::Resolved("g11:3_2".to_string())
         );
 
@@ -2146,7 +2159,7 @@ mod tests {
         let unchanged =
             BrowserSnapshot::from_axi_output("uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"");
         assert_eq!(
-            proposed.resolve_current_uid(&unchanged, &call),
+            unchanged.resolve_current_uid(&proposed, &call),
             TargetResolution::Resolved("g9:3_2".to_string())
         );
 
@@ -2155,7 +2168,7 @@ mod tests {
         let real_change =
             BrowserSnapshot::from_axi_output("uid=g11:9_1 button \"Main menu\" haspopup=\"menu\"");
         assert_eq!(
-            proposed.resolve_current_uid(&real_change, &call),
+            real_change.resolve_current_uid(&proposed, &call),
             TargetResolution::Gone
         );
 
