@@ -138,7 +138,7 @@ fn usage() -> Result<(), Box<dyn std::error::Error>> {
         "\nAsk and screen\n  mice ask [--action <preset>] <instruction>\n  mice see [--display|--sheet] <question>\n  mice history [query] | mice history --clear | mice plans\n  mice actions | route"
     );
     println!(
-        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice autopilot-multi <goal>  (splits a goal across several sites, one subprocess per site)\n  mice sheets connect | disconnect | push <job-id> --sheet-id <id>\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
+        "\nGoals, browser, and files\n  mice autopilot [--engine axi] <goal>\n  mice autopilot-multi <goal>  (splits a goal across several sites, one subprocess per site)\n  mice sheets connect | disconnect | push <job-id> --new-sheet \"<title>\"\n  mice knowledge add <site> \"<fact>\" | mice knowledge list\n  mice do [--model <model>] [--max-actions <n>] [--session <name>] <goal>\n  mice tidy [--apply] [--no-label] [folder] | mice tidy --undo\n  mice file --add-root <folder> | --finder | <path>"
     );
     println!(
         "\nIntegrations\n  mice connect <codex|claude|all> [--yes]\n  mice disconnect <codex|claude|all> [--yes]\n  mice integrations\n  mice mcp-server | mice mcp <list|call>"
@@ -2149,6 +2149,10 @@ fn autopilot_multi() -> Result<(), Box<dyn std::error::Error>> {
     let aggregate = aggregate_site_results(&goal, &results);
     let aggregate_path = job_dir(&job_id).join("aggregate.json");
     std::fs::write(&aggregate_path, serde_json::to_vec_pretty(&aggregate)?)?;
+    // Same reasoning as save_site_result: this is the collected scrape of
+    // every site in the job, so it gets the same owner-only treatment as
+    // progress.json rather than the default umask.
+    mission::restrict_file_to_user(&aggregate_path)?;
     println!(
         "MICE: Job {job_id} complete. {} of {} site(s) produced a result. Aggregate written to {}.",
         results.len(),
@@ -2214,7 +2218,27 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    autopilot_axi(&goal, job_context)
+    // An ordinary error return is a *failure with a known reason*, not a
+    // crash — but JobProgressGuard's Drop cannot tell the two apart, so it
+    // marks the site Crashed with no `last_error` on the way out. Record
+    // the real reason here, after the guard has already dropped, so
+    // `progress.json` distinguishes "hit its decision limit" from "the
+    // process died" instead of reporting every failure as an unexplained
+    // crash.
+    let site = job_context
+        .as_ref()
+        .map(|context| (context.job_id.clone(), context.site_index));
+    let outcome = autopilot_axi(&goal, job_context);
+    if let (Some((job_id, site_index)), Err(error)) = (site, &outcome) {
+        let _ = update_job_site_status(
+            &job_id,
+            site_index,
+            SiteStatus::Failed,
+            None,
+            Some(error.to_string()),
+        );
+    }
+    outcome
 }
 
 /// Browser autopilot v2: the registry shells out to chrome-devtools-axi, so no
@@ -2359,6 +2383,12 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
             
             if observed.snapshot.is_captcha() {
                 println!("MICE has handed this step back to you. A CAPTCHA or security challenge was detected.");
+                // Returns Ok, so the `Err`-path reconciliation in
+                // `autopilot()` never sees it and the guard's Drop would
+                // otherwise record a bare `Crashed`. Name the real reason.
+                if let Some(guard) = job_progress_guard.as_mut() {
+                    guard.mark_failed("a CAPTCHA or security challenge blocked this site".into());
+                }
                 return Ok(());
             }
 
@@ -2396,9 +2426,11 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
                 // context here. Cheap domain prefilter is a substring check
                 // against the observation text itself (which contains the
                 // live `url: ...` line), not a separate extraction step.
-                if !embed.is_empty() {
+                if !embed.is_empty()
+                    && let Some(domain) = observed_domain(&observed.text)
+                {
                     knowledge_facts =
-                        matching_knowledge_facts(&observed.text, &embed, &load_knowledge_snippets());
+                        matching_knowledge_facts(&domain, &embed, &load_knowledge_snippets());
                 }
             }
 
@@ -2625,14 +2657,8 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
                                                     .rev()
                                                     .find(|step| step.target_role.is_some() && step.target_context.is_some())
                                             {
-                                                let domain = observed
-                                                    .text
-                                                    .lines()
-                                                    .find(|line| line.starts_with("url: "))
-                                                    .and_then(|line| line.strip_prefix("url: "))
-                                                    .and_then(|url| url.split('/').nth(2))
-                                                    .unwrap_or("")
-                                                    .to_string();
+                                                let domain =
+                                                    observed_domain(&observed.text).unwrap_or_default();
                                                 if !domain.is_empty() {
                                                     let fact = format!(
                                                         "{domain}'s primary interactive element for this kind of goal is a {} labeled \"{}\".",
@@ -2647,13 +2673,7 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
                                                     .unwrap_or_default();
                                                     if !fact_embedding.is_empty() {
                                                         let _ = save_knowledge_snippet(&KnowledgeSnippet {
-                                                            snippet_id: format!(
-                                                                "knowledge-{}",
-                                                                std::time::SystemTime::now()
-                                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                                    .unwrap()
-                                                                    .as_secs()
-                                                            ),
+                                                            snippet_id: knowledge_snippet_id(&domain, &fact),
                                                             site_pattern: domain,
                                                             fact,
                                                             fact_embedding,
@@ -3124,12 +3144,18 @@ pub enum ResultFormat {
     Unstructured,
 }
 
+/// Owner-only, like the progress file beside it: a site result holds
+/// whatever the run scraped off a page, which is the same class of data
+/// `Ledger::record` already restricts. It used to be written at the
+/// default umask while `progress.json` in the same directory was 0600.
 pub fn save_site_result(path: &Path, result: &SiteResult) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        mission::restrict_directory_to_user(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(result)?;
-    std::fs::write(path, bytes)
+    std::fs::write(path, bytes)?;
+    mission::restrict_file_to_user(path)
 }
 
 pub fn load_site_result(path: &Path) -> Option<SiteResult> {
@@ -3182,9 +3208,28 @@ fn update_job_site_status(
             format!("no job progress file for job {job_id}"),
         ));
     };
+    apply_site_update(&mut progress, site_index, status, result_path, error);
+    save_job_progress(&progress)
+}
+
+/// The read-modify part of `update_job_site_status`, split out so the
+/// bookkeeping is testable in memory instead of only through `jobs_dir()`.
+pub fn apply_site_update(
+    progress: &mut JobProgress,
+    site_index: usize,
+    status: SiteStatus,
+    result_path: Option<String>,
+    error: Option<String>,
+) {
     if let Some(site) = progress.sites.get_mut(site_index) {
         site.status = status;
-        site.attempts += 1;
+        // Counts attempts, not status writes. Only entering InProgress
+        // starts an attempt; the Done/Failed/Crashed write that ends that
+        // same attempt must not count a second one, or a site that ran
+        // once and succeeded reports `attempts: 2`.
+        if status == SiteStatus::InProgress {
+            site.attempts += 1;
+        }
         if result_path.is_some() {
             site.result_path = result_path;
         }
@@ -3193,7 +3238,6 @@ fn update_job_site_status(
         }
     }
     progress.updated_at = unix_timestamp();
-    save_job_progress(&progress)
 }
 
 /// Marks this run's site `Crashed` when dropped unless `mark_done`/
@@ -4463,13 +4507,7 @@ fn knowledge() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map_err(|error| format!("Could not embed the fact locally: {error}"))?;
             save_knowledge_snippet(&KnowledgeSnippet {
-                snippet_id: format!(
-                    "knowledge-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                ),
+                snippet_id: knowledge_snippet_id(&site, fact),
                 site_pattern: site.clone(),
                 fact: fact.to_string(),
                 fact_embedding: embed,
@@ -4637,8 +4675,10 @@ fn save_keychain_api_key(variable: &str, secret: &str) -> Result<(), Box<dyn std
 // credential here (Groq, OpenAI) is 100% user-supplied via `mice keys
 // set`, with zero shared app/quota/liability on MICE's side, and Google
 // Sheets follows the same model: the user registers their own OAuth
-// client in Google Cloud Console (type "Desktop app" or "TVs and Limited
-// Input devices") and pastes its ID/secret in via `mice keys set
+// client in Google Cloud Console (which must be type "TVs and Limited
+// Input devices" — the device flow rejects a "Desktop app" client, and
+// only accepts a fixed scope allowlist; see GOOGLE_SHEETS_SCOPE) and
+// pastes its ID/secret in via `mice keys set
 // google-sheets-client-id` / `google-sheets-client-secret`. Google's
 // device-flow token endpoint requires that "client secret" be presented
 // even for these installed-app client types (it is not meant to be kept
@@ -4654,7 +4694,25 @@ fn save_keychain_api_key(variable: &str, secret: &str) -> Result<(), Box<dyn std
 
 const GOOGLE_DEVICE_CODE_ENDPOINT: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-const GOOGLE_SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/spreadsheets";
+/// Google's device flow accepts only a fixed, documented allowlist of
+/// scopes — `email`/`openid`/`profile`, `drive.appdata`, `drive.file`, and
+/// the two YouTube scopes. The broad `spreadsheets` scope is **not** on it,
+/// so requesting it fails the device-code request outright
+/// (https://developers.google.com/identity/protocols/oauth2/limited-input-device).
+/// `drive.file` is the only Sheets-capable scope the flow allows, and it is
+/// enough: `spreadsheets.create` and `spreadsheets.values.append` both
+/// accept it. Its cost is per-file access — MICE can only touch
+/// spreadsheets it created itself, which is why `sheets push` grew
+/// `--new-sheet` below.
+const GOOGLE_SHEETS_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+
+/// The device flow also requires an OAuth client registered as "TVs and
+/// Limited Input devices"; a "Desktop app" client is rejected. Stated once
+/// here so every error message that mentions it stays consistent.
+const GOOGLE_OAUTH_CLIENT_SETUP: &str =
+    "Create a free OAuth client in Google Cloud Console with application type \
+     \"TVs and Limited Input devices\" (a \"Desktop app\" client will not work with this flow), \
+     and enable the Google Sheets API for that project.";
 
 /// Form-encoded POST with no `Authorization` header — the shape RFC 6749's
 /// token endpoint requires, distinct from `post_provider_request`'s
@@ -4712,7 +4770,14 @@ fn request_google_device_code(
     let value = post_google_oauth_form(
         GOOGLE_DEVICE_CODE_ENDPOINT,
         &[("client_id", client_id), ("scope", GOOGLE_SHEETS_SCOPE)],
-    )?;
+    )
+    .map_err(|error| {
+        // `invalid_client` here almost always means the client was
+        // registered as the wrong application type — the single most
+        // likely setup mistake, and one Google's own message
+        // ("The OAuth client was not found") does not hint at.
+        format!("{error}\n{GOOGLE_OAUTH_CLIENT_SETUP}")
+    })?;
     serde_json::from_value(value).map_err(|error| {
         format!("Google's device-code response was not in the expected shape: {error}").into()
     })
@@ -4758,8 +4823,10 @@ fn poll_google_device_token_once(
 
 fn sheets_connect() -> Result<(), Box<dyn std::error::Error>> {
     let client_id = provider_api_key("GOOGLE_SHEETS_CLIENT_ID").map_err(|_| {
-        "GOOGLE_SHEETS_CLIENT_ID is not configured. Create a free OAuth client in Google Cloud \
-         Console (type \"Desktop app\"), then run `mice keys set google-sheets-client-id`."
+        format!(
+            "GOOGLE_SHEETS_CLIENT_ID is not configured. {GOOGLE_OAUTH_CLIENT_SETUP} Then run \
+             `mice keys set google-sheets-client-id`."
+        )
     })?;
     let client_secret = provider_api_key("GOOGLE_SHEETS_CLIENT_SECRET").map_err(|_| {
         "GOOGLE_SHEETS_CLIENT_SECRET is not configured. Run `mice keys set google-sheets-client-secret` \
@@ -4791,7 +4858,11 @@ fn sheets_connect() -> Result<(), Box<dyn std::error::Error>> {
         )? {
             DevicePollOutcome::Success { refresh_token } => {
                 save_keychain_api_key("GOOGLE_SHEETS_REFRESH_TOKEN", &refresh_token)?;
-                println!("Google Sheets connected.");
+                println!(
+                    "Google Sheets connected. MICE can read and write only the spreadsheets it \
+                     creates itself — push results with `mice sheets push <job-id> --new-sheet \
+                     \"<title>\"`."
+                );
                 return Ok(());
             }
             DevicePollOutcome::AuthorizationPending => continue,
@@ -4886,8 +4957,48 @@ pub fn append_sheet_rows(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = sheets_append_url(spreadsheet_id, range);
     let payload = sheets_append_payload(rows).to_string();
-    post_provider_request("Google Sheets API", &url, access_token, &payload)?;
+    post_provider_request("Google Sheets API", &url, access_token, &payload).map_err(|error| {
+        // Under the device flow's `drive.file` scope (the only
+        // Sheets-capable scope Google allows there) MICE has per-file
+        // access to spreadsheets it created and nothing else, so a sheet
+        // made by hand in the browser returns 403/404 rather than working.
+        // Say that plainly instead of surfacing a bare HTTP status.
+        format!(
+            "{error}\nIf this sheet was not created by MICE, it cannot be written to: the device \
+             authorization flow only permits per-file access to sheets MICE made itself. Use \
+             `mice sheets push <job-id> --new-sheet \"<title>\"` to create one."
+        )
+    })?;
     Ok(())
+}
+
+pub fn sheets_create_payload(title: &str) -> Value {
+    serde_json::json!({ "properties": { "title": title } })
+}
+
+/// Creates a spreadsheet MICE owns, which is what makes it writable at all
+/// under `drive.file`'s per-file access. Returns `(spreadsheet_id, url)`.
+pub fn create_spreadsheet(
+    access_token: &str,
+    title: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let payload = sheets_create_payload(title).to_string();
+    let response = post_provider_request(
+        "Google Sheets API",
+        "https://sheets.googleapis.com/v4/spreadsheets",
+        access_token,
+        &payload,
+    )?;
+    let value: Value = serde_json::from_reader(response.into_reader())?;
+    let id = value["spreadsheetId"]
+        .as_str()
+        .ok_or("Google created a spreadsheet but did not return its id.")?
+        .to_string();
+    let url = value["spreadsheetUrl"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("https://docs.google.com/spreadsheets/d/{id}/edit"));
+    Ok((id, url))
 }
 
 /// Flattens M19c's `aggregate.json` into sheet rows: a header row, then one
@@ -4922,9 +5033,17 @@ pub fn rows_from_aggregate(aggregate: &Value) -> Vec<Vec<String>> {
 /// (`autopilot_subprocess_env`) never includes any GOOGLE_SHEETS_*
 /// variable at all. The isolation is structural, not a convention someone
 /// could accidentally violate later.
+pub enum SheetTarget {
+    /// A sheet MICE created on an earlier push — the only kind of existing
+    /// sheet `drive.file` lets it write to.
+    Existing(String),
+    /// Create the spreadsheet first, which is what grants access to it.
+    New(String),
+}
+
 pub fn push_aggregate_to_sheet(
     job_id: &str,
-    spreadsheet_id: &str,
+    target: &SheetTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let aggregate_path = job_dir(job_id).join("aggregate.json");
     let bytes = std::fs::read(&aggregate_path).map_err(|error| {
@@ -4941,8 +5060,22 @@ pub fn push_aggregate_to_sheet(
     let refresh_token = provider_api_key("GOOGLE_SHEETS_REFRESH_TOKEN")
         .map_err(|_| "Google Sheets is not connected. Run `mice sheets connect` first.")?;
     let access_token = refresh_google_access_token(&client_id, &client_secret, &refresh_token)?;
-    append_sheet_rows(&access_token, spreadsheet_id, "A1", &rows)
+    let spreadsheet_id = match target {
+        SheetTarget::Existing(id) => id.clone(),
+        SheetTarget::New(title) => {
+            let (id, url) = create_spreadsheet(&access_token, title)?;
+            println!("Created sheet \"{title}\": {url}");
+            println!("Reuse it later with: mice sheets push <job-id> --sheet-id {id}");
+            id
+        }
+    };
+    append_sheet_rows(&access_token, &spreadsheet_id, "A1", &rows)?;
+    println!("Pushed job {job_id}'s results to Google Sheet {spreadsheet_id}.");
+    Ok(())
 }
+
+const SHEETS_PUSH_USAGE: &str =
+    "push <job-id> (--new-sheet \"<title>\" | --sheet-id <id of a sheet MICE created>)";
 
 fn sheets() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = env::args().skip(2).collect::<Vec<_>>();
@@ -4952,15 +5085,22 @@ fn sheets() -> Result<(), Box<dyn std::error::Error>> {
         Some("push") if arguments.len() >= 2 => {
             let job_id = arguments[1].clone();
             let mut rest = arguments[2..].to_vec();
-            let spreadsheet_id = extract_flag_value(&mut rest, "--sheet-id")
-                .ok_or("Usage: mice sheets push <job-id> --sheet-id <id>")?;
-            push_aggregate_to_sheet(&job_id, &spreadsheet_id)?;
-            println!("Pushed job {job_id}'s results to Google Sheet {spreadsheet_id}.");
-            Ok(())
+            let target = match (
+                extract_flag_value(&mut rest, "--sheet-id"),
+                extract_flag_value(&mut rest, "--new-sheet"),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err("Pass either --sheet-id or --new-sheet, not both.".into());
+                }
+                (Some(id), None) => SheetTarget::Existing(id),
+                (None, Some(title)) => SheetTarget::New(title),
+                (None, None) => {
+                    return Err(format!("Usage: mice sheets {SHEETS_PUSH_USAGE}").into());
+                }
+            };
+            push_aggregate_to_sheet(&job_id, &target)
         }
-        _ => Err(
-            "Usage: mice sheets <connect|disconnect|push <job-id> --sheet-id <id>>".into(),
-        ),
+        _ => Err(format!("Usage: mice sheets connect | disconnect | {SHEETS_PUSH_USAGE}").into()),
     }
 }
 
@@ -11051,6 +11191,26 @@ pub enum KnowledgeSource {
     ManuallySeeded,
 }
 
+/// Content-derived, so the same fact about the same site always lands in
+/// the same file. Two things depended on this: a timestamp-only id
+/// collided (and silently overwrote) whenever two facts were saved within
+/// the same second, and — worse — auto-capture writes one snippet per
+/// successful run, so a repeatedly-visited site accumulated an unbounded
+/// pile of byte-identical facts under different names. Keying on content
+/// makes a repeat save idempotent instead.
+///
+/// FNV-1a rather than `DefaultHasher` because these ids are filenames that
+/// have to stay stable across Rust versions, which `DefaultHasher`
+/// explicitly does not promise.
+pub fn knowledge_snippet_id(site_pattern: &str, fact: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in site_pattern.bytes().chain(b"\0".iter().copied()).chain(fact.bytes()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("knowledge-{hash:016x}")
+}
+
 pub fn save_knowledge_snippet(snippet: &KnowledgeSnippet) -> std::io::Result<()> {
     let dir = knowledge_dir();
     std::fs::create_dir_all(&dir)?;
@@ -11088,9 +11248,71 @@ pub fn matching_knowledge_facts(
         .iter()
         .filter(|snippet| !snippet.site_pattern.is_empty() && domain.contains(&snippet.site_pattern))
         .map(|snippet| (cosine_similarity(goal_embedding, &snippet.fact_embedding), snippet))
+        .filter(|(similarity, _)| *similarity >= KNOWLEDGE_MIN_SIMILARITY)
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    scored.into_iter().map(|(_, snippet)| snippet.fact.clone()).collect()
+    scored
+        .into_iter()
+        .take(KNOWLEDGE_FACT_LIMIT)
+        .map(|(_, snippet)| snippet.fact.clone())
+        .collect()
+}
+
+/// Auto-capture writes one snippet per successful run, so a site visited
+/// repeatedly accumulates near-duplicate facts indefinitely. Every match
+/// used to be joined into the instruction, which grew the prompt without
+/// bound over time — the exact failure `CompactingHistory` exists to
+/// prevent, reintroduced through a different door. Inject only the few
+/// best-matching facts.
+const KNOWLEDGE_FACT_LIMIT: usize = 3;
+/// And only facts related to this goal at all, so a stale fact left over
+/// from unrelated work on the same domain is not injected just because it
+/// happens to be the only one stored.
+///
+/// Placed from measured `nomic-embed-text` similarities against a real
+/// Wikipedia goal, not guessed: a matching fact scored 0.674, an
+/// off-topic fact for the same site 0.655, and unrelated prose 0.435. The
+/// model barely separates the first two, so this floor is deliberately set
+/// to clear only the third — `KNOWLEDGE_FACT_LIMIT` is what actually
+/// bounds the prompt; ranking alone is too weak to rely on.
+const KNOWLEDGE_MIN_SIMILARITY: f32 = 0.5;
+
+/// The host of the page currently being observed.
+///
+/// Read off the snapshot's `RootWebArea` line, whose `url="..."` attribute
+/// is the live page URL — verified against real `chrome-devtools-axi`
+/// output, which looks like:
+///
+/// ```text
+/// page:
+///   title: Example Domain
+///   refs: 5
+/// snapshot:
+/// uid=g3:2_0 RootWebArea "Example Domain" url="https://example.com/"
+///   uid=g3:2_3 link "Learn more" url="https://iana.org/domains/example"
+/// ```
+///
+/// Two things this must not do, both of which were live bugs. It must not
+/// look for a `url: ` line — there is no such line, so the auto-capture
+/// that depended on one silently never fired. And it must read the
+/// *RootWebArea* line specifically, not the first `url=` anywhere: every
+/// link carries its own, so any other choice returns whatever site the
+/// page happens to link to.
+pub fn observed_domain(observation: &str) -> Option<String> {
+    let root = observation
+        .lines()
+        .find(|line| line.contains("RootWebArea"))?;
+    let start = root.find("url=\"")? + "url=\"".len();
+    let url = &root[start..];
+    let url = &url[..url.find('"')?];
+    // `about:blank` and other non-web schemes have no host worth keying on.
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?;
+    // Strip any :port so a local dev server keys the same as its facts.
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -11249,15 +11471,198 @@ mod recipe_matching_tests {
         };
         let snippets = vec![wikipedia_fact.clone(), unrelated_fact];
 
-        let observation = "page:\n  url: \"https://en.wikipedia.org/wiki/Main_Page\"\nsnapshot:\nuid=g1:1_0 RootWebArea";
         let goal_embedding = [1.0, 0.0];
-        let facts = matching_knowledge_facts(observation, &goal_embedding, &snippets);
+        let facts = matching_knowledge_facts("en.wikipedia.org", &goal_embedding, &snippets);
         assert_eq!(facts, vec![wikipedia_fact.fact.clone()]);
 
-        // An unrelated domain's observation must exclude even a
+        // An unrelated domain must exclude even a
         // perfectly-similar-embedding fact from a different site.
-        let unrelated_observation = "page:\n  url: \"https://example.org/\"\nsnapshot:\n";
-        assert!(matching_knowledge_facts(unrelated_observation, &goal_embedding, &snippets).is_empty());
+        assert!(matching_knowledge_facts("example.org", &goal_embedding, &snippets).is_empty());
+    }
+
+    /// Verbatim `chrome-devtools-axi snapshot` output, captured live
+    /// against example.com — the format the parser actually has to handle,
+    /// rather than an invented one. The previous parser looked for a
+    /// `url: ` line, which this shows does not exist, so the auto-capture
+    /// depending on it silently never ran.
+    const LIVE_SNAPSHOT: &str = "page:\n  title: Example Domain\n  refs: 5\nsnapshot:\nuid=g3:2_0 RootWebArea \"Example Domain\" url=\"https://example.com/\"\n  uid=g3:2_1 heading \"Example Domain\" level=\"1\"\n  uid=g3:2_3 link \"Learn more\" url=\"https://iana.org/domains/example\"\n";
+
+    #[test]
+    fn observed_domain_reads_the_root_web_area_url_from_real_snapshot_output() {
+        assert_eq!(observed_domain(LIVE_SNAPSHOT).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn observed_domain_ignores_a_blank_tab_and_strips_any_port() {
+        let blank = "page:\n  refs: 1\nsnapshot:\nuid=g1:1_0 RootWebArea url=\"about:blank\"\n";
+        assert_eq!(observed_domain(blank), None);
+
+        let local = "page:\nsnapshot:\nuid=g1:1_0 RootWebArea url=\"http://localhost:3000/app\"\n";
+        assert_eq!(observed_domain(local).as_deref(), Some("localhost"));
+    }
+
+    /// The retrieval filter is a substring check, so it must be fed the
+    /// host — not the whole observation, as the call site once did, which
+    /// matched any domain merely *linked from* the page. The live snapshot
+    /// above links to iana.org while sitting on example.com.
+    #[test]
+    fn a_domain_only_linked_from_the_page_does_not_match_its_facts() {
+        let linked_site_fact = KnowledgeSnippet {
+            snippet_id: "k1".into(),
+            site_pattern: "iana.org".into(),
+            fact: "iana.org has a login form.".into(),
+            fact_embedding: vec![1.0, 0.0],
+            source: KnowledgeSource::ManuallySeeded,
+        };
+        assert!(LIVE_SNAPSHOT.contains("iana.org"));
+        let host = observed_domain(LIVE_SNAPSHOT).unwrap_or_default();
+        assert!(matching_knowledge_facts(&host, &[1.0, 0.0], &[linked_site_fact]).is_empty());
+    }
+
+    /// Auto-capture appends a snippet per successful run, so without a cap
+    /// every prompt for a much-visited site grew without bound.
+    #[test]
+    fn knowledge_retrieval_is_capped_and_drops_facts_unrelated_to_the_goal() {
+        let related: Vec<KnowledgeSnippet> = (0..10)
+            .map(|index| KnowledgeSnippet {
+                snippet_id: format!("k{index}"),
+                site_pattern: "wikipedia.org".into(),
+                fact: format!("fact {index}"),
+                fact_embedding: vec![1.0, 0.0],
+                source: KnowledgeSource::AutoCapturedFromRun,
+            })
+            .collect();
+        let facts = matching_knowledge_facts("en.wikipedia.org", &[1.0, 0.0], &related);
+        assert_eq!(facts.len(), KNOWLEDGE_FACT_LIMIT);
+
+        // Same domain, but orthogonal to the goal: kept before, dropped now.
+        let unrelated = KnowledgeSnippet {
+            snippet_id: "k-off".into(),
+            site_pattern: "wikipedia.org".into(),
+            fact: "unrelated".into(),
+            fact_embedding: vec![0.0, 1.0],
+            source: KnowledgeSource::AutoCapturedFromRun,
+        };
+        assert!(matching_knowledge_facts("en.wikipedia.org", &[1.0, 0.0], &[unrelated]).is_empty());
+    }
+
+    /// A timestamp-only id collided within the same second, and let
+    /// auto-capture pile up byte-identical facts under different names.
+    #[test]
+    fn knowledge_snippet_ids_are_content_derived_so_a_repeat_save_is_idempotent() {
+        assert_eq!(
+            knowledge_snippet_id("wikipedia.org", "the search box is at the top"),
+            knowledge_snippet_id("wikipedia.org", "the search box is at the top")
+        );
+        assert_ne!(
+            knowledge_snippet_id("wikipedia.org", "fact a"),
+            knowledge_snippet_id("wikipedia.org", "fact b")
+        );
+        assert_ne!(
+            knowledge_snippet_id("wikipedia.org", "same fact"),
+            knowledge_snippet_id("example.com", "same fact")
+        );
+        // The separator must keep field boundaries from blurring together.
+        assert_ne!(
+            knowledge_snippet_id("ab", "c"),
+            knowledge_snippet_id("a", "bc")
+        );
+    }
+
+    fn one_site_job() -> JobProgress {
+        JobProgress {
+            job_id: "job-1".into(),
+            goal: "collect a fact".into(),
+            created_at: 0,
+            updated_at: 0,
+            sites: vec![SiteProgress {
+                site_index: 0,
+                sub_goal: "visit example.com".into(),
+                status: SiteStatus::Pending,
+                result_path: None,
+                attempts: 0,
+                last_error: None,
+            }],
+        }
+    }
+
+    /// `attempts` used to be bumped on every status write, so the ordinary
+    /// InProgress→Done pair reported two attempts for a site that ran once.
+    #[test]
+    fn a_site_that_ran_once_and_succeeded_reports_exactly_one_attempt() {
+        let mut progress = one_site_job();
+        apply_site_update(&mut progress, 0, SiteStatus::InProgress, None, None);
+        apply_site_update(
+            &mut progress,
+            0,
+            SiteStatus::Done,
+            Some("/tmp/site-0-result.json".into()),
+            None,
+        );
+        assert_eq!(progress.sites[0].attempts, 1);
+        assert_eq!(progress.sites[0].status, SiteStatus::Done);
+        assert_eq!(
+            progress.sites[0].result_path.as_deref(),
+            Some("/tmp/site-0-result.json")
+        );
+    }
+
+    #[test]
+    fn a_retried_site_counts_one_attempt_per_run_not_per_status_write() {
+        let mut progress = one_site_job();
+        for _ in 0..3 {
+            apply_site_update(&mut progress, 0, SiteStatus::InProgress, None, None);
+            apply_site_update(&mut progress, 0, SiteStatus::Failed, None, Some("nope".into()));
+        }
+        assert_eq!(progress.sites[0].attempts, 3);
+    }
+
+    #[test]
+    fn a_site_update_for_an_index_that_does_not_exist_is_a_no_op_not_a_panic() {
+        let mut progress = one_site_job();
+        apply_site_update(&mut progress, 7, SiteStatus::Done, None, None);
+        assert_eq!(progress.sites[0].status, SiteStatus::Pending);
+    }
+
+    /// Google's device flow accepts only a fixed scope allowlist, and the
+    /// broad `spreadsheets` scope this once requested is not on it — the
+    /// device-code request failed outright, so no amount of correct
+    /// downstream code could have made `mice sheets connect` work.
+    #[test]
+    fn the_requested_scope_is_one_the_device_flow_actually_permits() {
+        // https://developers.google.com/identity/protocols/oauth2/limited-input-device
+        const DEVICE_FLOW_ALLOWED_SCOPES: [&str; 7] = [
+            "email",
+            "openid",
+            "profile",
+            "https://www.googleapis.com/auth/drive.appdata",
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/youtube",
+            "https://www.googleapis.com/auth/youtube.readonly",
+        ];
+        assert!(
+            DEVICE_FLOW_ALLOWED_SCOPES.contains(&GOOGLE_SHEETS_SCOPE),
+            "{GOOGLE_SHEETS_SCOPE} is not accepted by Google's device flow"
+        );
+    }
+
+    /// `drive.file` grants per-file access only, so a push to an existing
+    /// hand-made sheet cannot work — creating the spreadsheet is what makes
+    /// it writable. The setup guidance must also name the one client type
+    /// the device flow accepts.
+    #[test]
+    fn sheets_setup_guidance_names_the_client_type_the_device_flow_requires() {
+        assert!(GOOGLE_OAUTH_CLIENT_SETUP.contains("TVs and Limited Input devices"));
+        assert!(!GOOGLE_OAUTH_CLIENT_SETUP.contains("Desktop app\","));
+        assert!(SHEETS_PUSH_USAGE.contains("--new-sheet"));
+    }
+
+    #[test]
+    fn sheets_create_payload_carries_the_title_under_properties() {
+        assert_eq!(
+            sheets_create_payload("MICE results"),
+            serde_json::json!({ "properties": { "title": "MICE results" } })
+        );
     }
 
     fn sub_goal(text: &str) -> SubGoal {
