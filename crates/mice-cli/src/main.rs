@@ -2918,7 +2918,7 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
                 tools::run(&runner, &call, &context)
             };
             if let Err(error) = result {
-                if is_axi_stale_error(&error) && recovery.retry_stale_once() {
+                if is_axi_stale_error(&error) && recovery.can_retry_stale() {
                     // Not the raw error text: it repeats the stale uid
                     // itself (`Target \`g5:3_2\` is not in the current
                     // snapshot...`), which is exactly the same "old uid
@@ -2926,7 +2926,7 @@ fn autopilot_axi(goal: &str, job_context: Option<JobContext>) -> Result<(), Box<
                     // get copied back out as a candidate on a later turn.
                     history.push(format!("{} was stale; re-observed.", call.name));
                     println!(
-                        "The page changed before MICE acted. Re-observing once and replanning safely."
+                        "The page changed before MICE acted. Re-observing and trying again safely."
                     );
                     continue;
                 }
@@ -3293,17 +3293,18 @@ impl Drop for JobProgressGuard {
 
 #[derive(Default)]
 struct AxiActionRecovery {
-    stale_retried: bool,
+    stale_retries: usize,
 }
 
 impl AxiActionRecovery {
-    /// Return true exactly once for a proposed action. A completed action gets
-    /// a fresh recovery state on the next outer-loop iteration.
-    fn retry_stale_once(&mut self) -> bool {
-        if self.stale_retried {
+    /// Return true up to 5 times for a proposed action. Highly dynamic pages
+    /// (like Wikipedia with its background mutations) might cause several
+    /// snapshot-execution races. A completed action gets a fresh recovery state.
+    fn can_retry_stale(&mut self) -> bool {
+        if self.stale_retries >= 5 {
             false
         } else {
-            self.stale_retried = true;
+            self.stale_retries += 1;
             true
         }
     }
