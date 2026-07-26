@@ -99,6 +99,13 @@ pub struct BrowserSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BrowserTarget {
     context: String,
+    /// Leading-whitespace width of this target's own snapshot line.
+    ///
+    /// chrome-devtools-axi serialises the accessibility tree depth-first and
+    /// indents each level, so this is the only record of nesting that
+    /// survives parsing — `context` is trimmed. `controls_within` needs it to
+    /// tell a container's own controls from the next sibling subtree's.
+    depth: usize,
     role: String,
     input_type: Option<String>,
     autocomplete: Option<String>,
@@ -151,6 +158,7 @@ impl BrowserSnapshot {
                     }
                     targets.entry(uid.into()).or_insert_with(|| BrowserTarget {
                         context,
+                        depth: line.len() - line.trim_start().len(),
                         // A real snapshot line is `uid=<id> <role> "<label>"
                         // [attrs...]` (uid first, confirmed against live
                         // chrome-devtools-axi output) - taking the line's
@@ -237,6 +245,74 @@ impl BrowserSnapshot {
             .unwrap_or(0);
 
         Some((role, label, occurrence))
+    }
+
+    /// The interactive controls a container encloses, rendered for a refusal
+    /// message as `uid=<id> <role> "<label>"` entries the model can copy.
+    ///
+    /// Containment is read from indentation: chrome-devtools-axi serialises
+    /// the tree depth-first, so a container's descendants are the following
+    /// targets indented deeper than it, and the walk ends at the first target
+    /// back at its level or shallower — the next sibling subtree.
+    ///
+    /// Depth is what makes this correct, and skipping it does not work.
+    /// Wikipedia's search landmark wraps its controls in a `form`:
+    ///
+    /// ```text
+    /// uid=g2:1_10 search
+    ///   uid=g2:1_11 form
+    ///     uid=g2:1_12 searchbox "Search Wikipedia"
+    ///     uid=g2:1_13 button "Search"
+    ///   uid=g2:1_14 navigation "Personal tools"
+    /// ```
+    ///
+    /// A first cut stopped at the first non-interactive target, hit that
+    /// `form`, and returned nothing on the one page this was written for.
+    ///
+    /// This is a hint, not a decision: whatever the model does with it still
+    /// goes through target resolution, the safety checks, and the person's
+    /// confirmation.
+    pub fn controls_within(&self, container_uid: &str) -> String {
+        const INTERACTIVE_ROLES: &[&str] = &[
+            "button",
+            "link",
+            "searchbox",
+            "textbox",
+            "combobox",
+            "checkbox",
+            "radio",
+            "menuitem",
+            "option",
+            "switch",
+            "tab",
+        ];
+        let Some(start) = self
+            .target_order
+            .iter()
+            .position(|uid| uid == container_uid)
+        else {
+            return String::new();
+        };
+        let Some(container_depth) = self.target(container_uid).map(|target| target.depth) else {
+            return String::new();
+        };
+        let mut described = Vec::new();
+        for uid in self.target_order.iter().skip(start + 1) {
+            let Some(target) = self.target(uid) else {
+                continue;
+            };
+            if target.depth <= container_depth {
+                break;
+            }
+            if INTERACTIVE_ROLES.contains(&target.role.as_str()) {
+                let label = accessible_label(&target.context);
+                described.push(format!("uid={uid} {} \"{label}\"", target.role));
+                if described.len() == 3 {
+                    break;
+                }
+            }
+        }
+        described.join("; ")
     }
 
     /// Find the current uid for a target last seen with this (role,
@@ -893,6 +969,21 @@ pub fn execute_verified_browser_action(
             if let Some(reason) =
                 blocked_browser_action(action, target, page_form_context(snapshot))
             {
+                // Naming the alternatives is the difference between a
+                // refusal the model can act on and one it just repeats.
+                // Confirmed live: gemma3:4b's *intent* was right every time
+                // ("Click the 'Search' button now.") while its uid pointed
+                // at the enclosing landmark — it knows what it wants and
+                // cannot find the id for it. Telling it only that the
+                // target was wrong left it to guess again, and it guessed
+                // the same way.
+                let alternatives = snapshot.controls_within(uid);
+                if !alternatives.is_empty() {
+                    return Err(ToolError(format!(
+                        "MICE will not {action} this target: {reason}. Use one of the controls it \
+                         contains instead: {alternatives}."
+                    )));
+                }
                 return Err(ToolError(format!(
                     "MICE will not {action} this target: {reason}."
                 )));
@@ -1926,6 +2017,70 @@ mod tests {
             .unwrap()
             .text,
             "filled"
+        );
+    }
+
+    #[test]
+    fn refusing_a_landmark_names_the_controls_inside_it() {
+        // Wikipedia's real search region. The live failure this addresses:
+        // the model repeatedly said "Clicking the 'Search' button now." while
+        // sending the landmark's uid — right intent, wrong id — so the
+        // refusal has to hand it the id it could not find.
+        // Verbatim shape of Wikipedia's header, indentation included — the
+        // `form` wrapper between the landmark and its controls is exactly
+        // what a depth-blind walk trips over, and `navigation` is the
+        // sibling that must not be mistaken for a child.
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "    uid=g4:3_10 search\n      \
+             uid=g4:3_11 form\n        \
+             uid=g4:3_12 searchbox \"Search Wikipedia\"\n        \
+             uid=g4:3_13 button \"Search\"\n    \
+             uid=g4:3_14 navigation \"Personal tools\"\n      \
+             uid=g4:3_15 link \"Donate\"",
+        );
+        let inside = snapshot.controls_within("g4:3_10");
+        assert!(
+            !inside.contains("Donate"),
+            "a sibling subtree's controls are not inside this landmark: {inside}"
+        );
+        assert!(inside.contains("uid=g4:3_13"), "{inside}");
+        assert!(inside.contains("button"), "{inside}");
+        assert!(inside.contains("Search"), "{inside}");
+
+        // The refusal the loop actually emits must carry them.
+        let runner = MockRunner {
+            output: "clicked".into(),
+        };
+        let context = ToolContext {
+            working_dir: PathBuf::from("."),
+            session_name: "s".into(),
+            output_budget_tokens: 300,
+        };
+        let refusal = execute_verified_browser_action(
+            &runner,
+            &ToolCall {
+                name: "browser.click".into(),
+                args: json!({"uid": "g4:3_10"}),
+            },
+            &context,
+            &snapshot,
+            true,
+        )
+        .expect_err("a landmark click is still refused")
+        .to_string();
+        assert!(refusal.contains("uid=g4:3_13"), "{refusal}");
+
+        // A container with nothing interactive in it must not advertise the
+        // next subtree's controls as its own.
+        let empty = BrowserSnapshot::from_axi_output(
+            "  uid=g4:1_1 region\n    \
+             uid=g4:1_2 StaticText \"unrelated\"\n  \
+             uid=g4:1_3 button \"Elsewhere\"",
+        );
+        assert_eq!(
+            empty.controls_within("g4:1_1"),
+            "",
+            "a container holding no controls must not advertise its sibling's"
         );
     }
 

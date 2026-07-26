@@ -17,9 +17,28 @@ pub const OLLAMA_KEEP_ALIVE: &str = "30m";
 /// `ureq` timeout would cut that response off mid-stream.
 pub const OLLAMA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a *stream that has stopped producing tokens* may stay silent
+/// before it is treated as dead.
+///
+/// This is deliberately not the total deadline the comment above rejects — a
+/// long generation keeps emitting tokens and resets this on every one, so a
+/// legitimately slow summary is never cut off. What it catches is a stream
+/// that produces nothing at all, which without a read timeout blocks on
+/// `read` forever.
+///
+/// Confirmed live, and it is not hypothetical: an autopilot run stalled
+/// mid-goal with no output for fourteen minutes. Ollama had the model resident
+/// but every other request to it — including a bare "say hi" — hung too,
+/// because Ollama serialises on the model and MICE's dead stream never
+/// released the slot. Killing the run made Ollama answer in 2.3 seconds. A
+/// hung generation must fail the turn, which the loop can already retry,
+/// rather than freeze the run with no output and no explanation.
+pub const OLLAMA_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 fn ollama_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(OLLAMA_CONNECT_TIMEOUT)
+        .timeout_read(OLLAMA_STREAM_IDLE_TIMEOUT)
         .build()
 }
 

@@ -2441,6 +2441,54 @@ fn autopilot_axi(
                 Err(error) => return pause_axi(goal, &history, &error),
             };
 
+            // Stop when the page says the goal is met, without waiting for
+            // the model to notice.
+            //
+            // Traced live, and it is the difference between succeeding and
+            // not: the run *reached* the article —
+            // `RootWebArea "James Webb Space Telescope - Wikipedia"
+            // url=".../wiki/James_Webb_Space_Telescope"` — and then kept
+            // going, because nothing told it to stop except the model's own
+            // judgement. It clicked Search again on the article's own search
+            // box, now empty, and navigated to `Special:Search?search=` —
+            // undoing the result it had already achieved. A 4B model
+            // recognising arrival is not something to depend on; the page
+            // identity already answers it, using exactly the predicate that
+            // gates a model-declared `done`.
+            //
+            // Cannot fire spuriously at the start: `verify_goal_completion`
+            // requires a real interaction first, so a fresh run over a page
+            // that merely mentions the subject does not qualify.
+            if verify_goal_completion(goal, &current_sequence, &observed.text).is_ok() {
+                if recipe_is_worth_saving(&current_sequence)
+                    && let Some(embed) = goal_embedding.clone()
+                    && !embed.is_empty()
+                {
+                    let recipe_id = matched_recipe_id.clone().unwrap_or_else(|| {
+                        format!(
+                            "recipe-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                        )
+                    });
+                    if save_recipe(&AxiRecipe {
+                        recipe_id,
+                        goal_pattern: goal.to_string(),
+                        goal_embedding: embed,
+                        steps: current_sequence.clone(),
+                        negative_constraints: negative_constraints.clone(),
+                    })
+                    .is_ok()
+                    {
+                        println!("MICE: Saved successful sequence as a new recipe.");
+                    }
+                }
+                println!("MICE AXI guide complete: the page now matches the goal.");
+                return Ok(());
+            }
+
             if observed.snapshot.is_captcha() {
                 println!(
                     "MICE has handed this step back to you. A CAPTCHA or security challenge was detected."
@@ -3166,7 +3214,21 @@ fn autopilot_axi(
     )
 }
 
-const AXI_FRESH_DECISION_LIMIT: usize = 6;
+/// How many actions a single goal may actually dispatch.
+///
+/// This bounds work, not correctness — runaway loops are stopped by
+/// `AXI_MAX_CONSECUTIVE_REPLANS`, the negative-constraint veto, and the
+/// completion verifier, all of which fire long before this does. At 6 it was
+/// also bounding *success*: "search Wikipedia for X" needs three actions with
+/// nothing to spare (open, fill, click Search), and a local 4B model reliably
+/// spends one or two elsewhere first. Observed live at 6 — the model recovered,
+/// found the right control, and clicked Search on actions 5 and 6, only to hit
+/// the limit before it could confirm the result.
+///
+/// 12 leaves room for that wandering while still ending a goal that is going
+/// nowhere. Every mutating action is still individually confirmed, so this
+/// changes how long a run may take, not what it may do without asking.
+const AXI_FRESH_DECISION_LIMIT: usize = 12;
 // See the AutopilotAxi ToolContext construction for why this needs to be
 // well above tools::DEFAULT_RETURN_TOKENS.
 const AXI_OBSERVATION_TOKENS: usize = 2_000;
