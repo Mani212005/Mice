@@ -136,7 +136,37 @@ are what long-horizon runs actually starve for.
 end-to-end fresh-teach success rate over 10 runs is no worse than the 3/4
 baseline, and per-decision latency is reported alongside.
 
-## M20c — Embedder swap, measured (COMPLETED)
+## M20c — Embedder swap (adopted, with a production regression found and fixed)
+
+> **The swap shipped a silent break in recipe replay.** `AXI_RECIPE_EMBEDDING_MODEL`
+> is not grounding-only — it also vectorises saved recipes and knowledge
+> snippets. Changing it from `nomic-embed-text` (768 dims) to `all-minilm`
+> (384 dims) left every stored vector in the old model's space, and
+> `cosine_similarity` used `zip`, which silently truncates to the shorter
+> vector instead of erroring.
+>
+> Measured on the real store: the goal
+> `"go to en.wikipedia.org and search for the James Webb Space Telescope"`
+> matched its own saved recipe at **1.000** before the swap and **−0.051**
+> after — against a 0.85 threshold, so it could never replay again. Three saved
+> knowledge snippets were equally unreachable (0.5 threshold). Nothing was
+> logged; the only symptom would have been recipe replay quietly never firing,
+> and replay was the most reliable part of the system (2/2 deterministic runs
+> versus 3/4 for fresh teach).
+>
+> Two fixes:
+> - `cosine_similarity` now returns 0.0 when lengths differ. Vectors from
+>   different models occupy different spaces and have no similarity; a clean
+>   miss falls back to a fresh run, which callers already handle.
+> - `refresh_embeddings_for_current_model` re-derives stale vectors from the
+>   text still on disk (`goal_pattern`, `fact`) on the first run after a swap.
+>   Verified on the real store: `re-embedded 4 saved item(s)`, then
+>   `Found a matching recipe (score 1.00)` — all four files now 384 dims.
+>
+> Any future embedder change is now self-healing rather than silently
+> destructive.
+
+
 
 **What:** Evaluated embedder candidates (`all-minilm:latest`, 45MB vs incumbent `nomic-embed-text:latest`, 274MB) on M20a's test harness across both Development (`grounding_m20b`) and Held-Out (`grounding_held_out`) benchmark sets.
 

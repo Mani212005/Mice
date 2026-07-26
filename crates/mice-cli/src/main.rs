@@ -2523,6 +2523,16 @@ fn autopilot_axi(
                 goal_embedding = Some(embed.clone());
 
                 if !embed.is_empty() {
+                    // Before matching, bring anything embedded by a previous
+                    // model back into the current vector space — otherwise a
+                    // model swap quietly costs the person every recipe and
+                    // fact they have taught.
+                    let repaired = refresh_embeddings_for_current_model(embed.len());
+                    if repaired > 0 {
+                        println!(
+                            "MICE: re-embedded {repaired} saved item(s) for the current embedding model."
+                        );
+                    }
                     let recipes = load_recipes();
                     let mut best_sim = 0.0;
                     let mut best_recipe = None;
@@ -12058,6 +12068,61 @@ pub fn save_recipe(recipe: &AxiRecipe) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
+/// Re-embed saved recipes and knowledge that were vectorised by a different
+/// embedding model, and report how many were repaired.
+///
+/// Changing `AXI_RECIPE_EMBEDDING_MODEL` silently retires everything the person
+/// has taught MICE: stored vectors keep the old model's dimensionality, so
+/// `cosine_similarity` now returns 0.0 for them and no recipe ever matches
+/// again. Measured on the nomic-embed-text (768) → all-minilm (384) swap, a
+/// goal that matched its own recipe at 1.000 dropped to a guaranteed miss.
+///
+/// Nothing is actually lost, though — the text each vector was derived from is
+/// still on disk. So re-derive rather than discard, once, on the first run
+/// after a swap. `dimensions` comes from a vector the current model just
+/// produced, so this needs no record of which model wrote what.
+fn refresh_embeddings_for_current_model(dimensions: usize) -> usize {
+    if dimensions == 0 {
+        return 0;
+    }
+    let endpoint = format!("{OLLAMA_ENDPOINT}/api/embed");
+    let mut repaired = 0;
+
+    for mut recipe in load_recipes() {
+        if recipe.goal_embedding.len() == dimensions {
+            continue;
+        }
+        if let Ok(embedding) = mice_providers::ollama_embed(
+            &endpoint,
+            AXI_RECIPE_EMBEDDING_MODEL,
+            &recipe.goal_pattern,
+        ) && embedding.len() == dimensions
+        {
+            recipe.goal_embedding = embedding;
+            if save_recipe(&recipe).is_ok() {
+                repaired += 1;
+            }
+        }
+    }
+
+    for mut snippet in load_knowledge_snippets() {
+        if snippet.fact_embedding.len() == dimensions {
+            continue;
+        }
+        if let Ok(embedding) =
+            mice_providers::ollama_embed(&endpoint, AXI_RECIPE_EMBEDDING_MODEL, &snippet.fact)
+            && embedding.len() == dimensions
+        {
+            snippet.fact_embedding = embedding;
+            if save_knowledge_snippet(&snippet).is_ok() {
+                repaired += 1;
+            }
+        }
+    }
+
+    repaired
+}
+
 pub fn load_recipes() -> Vec<AxiRecipe> {
     let mut recipes = Vec::new();
     let dir = recipes_dir();
@@ -12075,6 +12140,18 @@ pub fn load_recipes() -> Vec<AxiRecipe> {
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    // Vectors of different lengths come from different embedding models, and
+    // there is no meaningful similarity between two different vector spaces.
+    // Without this the `zip` below silently truncates to the shorter one and
+    // returns a confident-looking number computed from unrelated coordinates —
+    // confirmed live when the embedder moved from nomic-embed-text (768 dims)
+    // to all-minilm (384): a goal that matched its own saved recipe at 1.000
+    // scored -0.051 against the same recipe, with no error anywhere. Returning
+    // 0.0 turns that into a clean miss, which callers already handle by
+    // falling back to a fresh run.
+    if a.len() != b.len() {
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -12245,6 +12322,26 @@ pub fn observed_domain(observation: &str) -> Option<String> {
 #[cfg(test)]
 mod recipe_matching_tests {
     use super::*;
+
+    #[test]
+    fn vectors_from_different_embedding_models_are_never_similar() {
+        // The live regression: swapping the embedder left 768-dimension
+        // recipes on disk while queries became 384-dimension. `zip` truncated
+        // silently and produced a plausible-looking score from unrelated
+        // coordinates, so a recipe that matched itself at 1.000 scored -0.051
+        // and never replayed again — with nothing logged anywhere.
+        let stored = vec![0.5_f32; 768];
+        let query = vec![0.5_f32; 384];
+        assert_eq!(
+            cosine_similarity(&query, &stored),
+            0.0,
+            "incomparable vector spaces must score 0, not a truncated guess"
+        );
+        assert_eq!(cosine_similarity(&stored, &query), 0.0, "and symmetrically");
+
+        // Equal lengths are unaffected.
+        assert!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) > 0.99);
+    }
 
     #[test]
     fn cosine_similarity_ranks_identical_over_orthogonal_over_opposite() {
