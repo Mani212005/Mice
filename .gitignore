@@ -18,3 +18,7 @@ config.toml
 *.jpg
 *.jpeg
 dist/
+
+# Multi-agent sync and local notes
+CLAUDE.md
+.agents-sync/

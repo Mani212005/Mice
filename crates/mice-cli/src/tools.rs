@@ -79,12 +79,21 @@ pub struct ToolOutput {
     pub needs_distillation: bool,
 }
 
+/// Wrapper marking a freshly captured accessibility snapshot.
+#[derive(Debug, Copy, Clone)]
+pub struct FreshSnapshot<'a>(pub &'a BrowserSnapshot);
+
+/// Wrapper marking the accessibility snapshot from which the planner/model chose a UID.
+#[derive(Debug, Copy, Clone)]
+pub struct ModelSnapshot<'a>(pub &'a BrowserSnapshot);
+
 /// A short-lived AXI accessibility snapshot. It deliberately lives only in
 /// memory: browser snapshots can contain private page text and must never be
 /// written to MICE's artifact cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserSnapshot {
     targets: HashMap<String, BrowserTarget>,
+    target_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +109,7 @@ struct BrowserTarget {
 impl BrowserSnapshot {
     pub fn from_axi_output(output: &str) -> Self {
         let mut targets = HashMap::new();
+        let mut target_order = Vec::new();
         // Quote state spans physical lines: an accessible label is
         // page-controlled text and may legally contain a newline. Stripping
         // each line independently would reopen structural parsing mid-label.
@@ -136,6 +146,9 @@ impl BrowserSnapshot {
                     } else {
                         quoted_context.join("\n")
                     };
+                    if !targets.contains_key(uid) {
+                        target_order.push(uid.into());
+                    }
                     targets.entry(uid.into()).or_insert_with(|| BrowserTarget {
                         context,
                         // A real snapshot line is `uid=<id> <role> "<label>"
@@ -174,7 +187,10 @@ impl BrowserSnapshot {
                 quoted_context.clear();
             }
         }
-        Self { targets }
+        Self {
+            targets,
+            target_order,
+        }
     }
 
     fn target(&self, uid: &str) -> Option<&BrowserTarget> {
@@ -189,7 +205,7 @@ impl BrowserSnapshot {
         self.targets.contains_key(uid)
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
 
@@ -203,32 +219,54 @@ impl BrowserSnapshot {
         })
     }
 
-    /// Stable (role, accessible-name) fingerprint for a target, used to
-    /// re-resolve a recorded recipe step — or a proposed action's target —
-    /// against a freshly loaded page. A uid alone is only meaningful within
-    /// the snapshot generation it came from (see `resolve_current_uid`'s
-    /// note on chrome-devtools-axi's generation counter); this is the
-    /// anchor a recipe (or a live re-verification) carries across
-    /// generations instead. `context` is the raw snapshot line, which also
-    /// carries the uid marker and any other attributes (`haspopup=`,
-    /// `url=`, ...) alongside the label (see the `multiline`/
-    /// `escaped_newline` tests below for why `context` itself must stay
-    /// raw) — `accessible_label` pulls out just the quoted label text so
-    /// the fingerprint neither embeds this session's own uid nor breaks on
-    /// an unrelated attribute changing between snapshots.
-    pub fn identity_of(&self, uid: &str) -> Option<(String, String)> {
-        self.target(uid)
-            .map(|target| (target.role.clone(), accessible_label(&target.context)))
+    /// Pull out a target's `(role, accessible_label, occurrence_index)`
+    /// fingerprint for re-resolving across snapshot generations. `occurrence_index`
+    /// tracks the 0-based DOM order index among elements with identical role and label,
+    /// removing ambiguity when a page contains multiple same-role same-label targets.
+    pub fn identity_of(&self, uid: &str) -> Option<(String, String, usize)> {
+        let target = self.target(uid)?;
+        let role = target.role.clone();
+        let label = accessible_label(&target.context);
+
+        let occurrence = self
+            .target_order
+            .iter()
+            .filter_map(|id| self.target(id))
+            .filter(|t| t.role == role && accessible_label(&t.context) == label)
+            .position(|t| std::ptr::eq(t, target))
+            .unwrap_or(0);
+
+        Some((role, label, occurrence))
     }
 
     /// Find the current uid for a target last seen with this (role,
-    /// accessible-name) fingerprint. Returns the first match; ambiguous
-    /// duplicates are a known limitation of anchor-based matching.
-    pub fn find_uid_by_identity(&self, role: &str, label: &str) -> Option<String> {
-        self.targets
+    /// accessible-name, occurrence_index) fingerprint in DOM order.
+    pub fn find_uid_by_identity(
+        &self,
+        role: &str,
+        label: &str,
+        occurrence: usize,
+    ) -> Option<String> {
+        let matches: Vec<&String> = self
+            .target_order
             .iter()
-            .find(|(_, target)| target.role == role && accessible_label(&target.context) == label)
-            .map(|(uid, _)| uid.clone())
+            .filter(|uid| {
+                if let Some(target) = self.target(uid) {
+                    target.role == role && accessible_label(&target.context) == label
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if matches.is_empty() {
+            None
+        } else if occurrence < matches.len() {
+            Some(matches[occurrence].clone())
+        } else {
+            // Fall back to the first matching target if the ordinal index is out of bounds
+            Some(matches[0].clone())
+        }
     }
 
     /// Human-readable target context shown before the user confirms an AXI
@@ -245,7 +283,7 @@ impl BrowserSnapshot {
                 } else {
                     format!("'{}' ({})", label, target.role)
                 };
-                
+
                 if let Some(text) = call.args.get("text").and_then(Value::as_str) {
                     format!("{} \"{}\" into {}", call.name, text, element_desc)
                 } else {
@@ -258,37 +296,25 @@ impl BrowserSnapshot {
     /// Re-resolve a proposed action's target against a freshly captured
     /// snapshot, returning the uid to actually execute with.
     ///
-    /// chrome-devtools-axi's uid prefix (`g<N>:`) is not a tree-position
-    /// index — it is a page-wide snapshot generation counter that the tool
-    /// bumps via a `MutationObserver` on *any* DOM mutation anywhere on the
-    /// page (childList/subtree/attributes/characterData), then rejects any
-    /// uid whose generation doesn't equal the current one, full stop —
-    /// regardless of whether the specific element referenced actually
-    /// changed. A raw ad refresh, a lazy-loaded image, or a "you might also
-    /// like" widget updating anywhere on the page is enough to bump it. On
-    /// a live page like Wikipedia, the multi-second gap while a person
-    /// reads and confirms a proposed action is close to guaranteed to see
-    /// at least one such incidental mutation, so an exact-uid comparison
-    /// (or a same-suffix string match — the same problem, since matching
-    /// still leaves the *stale* uid string in the call) fails almost every
-    /// time even though nothing relevant to the click changed.
-    ///
-    /// The fix is to re-resolve by (role, label) identity in the fresh
-    /// snapshot and hand back a uid that is actually valid for it, not to
-    /// find a way to keep using the old one. `Gone` still means what it
-    /// always did: no element with that identity exists anymore — a real
-    /// change, not just an incidental mutation elsewhere on the page.
-    pub fn resolve_current_uid(&self, original_snapshot: &Self, call: &ToolCall) -> TargetResolution {
+    /// The type system enforces argument ordering via `FreshSnapshot` and
+    /// `ModelSnapshot` wrapper types: `fresh` must be the freshly captured
+    /// snapshot and `chosen_from` must be the snapshot from which the planner/model
+    /// selected the target UID. Inverting them fails compilation.
+    pub fn resolve_current_uid(
+        fresh: FreshSnapshot<'_>,
+        chosen_from: ModelSnapshot<'_>,
+        call: &ToolCall,
+    ) -> TargetResolution {
         let Some(uid) = call.args.get("uid").and_then(Value::as_str) else {
             return TargetResolution::NoUidNeeded;
         };
-        if self.target(uid).is_some() {
+        if fresh.0.target(uid).is_some() {
             return TargetResolution::Resolved(uid.to_string());
         }
-        let Some((role, label)) = original_snapshot.identity_of(uid) else {
+        let Some((role, label, occurrence)) = chosen_from.0.identity_of(uid) else {
             return TargetResolution::Gone;
         };
-        match self.find_uid_by_identity(&role, &label) {
+        match fresh.0.find_uid_by_identity(&role, &label, occurrence) {
             Some(resolved) => TargetResolution::Resolved(resolved),
             None => TargetResolution::Gone,
         }
@@ -1029,6 +1055,46 @@ fn page_form_context(snapshot: &BrowserSnapshot) -> PageFormContext {
     PageFormContext::SafeFields
 }
 
+/// ARIA landmark and grouping roles: page structure, never a control.
+///
+/// Clicking one is not an error — axi dispatches it happily and the page
+/// simply does nothing — which is precisely the problem. Confirmed live on
+/// Wikipedia, whose search region is
+///
+/// ```text
+/// uid=g2:1_10 search
+///   uid=g2:1_12 searchbox "Search Wikipedia"
+///   uid=g2:1_13 button "Search"
+/// ```
+///
+/// The model, looking for something to submit with, repeatedly proposed the
+/// unlabeled `search` *landmark* rather than the `button "Search"` inside
+/// it. Each click "succeeded", nothing changed, and the run burned its
+/// whole action budget re-proposing the same dead target. Refusing here
+/// turns that silent no-op into a soft refusal, which replans with the
+/// reason in history and points the model at the control inside.
+///
+/// Deliberately limited to roles that are *never* interactive themselves.
+/// `listitem`, `article`, and similar are left out: sites legitimately
+/// attach click handlers to them, and a false refusal costs more than the
+/// no-op this prevents.
+const NON_INTERACTIVE_CONTAINER_ROLES: &[&str] = &[
+    "banner",
+    "complementary",
+    "contentinfo",
+    "document",
+    "form",
+    "generic",
+    "group",
+    "main",
+    "navigation",
+    "none",
+    "presentation",
+    "region",
+    "search",
+    "RootWebArea",
+];
+
 fn blocked_browser_action(
     action: &str,
     target: &BrowserTarget,
@@ -1076,6 +1142,12 @@ fn blocked_browser_action(
         )
     } else if action == "click" && unknown_button_context && page == PageFormContext::Unknown {
         Some("it is a button without trusted form metadata, so it could submit an unknown form")
+    } else if action == "click" && NON_INTERACTIVE_CONTAINER_ROLES.contains(&target.role.as_str()) {
+        // Last in the chain on purpose: every safety refusal above should
+        // win the message when both apply.
+        Some(
+            "it is a page landmark or container rather than a control — click the button, link, or field inside it instead",
+        )
     } else {
         None
     }
@@ -1858,6 +1930,65 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_landmark_is_refused_but_the_control_inside_it_is_not() {
+        // Wikipedia's real search region, verbatim: an unlabeled `search`
+        // landmark wrapping the box and the submit button.
+        let runner = MockRunner {
+            output: "clicked".into(),
+        };
+        let context = ToolContext {
+            working_dir: PathBuf::from("."),
+            session_name: "s".into(),
+            output_budget_tokens: 300,
+        };
+        let snapshot = BrowserSnapshot::from_axi_output(
+            "uid=g2:1_10 search\n\
+             uid=g2:1_12 searchbox \"Search Wikipedia\" description=\"Search Wikipedia\"\n\
+             uid=g2:1_13 button \"Search\"",
+        );
+
+        // The landmark: axi would dispatch this happily and the page would
+        // do nothing, which is how a run burns its whole budget clicking
+        // the same dead target. Refused, and phrased so the replan that
+        // follows points the model at the control inside.
+        let refusal = execute_verified_browser_action(
+            &runner,
+            &ToolCall {
+                name: "browser.click".into(),
+                args: json!({"uid": "g2:1_10"}),
+            },
+            &context,
+            &snapshot,
+            true,
+        )
+        .expect_err("clicking a landmark must be refused, not silently dispatched")
+        .to_string();
+        assert!(
+            refusal.starts_with("MICE will not "),
+            "must be a soft refusal so the loop replans instead of pausing: {refusal}"
+        );
+        assert!(refusal.contains("landmark or container"), "{refusal}");
+
+        // The button inside it is a real control and must still work —
+        // this is the step that actually submits the search.
+        assert_eq!(
+            execute_verified_browser_action(
+                &runner,
+                &ToolCall {
+                    name: "browser.click".into(),
+                    args: json!({"uid": "g2:1_13"}),
+                },
+                &context,
+                &snapshot,
+                true,
+            )
+            .unwrap()
+            .text,
+            "clicked"
+        );
+    }
+
+    #[test]
     fn already_has_value_detects_a_redundant_fill() {
         // The exact live reproduction: after a fill succeeds, the same
         // field reappears in the next snapshot already carrying the
@@ -1928,9 +2059,8 @@ mod tests {
             session_name: "s".into(),
             output_budget_tokens: 300,
         };
-        let snapshot = BrowserSnapshot::from_axi_output(
-            "uid=g1:secret textbox \"Enter value\" type=password",
-        );
+        let snapshot =
+            BrowserSnapshot::from_axi_output("uid=g1:secret textbox \"Enter value\" type=password");
         assert!(
             execute_verified_browser_action(
                 &runner,
@@ -2044,13 +2174,20 @@ mod tests {
 
     #[test]
     fn scroll_is_read_only_so_it_never_blocks_on_a_checkpoint_prompt() {
-        let scroll = specs().iter().find(|spec| spec.name == "browser.scroll").unwrap();
+        let scroll = specs()
+            .iter()
+            .find(|spec| spec.name == "browser.scroll")
+            .unwrap();
         assert_eq!(scroll.kind, ToolKind::ReadOnly);
         // The actions the axi decision loop can actually propose that do
         // change page/account state must stay gated.
         for mutating in ["browser.open", "browser.click", "browser.fill"] {
             let spec = specs().iter().find(|spec| spec.name == mutating).unwrap();
-            assert_eq!(spec.kind, ToolKind::Mutating, "{mutating} should stay gated");
+            assert_eq!(
+                spec.kind,
+                ToolKind::Mutating,
+                "{mutating} should stay gated"
+            );
         }
     }
 
@@ -2088,19 +2225,19 @@ mod tests {
         assert_eq!(identity.0, "button");
         // The identity fingerprint must not embed this session's own uid
         // (unlike `context`, which deliberately stays raw for display).
-        assert_eq!(identity, ("button".to_string(), "Search".to_string()));
+        assert_eq!(identity, ("button".to_string(), "Search".to_string(), 0));
         assert!(!identity.1.contains("g0:5"));
 
         // A different session assigns a different uid to the same logical
         // control, and an unrelated attribute the label never had is now
-        // present too. Replay must re-resolve by (role, accessible name),
+        // present too. Replay must re-resolve by (role, accessible name, occurrence),
         // not by reusing the uid recorded in a prior session, and must not
         // be thrown off by an attribute change that has nothing to do with
         // the label itself.
         let replayed_page =
             BrowserSnapshot::from_axi_output("uid=g2:91 button \"Search\" haspopup=\"menu\"");
         assert_eq!(
-            replayed_page.find_uid_by_identity(&identity.0, &identity.1),
+            replayed_page.find_uid_by_identity(&identity.0, &identity.1, identity.2),
             Some("g2:91".to_string())
         );
         assert!(replayed_page.target("g0:5").is_none());
@@ -2109,22 +2246,40 @@ mod tests {
         // miss rather than silently matching something else.
         let redesigned_page = BrowserSnapshot::from_axi_output("uid=g3:1 button \"Go\"");
         assert_eq!(
-            redesigned_page.find_uid_by_identity(&identity.0, &identity.1),
+            redesigned_page.find_uid_by_identity(&identity.0, &identity.1, identity.2),
             None
         );
     }
 
     #[test]
-    fn role_is_parsed_correctly_when_uid_comes_before_the_role_token() {
-        // The specific regression this guards: `role` used to be "the
-        // line's first whitespace token", which silently became the
-        // literal `uid=...` marker on real, uid-first snapshot lines
-        // instead of the actual role - breaking every role-based check
-        // (identity matching, `looks_like_input`, the button-context
-        // fallback in `blocked_browser_action`) without ever failing loudly.
-        let snapshot = BrowserSnapshot::from_axi_output(
-            "uid=g5:3_6 button \"Main menu\" haspopup=\"menu\"",
+    fn identity_disambiguates_multiple_elements_with_same_role_and_label() {
+        let proposed = BrowserSnapshot::from_axi_output(
+            "uid=g1:1 button \"Edit\"\nuid=g1:2 button \"Edit\"\nuid=g1:3 button \"Edit\"",
         );
+        let fresh = BrowserSnapshot::from_axi_output(
+            "uid=g2:10 button \"Edit\"\nuid=g2:20 button \"Edit\"\nuid=g2:30 button \"Edit\"",
+        );
+
+        let call_2nd = ToolCall {
+            name: "browser.click".into(),
+            args: json!({"uid": "g1:2"}),
+        };
+
+        // Selecting the 2nd "Edit" button (index 1) re-resolves to the 2nd "Edit" button in fresh
+        assert_eq!(
+            BrowserSnapshot::resolve_current_uid(
+                FreshSnapshot(&fresh),
+                ModelSnapshot(&proposed),
+                &call_2nd
+            ),
+            TargetResolution::Resolved("g2:20".to_string())
+        );
+    }
+
+    #[test]
+    fn role_is_parsed_correctly_when_uid_comes_before_the_role_token() {
+        let snapshot =
+            BrowserSnapshot::from_axi_output("uid=g5:3_6 button \"Main menu\" haspopup=\"menu\"");
         let target = snapshot.target("g5:3_6").unwrap();
         assert_eq!(target.role, "button");
         assert_eq!(accessible_label(&target.context), "Main menu");
@@ -2132,16 +2287,9 @@ mod tests {
 
     #[test]
     fn resolve_current_uid_survives_an_incidental_generation_bump() {
-        // chrome-devtools-axi bumps its generation counter (the uid's `g<N>:`
-        // prefix) on *any* page mutation, not just ones affecting the
-        // proposed target - simulated here by the same element reappearing
-        // under a new prefix while its role/label are unchanged. Fixtures
-        // use the real uid-first line format, and vary an unrelated
-        // attribute the way an actual re-render would (see the reproduction
-        // this is modeled on: MICE looping on Wikipedia's "Main menu"
-        // button because attribute noise defeated the identity match).
-        let proposed =
-            BrowserSnapshot::from_axi_output("uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"");
+        let proposed = BrowserSnapshot::from_axi_output(
+            "uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"",
+        );
         let call = ToolCall {
             name: "browser.click".into(),
             args: json!({"uid": "g9:3_2"}),
@@ -2151,15 +2299,24 @@ mod tests {
             "uid=g11:3_2 link \"Jump to content\" url=\"#bodyContent\" data-rev=\"7\"",
         );
         assert_eq!(
-            unrelated_mutation.resolve_current_uid(&proposed, &call),
+            BrowserSnapshot::resolve_current_uid(
+                FreshSnapshot(&unrelated_mutation),
+                ModelSnapshot(&proposed),
+                &call
+            ),
             TargetResolution::Resolved("g11:3_2".to_string())
         );
 
         // Nothing changed at all: the exact-match fast path still applies.
-        let unchanged =
-            BrowserSnapshot::from_axi_output("uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"");
+        let unchanged = BrowserSnapshot::from_axi_output(
+            "uid=g9:3_2 link \"Jump to content\" url=\"#bodyContent\"",
+        );
         assert_eq!(
-            unchanged.resolve_current_uid(&proposed, &call),
+            BrowserSnapshot::resolve_current_uid(
+                FreshSnapshot(&unchanged),
+                ModelSnapshot(&proposed),
+                &call
+            ),
             TargetResolution::Resolved("g9:3_2".to_string())
         );
 
@@ -2168,7 +2325,11 @@ mod tests {
         let real_change =
             BrowserSnapshot::from_axi_output("uid=g11:9_1 button \"Main menu\" haspopup=\"menu\"");
         assert_eq!(
-            real_change.resolve_current_uid(&proposed, &call),
+            BrowserSnapshot::resolve_current_uid(
+                FreshSnapshot(&real_change),
+                ModelSnapshot(&proposed),
+                &call
+            ),
             TargetResolution::Gone
         );
 
@@ -2178,7 +2339,11 @@ mod tests {
             args: json!({"direction": "down"}),
         };
         assert_eq!(
-            proposed.resolve_current_uid(&unrelated_mutation, &scroll),
+            BrowserSnapshot::resolve_current_uid(
+                FreshSnapshot(&proposed),
+                ModelSnapshot(&unrelated_mutation),
+                &scroll
+            ),
             TargetResolution::NoUidNeeded
         );
     }

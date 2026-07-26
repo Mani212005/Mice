@@ -419,7 +419,10 @@ pub fn ollama_chat_payload(
         "options": {"num_ctx": num_ctx},
     });
     if let Some(format) = format {
-        payload.as_object_mut().unwrap().insert("format".into(), format);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("format".into(), format);
     }
     payload
 }
@@ -471,7 +474,13 @@ pub fn stream_ollama_chat(
 ) -> Result<(), OllamaError> {
     let response = ollama_agent()
         .post(endpoint)
-        .send_json(ollama_chat_payload(model, instruction, text, num_ctx, format))
+        .send_json(ollama_chat_payload(
+            model,
+            instruction,
+            text,
+            num_ctx,
+            format,
+        ))
         .map_err(ollama_request_error)?;
     for line in BufReader::new(response.into_reader()).lines() {
         let line = line?;
@@ -495,11 +504,7 @@ struct OllamaEmbedResponse {
 }
 
 /// Retrieve an embedding from Ollama's `/api/embed` endpoint.
-pub fn ollama_embed(
-    endpoint: &str,
-    model: &str,
-    input: &str,
-) -> Result<Vec<f32>, OllamaError> {
+pub fn ollama_embed(endpoint: &str, model: &str, input: &str) -> Result<Vec<f32>, OllamaError> {
     let response = ollama_agent()
         .post(endpoint)
         .send_json(serde_json::json!({
@@ -1379,14 +1384,9 @@ mod tests {
             .unwrap();
         });
 
-        let embedding = ollama_embed(
-            &endpoint,
-            "nomic-embed-text",
-            "test input",
-        )
-        .unwrap();
+        let embedding = ollama_embed(&endpoint, "nomic-embed-text", "test input").unwrap();
         server.join().unwrap();
-        
+
         assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
     }
 }
