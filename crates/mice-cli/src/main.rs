@@ -1,5 +1,11 @@
 mod coordination;
 mod filing;
+/// M20a's benchmark is test-only: it exists to measure grounding, and its
+/// fixtures are ~1.1MB of real page text that has no business in the shipped
+/// binary. When M20b introduces a ranker the autopilot actually uses, that
+/// ranker belongs on the main path and this module keeps scoring it.
+#[cfg(test)]
+mod grounding;
 mod mcp_client;
 mod memory;
 mod mission;
@@ -6628,7 +6634,7 @@ fn ensure_ollama_server() -> Result<(), Box<dyn std::error::Error>> {
 // still needless work and needless "pulling manifest…" output) on every
 // single autopilot invocation regardless of whether the model was already
 // installed.
-const AXI_RECIPE_EMBEDDING_MODEL: &str = "nomic-embed-text:latest";
+const AXI_RECIPE_EMBEDDING_MODEL: &str = "all-minilm:latest";
 
 /// Best-effort pull of the small embedding model recipe matching (Pillar C)
 /// uses. It is a few hundred MiB, not a multi-GiB model choice, so this

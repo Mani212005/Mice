@@ -205,6 +205,10 @@ impl BrowserSnapshot {
         self.targets.get(uid)
     }
 
+    pub fn raw_context_of(&self, uid: &str) -> Option<String> {
+        self.targets.get(uid).map(|t| t.context.clone())
+    }
+
     /// Whether a uid resolves in this snapshot at all. Used to catch a
     /// proposal that already references a target missing from the very
     /// snapshot it was decided against (a copy/paste slip or a hallucinated
@@ -247,6 +251,67 @@ impl BrowserSnapshot {
         Some((role, label, occurrence))
     }
 
+    /// Returns the ancestor chain for a target as `Vec<(String, String, String)>` (uid, role, label)
+    /// ordered from nearest parent up towards the root.
+    /// Accessible text of the targets immediately surrounding `uid`, looking
+    /// **both** directions in document order.
+    ///
+    /// Forward matters as much as backward, and a real case turns on it: on an
+    /// arXiv listing the link is labelled `arXiv:2607.20661` while the paper's
+    /// title — the only text a person would actually use to describe it — sits
+    /// in a sibling `StaticText` *after* the link. Context gathered only from
+    /// preceding targets cannot see it, which makes that element impossible to
+    /// retrieve from any natural phrasing of the goal.
+    ///
+    /// Includes non-interactive targets on purpose: `StaticText` is where the
+    /// describing words live.
+    pub fn context_window_of(&self, uid: &str, before: usize, after: usize) -> String {
+        let Some(pos) = self.target_order.iter().position(|id| id == uid) else {
+            return String::new();
+        };
+        let start = pos.saturating_sub(before);
+        let end = (pos + after + 1).min(self.target_order.len());
+        let mut parts = Vec::new();
+        for id in &self.target_order[start..end] {
+            if id == uid {
+                continue;
+            }
+            if let Some(target) = self.target(id) {
+                let label = accessible_label(&target.context);
+                if !label.is_empty() {
+                    parts.push(label);
+                }
+            }
+        }
+        parts.join(" ")
+    }
+
+    pub fn ancestors_of(&self, uid: &str) -> Vec<(String, String, String)> {
+        let Some(pos) = self.target_order.iter().position(|id| id == uid) else {
+            return Vec::new();
+        };
+        let Some(target_depth) = self.target(uid).map(|target| target.depth) else {
+            return Vec::new();
+        };
+
+        let mut ancestors = Vec::new();
+        let mut min_depth = target_depth;
+        for id in self.target_order[..pos].iter().rev() {
+            let Some(candidate) = self.target(id) else {
+                continue;
+            };
+            if candidate.depth < min_depth {
+                min_depth = candidate.depth;
+                ancestors.push((
+                    id.clone(),
+                    candidate.role.clone(),
+                    accessible_label(&candidate.context),
+                ));
+            }
+        }
+        ancestors
+    }
+
     /// The interactive controls a container encloses, rendered for a refusal
     /// message as `uid=<id> <role> "<label>"` entries the model can copy.
     ///
@@ -273,19 +338,6 @@ impl BrowserSnapshot {
     /// goes through target resolution, the safety checks, and the person's
     /// confirmation.
     pub fn controls_within(&self, container_uid: &str) -> String {
-        const INTERACTIVE_ROLES: &[&str] = &[
-            "button",
-            "link",
-            "searchbox",
-            "textbox",
-            "combobox",
-            "checkbox",
-            "radio",
-            "menuitem",
-            "option",
-            "switch",
-            "tab",
-        ];
         let Some(start) = self
             .target_order
             .iter()
@@ -503,6 +555,52 @@ fn quoted_span_state(line: &str, mut in_quote: bool) -> bool {
 /// does not. Honors backslash-escaping the same way `strip_quoted_spans`
 /// does, for the same reason: a label cannot use an escaped quote to
 /// truncate itself early.
+/// Roles a person can actually act on. Everything else is page structure.
+///
+/// Used both to name the controls inside a refused container and, in the
+/// grounding benchmark, to decide what counts as a candidate at all — a
+/// ranker that has to consider `StaticText` nodes is ranking mostly noise
+/// (Wikipedia's own main page parses to 842 targets, of which a small
+/// fraction are actionable).
+pub const INTERACTIVE_ROLES: &[&str] = &[
+    "button",
+    "link",
+    "searchbox",
+    "textbox",
+    "combobox",
+    "checkbox",
+    "radio",
+    "menuitem",
+    "option",
+    "switch",
+    "tab",
+];
+
+#[allow(dead_code)]
+pub fn is_interactive_role(role: &str) -> bool {
+    INTERACTIVE_ROLES.contains(&role)
+}
+
+/// Every target in document order as `(uid, role, accessible label)`.
+///
+/// Document order is what a reader — or a model scanning the prompt — sees,
+/// so it is the ordering the benchmark's baseline ranker uses.
+#[allow(dead_code)]
+pub fn targets_in_document_order(snapshot: &BrowserSnapshot) -> Vec<(String, String, String)> {
+    snapshot
+        .target_order
+        .iter()
+        .filter_map(|uid| {
+            let target = snapshot.target(uid)?;
+            Some((
+                uid.clone(),
+                target.role.clone(),
+                accessible_label(&target.context),
+            ))
+        })
+        .collect()
+}
+
 fn accessible_label(context: &str) -> String {
     let mut label = String::new();
     let mut in_quote = false;

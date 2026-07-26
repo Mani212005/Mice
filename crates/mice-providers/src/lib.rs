@@ -541,6 +541,48 @@ pub fn ollama_embed(endpoint: &str, model: &str, input: &str) -> Result<Vec<f32>
     })
 }
 
+/// Embed many texts in one request.
+///
+/// Ollama's `/api/embed` accepts an array for `input`, and the difference is
+/// not marginal: element grounding has to score every actionable target on a
+/// page, and one-request-per-element would dominate the decision it is meant
+/// to speed up. Measured on this machine with `nomic-embed-text`, batched:
+/// 100 texts in 1.9s, 500 in 8.6s, 2355 in 41.7s. Even batched the largest
+/// pages are too slow to embed wholesale, which is why callers pool candidates
+/// first — but the batching is what makes a pool of a hundred or two viable at
+/// all.
+///
+/// Returns embeddings positionally aligned with `inputs`.
+pub fn ollama_embed_batch(
+    endpoint: &str,
+    model: &str,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, OllamaError> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let response = ollama_agent()
+        .post(endpoint)
+        .send_json(serde_json::json!({
+            "model": model,
+            "input": inputs,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+        }))
+        .map_err(ollama_request_error)?;
+    let body: OllamaEmbedResponse = serde_json::from_reader(response.into_reader())?;
+    if body.embeddings.len() != inputs.len() {
+        return Err(OllamaError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "embedding count {} does not match input count {}",
+                body.embeddings.len(),
+                inputs.len()
+            ),
+        )));
+    }
+    Ok(body.embeddings)
+}
+
 /// Verify both the local Ollama service and a named model before selecting a
 /// local tool-loop lane. A binary on PATH alone does not guarantee either.
 pub fn ollama_model_ready(endpoint: &str, model: &str) -> Result<(), OllamaError> {
