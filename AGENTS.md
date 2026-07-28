@@ -89,3 +89,14 @@ save the next agent from repeating your mistakes.
 - `gemma3:4b` is the default local privacy model. `phi4-mini` is a supported
   smaller text-only alternative. `gpt-oss:20b` is an opt-in heavy model only:
   require the hardware preflight to pass before enabling or downloading it.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
+
+## Design Language
+
+- Consult `design-system.md` for standard macOS-native MICE UI components, typography, colors, and the `PromptPanel` styling guidelines.
