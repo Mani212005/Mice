@@ -1370,15 +1370,27 @@ private final class PalettePanel: NSPanel, NSTextFieldDelegate {
         hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let material = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
+        let container = NSView(frame: contentView?.bounds ?? .zero)
+        container.autoresizingMask = [.width, .height]
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 24
+        container.layer?.masksToBounds = true
+        contentView = container
+
+        let mesh = PremiumMeshGradientView(frame: container.bounds)
+        mesh.autoresizingMask = [.width, .height]
+        mesh.gradientOpacity = 0.7
+        container.addSubview(mesh)
+
+        let material = NSVisualEffectView(frame: container.bounds.insetBy(dx: 1.5, dy: 1.5))
         material.autoresizingMask = [.width, .height]
         material.material = .hudWindow
         material.blendingMode = .withinWindow
         material.state = .active
         material.wantsLayer = true
-        material.layer?.cornerRadius = 24
+        material.layer?.cornerRadius = 22.5
         material.layer?.masksToBounds = true
-        contentView = material
+        container.addSubview(material)
 
         // A real card behind the text field is intentional. The standard
         // rounded bezel can disappear on the dark HUD material, leaving an
@@ -1624,6 +1636,7 @@ private final class HomePanel: NSPanel, NSWindowDelegate {
         hero.addSubview(eyebrow)
         let title = label("Make the next step\nfeel obvious.", frame: NSRect(x: 24, y: 69, width: 420, height: 66), size: 30, weight: .bold)
         title.maximumNumberOfLines = 2
+        title.font = premiumDisplayFont(size: 30, weight: .bold)
         hero.addSubview(title)
         let subtitle = label("Ask, understand, plan, and keep work moving —\nwith you in control.", frame: NSRect(x: 24, y: 27, width: 430, height: 35), size: 14, weight: .regular)
         subtitle.textColor = .secondaryLabelColor
@@ -1720,22 +1733,10 @@ private final class HomePanel: NSPanel, NSWindowDelegate {
     }
 
     private func addGlassPrimaryButton(to view: NSView, title: String, frame: NSRect, action: Selector) {
-        let glow = CAGradientLayer()
-        glow.colors = [
-            NSColor.systemPink.cgColor, NSColor.systemOrange.cgColor,
-            NSColor.systemTeal.cgColor, NSColor.systemBlue.cgColor,
-            NSColor.systemPurple.cgColor,
-        ]
-        glow.startPoint = CGPoint(x: 0, y: 0)
-        glow.endPoint = CGPoint(x: 1, y: 1)
-        glow.frame = frame
-        glow.cornerRadius = 13
-        view.layer?.addSublayer(glow)
-        let control = NSButton(title: title, target: self, action: action)
-        control.frame = frame.insetBy(dx: 1, dy: 1)
-        control.isBordered = false
-        control.font = .systemFont(ofSize: 14, weight: .bold)
-        control.contentTintColor = .white
+        let control = PremiumPillButton(frame: frame)
+        control.title = title
+        control.target = self
+        control.action = action
         view.addSubview(control)
     }
 
@@ -1858,15 +1859,27 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let material = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
+        let container = NSView(frame: contentView?.bounds ?? .zero)
+        container.autoresizingMask = [.width, .height]
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 22
+        container.layer?.masksToBounds = true
+        contentView = container
+
+        let mesh = PremiumMeshGradientView(frame: container.bounds)
+        mesh.autoresizingMask = [.width, .height]
+        mesh.gradientOpacity = 0.7
+        container.addSubview(mesh)
+
+        let material = NSVisualEffectView(frame: container.bounds.insetBy(dx: 1.5, dy: 1.5))
         material.autoresizingMask = [.width, .height]
         material.material = .hudWindow
         material.blendingMode = .withinWindow
         material.state = .active
         material.wantsLayer = true
-        material.layer?.cornerRadius = 20
+        material.layer?.cornerRadius = 20.5
         material.layer?.masksToBounds = true
-        contentView = material
+        container.addSubview(material)
 
         titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
         titleLabel.textColor = .labelColor
@@ -2025,12 +2038,39 @@ private final class OverlayController: NSObject {
     private var reviewSessionId: String?
 
     override init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.nonactivatingPanel, .titled, .closable], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.borderless, .nonactivatingPanel, .resizable], backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.title = "MICE"
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        
+        let container = NSView(frame: panel.contentView?.bounds ?? .zero)
+        container.autoresizingMask = [.width, .height]
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 22
+        container.layer?.masksToBounds = true
+        panel.contentView = container
+
+        let mesh = PremiumMeshGradientView(frame: container.bounds)
+        mesh.autoresizingMask = [.width, .height]
+        mesh.gradientOpacity = 0.7
+        container.addSubview(mesh)
+
+        let material = NSVisualEffectView(frame: container.bounds.insetBy(dx: 1.5, dy: 1.5))
+        material.autoresizingMask = [.width, .height]
+        material.material = .hudWindow
+        material.blendingMode = .withinWindow
+        material.state = .active
+        material.wantsLayer = true
+        material.layer?.cornerRadius = 20.5
+        material.layer?.masksToBounds = true
+        container.addSubview(material)
+        
+        // Ensure subviews are added to material instead of panel.contentView later
 
         scrollView = NSScrollView(frame: NSRect(x: 12, y: 52, width: 456, height: 256))
         scrollView.hasVerticalScroller = true
@@ -2082,10 +2122,12 @@ private final class OverlayController: NSObject {
 
         OverlayController.active = self
 
-        panel.contentView?.addSubview(scrollView)
-        panel.contentView?.addSubview(buttonRow)
-        panel.contentView?.addSubview(captionLabel)
-        panel.contentView?.addSubview(imageView)
+        if let material = panel.contentView?.subviews.compactMap({ $0 as? NSVisualEffectView }).first {
+            material.addSubview(scrollView)
+            material.addSubview(buttonRow)
+            material.addSubview(captionLabel)
+            material.addSubview(imageView)
+        }
     }
 
     func handle(json: String) {
@@ -2367,7 +2409,16 @@ private final class OverlayController: NSObject {
         for action in actions {
             guard let id = action["id"] as? String, let title = action["label"] as? String else { continue }
             let button = NSButton(title: title, target: self, action: #selector(actionButtonClicked(_:)))
-            button.bezelStyle = .rounded
+            button.isBordered = false
+            button.wantsLayer = true
+            button.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.1).cgColor
+            button.layer?.borderColor = NSColor(white: 1.0, alpha: 0.1).cgColor
+            button.layer?.borderWidth = 1
+            button.layer?.cornerRadius = 6
+            button.contentTintColor = .white
+            button.font = premiumDisplayFont(size: 12, weight: .semibold)
+            let trackingArea = NSTrackingArea(rect: NSRect(x: 0, y: 0, width: 1000, height: 1000), options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: button, userInfo: nil)
+            button.addTrackingArea(trackingArea)
             button.identifier = NSUserInterfaceItemIdentifier(id)
             buttonRow.addArrangedSubview(button)
         }
@@ -2647,4 +2698,200 @@ private func writeFrame(_ data: Data) {
     let header = Data(bytes: &length, count: 4)
     try? FileHandle.standardOutput.write(contentsOf: header)
     try? FileHandle.standardOutput.write(contentsOf: data)
+}
+
+func premiumDisplayFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+    if let oswald = NSFont(name: "Oswald-Medium", size: size) {
+        return oswald
+    } else if let oswald = NSFont(name: "Oswald", size: size) {
+        return oswald
+    }
+    
+    let sysFont = NSFont.systemFont(ofSize: size, weight: weight)
+    if #available(macOS 13.0, *) {
+        return NSFont.systemFont(ofSize: size, weight: weight, width: .condensed)
+    } else {
+        let descriptor = sysFont.fontDescriptor.withDesign(.default)?
+            .withSymbolicTraits(.condensed) ?? sysFont.fontDescriptor
+        return NSFont(descriptor: descriptor, size: size) ?? sysFont
+    }
+}
+
+class PremiumMeshGradientView: NSView {
+    private let orbs: [CAGradientLayer] = (0..<4).map { _ in CAGradientLayer() }
+    var gradientOpacity: Float = 1.0 {
+        didSet { layer?.opacity = gradientOpacity }
+    }
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+    
+    private func setup() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(calibratedRed: 10/255.0, green: 10/255.0, blue: 11/255.0, alpha: 1.0).cgColor
+        layer?.masksToBounds = true
+        
+        let colors = [
+            NSColor(calibratedRed: 99/255.0, green: 102/255.0, blue: 241/255.0, alpha: 0.4).cgColor,
+            NSColor(calibratedRed: 168/255.0, green: 85/255.0, blue: 247/255.0, alpha: 0.4).cgColor,
+            NSColor(calibratedRed: 236/255.0, green: 72/255.0, blue: 153/255.0, alpha: 0.4).cgColor,
+            NSColor(calibratedRed: 56/255.0, green: 189/255.0, blue: 248/255.0, alpha: 0.4).cgColor
+        ]
+        
+        for (i, orb) in orbs.enumerated() {
+            orb.type = .radial
+            orb.colors = [colors[i], NSColor.clear.cgColor]
+            orb.startPoint = CGPoint(x: 0.5, y: 0.5)
+            orb.endPoint = CGPoint(x: 1.0, y: 1.0)
+            layer?.addSublayer(orb)
+        }
+        
+        startAnimation()
+    }
+    
+    override func layout() {
+        super.layout()
+        let size = max(bounds.width, bounds.height) * 1.5
+        let startPositions: [CGPoint] = [
+            CGPoint(x: bounds.width * 0.2, y: bounds.height * 0.3),
+            CGPoint(x: bounds.width * 0.8, y: bounds.height * 0.2),
+            CGPoint(x: bounds.width * 0.4, y: bounds.height * 0.8),
+            CGPoint(x: bounds.width * 0.8, y: bounds.height * 0.8)
+        ]
+        for (i, orb) in orbs.enumerated() {
+            orb.bounds = NSRect(x: 0, y: 0, width: size, height: size)
+            if orb.animation(forKey: "mesh-move") == nil {
+                orb.position = startPositions[i]
+            }
+        }
+    }
+    
+    private func startAnimation() {
+        let duration: CFTimeInterval = 8.0
+        for (i, orb) in orbs.enumerated() {
+            let move = CABasicAnimation(keyPath: "transform.translation")
+            // A bit of random offset per orb based on its index
+            let dx = (i % 2 == 0 ? 1 : -1) * 40.0
+            let dy = (i < 2 ? 1 : -1) * 40.0
+            
+            move.fromValue = NSSize(width: dx, height: dy)
+            move.toValue = NSSize(width: -dx, height: -dy)
+            move.duration = duration
+            move.autoreverses = true
+            move.repeatCount = .infinity
+            move.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            move.timeOffset = Double(i) * 2.0
+            
+            orb.add(move, forKey: "mesh-move")
+        }
+    }
+}
+
+class PremiumPillButton: NSButton {
+    private let glowLayer = CAGradientLayer()
+    private let bgLayer = CAGradientLayer()
+    private let highlightLayer = CALayer()
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+    
+    private func setup() {
+        wantsLayer = true
+        isBordered = false
+        font = premiumDisplayFont(size: 16, weight: .bold)
+        contentTintColor = NSColor(white: 249/255.0, alpha: 1.0)
+        
+        let radius = bounds.height / 2.0
+        layer?.cornerRadius = radius
+        layer?.masksToBounds = false
+        
+        // Glow layer (hidden by default)
+        glowLayer.colors = [
+            NSColor(calibratedRed: 99/255.0, green: 102/255.0, blue: 241/255.0, alpha: 1.0).cgColor,
+            NSColor(calibratedRed: 168/255.0, green: 85/255.0, blue: 247/255.0, alpha: 1.0).cgColor,
+            NSColor(calibratedRed: 236/255.0, green: 72/255.0, blue: 153/255.0, alpha: 1.0).cgColor
+        ]
+        glowLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        glowLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        glowLayer.opacity = 0.0
+        
+        // Use a CIFilter for blur if needed, but for simplicity, we rely on shadow
+        glowLayer.shadowColor = NSColor(calibratedRed: 168/255.0, green: 85/255.0, blue: 247/255.0, alpha: 1.0).cgColor
+        glowLayer.shadowOffset = .zero
+        glowLayer.shadowRadius = 8.0
+        glowLayer.shadowOpacity = 1.0
+        glowLayer.cornerRadius = radius
+        layer?.addSublayer(glowLayer)
+        
+        // Background layer
+        bgLayer.colors = [
+            NSColor(white: 1.0, alpha: 0.08).cgColor,
+            NSColor(white: 1.0, alpha: 0.0).cgColor
+        ]
+        bgLayer.backgroundColor = NSColor(calibratedRed: 10/255.0, green: 10/255.0, blue: 11/255.0, alpha: 1.0).cgColor
+        bgLayer.cornerRadius = radius
+        bgLayer.borderWidth = 1.0
+        bgLayer.borderColor = NSColor(white: 1.0, alpha: 0.12).cgColor
+        bgLayer.masksToBounds = true
+        layer?.addSublayer(bgLayer)
+        
+        // Add highlight
+        highlightLayer.backgroundColor = NSColor(white: 1.0, alpha: 0.15).cgColor
+        highlightLayer.opacity = 0.0
+        highlightLayer.cornerRadius = radius
+        bgLayer.addSublayer(highlightLayer)
+        
+        let trackingArea = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(trackingArea)
+    }
+    
+    override func layout() {
+        super.layout()
+        let radius = bounds.height / 2.0
+        layer?.cornerRadius = radius
+        glowLayer.frame = bounds.insetBy(dx: -2, dy: -2)
+        glowLayer.cornerRadius = radius + 2
+        bgLayer.frame = bounds
+        bgLayer.cornerRadius = radius
+        
+        // Simulate radial gradient for highlight
+        highlightLayer.frame = bounds
+        highlightLayer.cornerRadius = radius
+        
+        // The title of NSButton might be misaligned when changing cornerRadius in code.
+        // It's usually fine when using `isBordered = false`.
+    }
+    
+    override func mouseEntered(with event: NSEvent) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.4
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
+            glowLayer.opacity = 0.6
+            highlightLayer.opacity = 1.0
+            bgLayer.borderColor = NSColor(calibratedRed: 168/255.0, green: 85/255.0, blue: 247/255.0, alpha: 0.5).cgColor
+        }
+    }
+    
+    override func mouseExited(with event: NSEvent) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.4
+            glowLayer.opacity = 0.0
+            highlightLayer.opacity = 0.0
+            bgLayer.borderColor = NSColor(white: 1.0, alpha: 0.12).cgColor
+        }
+    }
 }
