@@ -1833,6 +1833,179 @@ private final class HomePanel: NSPanel, NSWindowDelegate {
 }
 
 @MainActor
+private final class PromptPanel: NSPanel, NSTextFieldDelegate {
+    private let titleLabel = NSTextField(wrappingLabelWithString: "")
+    private let contextLabel = NSTextField(wrappingLabelWithString: "")
+    private let input = NSTextField(string: "")
+    private let inputCard = NSView(frame: .zero)
+    private let hint = NSTextField(labelWithString: "Return sends · Esc cancels")
+    private var sessionID = ""
+    private var previousApp: NSRunningApplication?
+    
+    override var canBecomeKey: Bool { true }
+    
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = .floating
+        hidesOnDeactivate = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let material = NSVisualEffectView(frame: contentView?.bounds ?? .zero)
+        material.autoresizingMask = [.width, .height]
+        material.material = .hudWindow
+        material.blendingMode = .withinWindow
+        material.state = .active
+        material.wantsLayer = true
+        material.layer?.cornerRadius = 20
+        material.layer?.masksToBounds = true
+        contentView = material
+
+        titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        material.addSubview(titleLabel)
+
+        contextLabel.font = .systemFont(ofSize: 13, weight: .regular)
+        contextLabel.textColor = .secondaryLabelColor
+        material.addSubview(contextLabel)
+
+        inputCard.wantsLayer = true
+        inputCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.26).cgColor
+        inputCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        inputCard.layer?.borderWidth = 1
+        inputCard.layer?.cornerRadius = 12
+        material.addSubview(inputCard)
+
+        input.font = .systemFont(ofSize: 14, weight: .regular)
+        input.textColor = .labelColor
+        input.backgroundColor = .clear
+        input.isBordered = false
+        input.focusRingType = .none
+        input.delegate = self
+        input.target = self
+        input.action = #selector(submit(_:))
+        inputCard.addSubview(input)
+
+        hint.font = .systemFont(ofSize: 11, weight: .medium)
+        hint.textColor = .secondaryLabelColor
+        hint.alignment = .center
+        material.addSubview(hint)
+    }
+
+    func present(
+        sessionID: String,
+        title: String,
+        placeholder: String,
+        context: String?
+    ) {
+        self.sessionID = sessionID
+        self.previousApp = NSWorkspace.shared.frontmostApplication
+        
+        titleLabel.stringValue = title
+        contextLabel.stringValue = context ?? ""
+        input.stringValue = ""
+        input.isEnabled = true
+        input.placeholderAttributedString = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: NSColor.secondaryLabelColor]
+        )
+        
+        let width: CGFloat = 480
+        let padding: CGFloat = 24
+        
+        let titleHeight = titleLabel.sizeThatFits(NSSize(width: width - padding * 2, height: .greatestFiniteMagnitude)).height
+        let contextHeight = contextLabel.stringValue.isEmpty ? 0 : contextLabel.sizeThatFits(NSSize(width: width - padding * 2, height: .greatestFiniteMagnitude)).height
+        
+        let inputCardHeight: CGFloat = 40
+        let hintHeight: CGFloat = 16
+        let spacing: CGFloat = 16
+        
+        let totalHeight = padding + titleHeight + (contextHeight > 0 ? spacing + contextHeight : 0) + spacing + inputCardHeight + spacing + hintHeight + padding
+        setContentSize(NSSize(width: width, height: totalHeight))
+        
+        var currentY: CGFloat = totalHeight - padding
+        
+        titleLabel.frame = NSRect(x: padding, y: currentY - titleHeight, width: width - padding * 2, height: titleHeight)
+        currentY -= titleHeight
+        
+        if contextHeight > 0 {
+            currentY -= spacing
+            contextLabel.frame = NSRect(x: padding, y: currentY - contextHeight, width: width - padding * 2, height: contextHeight)
+            currentY -= contextHeight
+        } else {
+            contextLabel.frame = .zero
+        }
+        
+        currentY -= spacing
+        inputCard.frame = NSRect(x: padding, y: currentY - inputCardHeight, width: width - padding * 2, height: inputCardHeight)
+        input.frame = NSRect(x: 12, y: (inputCardHeight - 18) / 2, width: width - padding * 2 - 24, height: 18)
+        currentY -= inputCardHeight
+        
+        currentY -= spacing
+        hint.frame = NSRect(x: padding, y: currentY - hintHeight, width: width - padding * 2, height: hintHeight)
+        
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let visible = screen.visibleFrame
+            setFrameOrigin(NSPoint(
+                x: visible.midX - width / 2,
+                y: visible.maxY - totalHeight - 96
+            ))
+        }
+        
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(input)
+    }
+
+    @objc private func submit(_ sender: NSTextField) {
+        let text = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sessionID.isEmpty else { return }
+        let session = sessionID
+        sessionID = ""
+        dismissAndRestoreFocus()
+        MiceMacAgent.sendPromptSubmitted(sessionID: session, text: text)
+    }
+    
+    func dismissAndRestoreFocus() {
+        orderOut(nil)
+        previousApp?.activate(options: [])
+    }
+    
+    func cancelAndDismiss() {
+        guard !sessionID.isEmpty else { return }
+        let session = sessionID
+        sessionID = ""
+        dismissAndRestoreFocus()
+        MiceMacAgent.sendPromptCancelled(sessionID: session)
+    }
+    
+    override func cancelOperation(_ sender: Any?) {
+        cancelAndDismiss()
+    }
+    
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:))
+            || commandSelector == #selector(NSResponder.insertLineBreak(_:))
+        {
+            submit(input)
+            return true
+        }
+        return false
+    }
+}
+
+@MainActor
 private final class OverlayController: NSObject {
     private static weak var active: OverlayController?
     private let panel: NSPanel
@@ -1845,6 +2018,7 @@ private final class OverlayController: NSObject {
     private var guidePanel: GuideStepPanel?
     private var palettePanel: PalettePanel?
     private var homePanel: HomePanel?
+    private var promptPanel: PromptPanel?
     private var currentSessionId: String?
     /// The generic result panel also renders the Goal Guide review buttons.
     /// Keep that narrow distinction so Escape can cancel only this transient
@@ -2095,10 +2269,16 @@ private final class OverlayController: NSObject {
         panel.orderOut(nil)
         let paletteWasVisible = palettePanel?.isVisible == true
         palettePanel?.dismissAndRestoreFocus(notifyCore: true)
+        
+        let promptWasVisible = promptPanel?.isVisible == true
+        if promptWasVisible {
+            promptPanel?.cancelAndDismiss()
+        }
+
         // Escape is scoped to the surface the person is currently using.
         // Closing the palette must not silently send quit for a separately
         // active Goal Guide panel.
-        if !paletteWasVisible {
+        if !paletteWasVisible && !promptWasVisible {
             guidePanel?.dismissFromGlobalEscape()
             guidePanel = nil
         }
@@ -2107,6 +2287,7 @@ private final class OverlayController: NSObject {
         // button action discards the session in core memory.
         if panelWasVisible,
            !paletteWasVisible,
+           !promptWasVisible,
            !guideWasVisible,
            let _ = reviewSession {
             reviewSessionId = nil
@@ -2246,22 +2427,14 @@ private final class OverlayController: NSObject {
         if reviewSessionId == sessionID {
             reviewSessionId = nil
         }
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = context ?? ""
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(string: "")
-        field.placeholderString = placeholder
-        field.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
-        alert.accessoryView = field
-        NSApp.activate(ignoringOtherApps: true)
-        let result = alert.runModal()
-        if result == .alertFirstButtonReturn {
-            MiceMacAgent.sendPromptSubmitted(sessionID: sessionID, text: field.stringValue)
-        } else {
-            MiceMacAgent.sendPromptCancelled(sessionID: sessionID)
-        }
+        let prompt = promptPanel ?? PromptPanel()
+        promptPanel = prompt
+        prompt.present(
+            sessionID: sessionID,
+            title: title,
+            placeholder: placeholder,
+            context: context
+        )
     }
 
     private func showGuideStep(
