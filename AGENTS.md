@@ -77,6 +77,12 @@ save the next agent from repeating your mistakes.
 
 ## Local development
 
+- Read `OPENAI_API_KEY` only from the environment at runtime.
+- The default config path is `~/Library/Application Support/MICE/config.toml`;
+  never add a real config file to git.
+- `gemma3:4b` is the default local privacy model. `phi4-mini` is a supported
+  smaller text-only alternative. `gpt-oss:20b` is an opt-in heavy model only:
+  require the hardware preflight to pass before enabling or downloading it.
 - See [README.md](README.md) for configuration paths, API keys, and model defaults.
 
 ## Maintaining this file
@@ -85,3 +91,7 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
+
+## Design Language
+
+- Consult `design-system.md` for standard macOS-native MICE UI components, typography, colors, and the `PromptPanel` styling guidelines.
