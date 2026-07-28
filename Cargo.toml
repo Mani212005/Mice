@@ -12,6 +12,9 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "MICE is a screen-aware, native AI helper that accomplishes goals on your computer or patiently walks you through them on your actual screen, in plain language."
+keywords = ["ai", "agent", "desktop", "mac", "rust"]
+categories = ["command-line-utilities"]
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
