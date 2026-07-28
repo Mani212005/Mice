@@ -2076,7 +2076,7 @@ private final class OverlayController: NSObject {
         
         // Ensure subviews are added to material instead of panel.contentView later
 
-        summaryCard = NSView(frame: NSRect(x: 12, y: 12, width: 456, height: 254))
+        summaryCard = NSView(frame: NSRect(x: 24, y: 24, width: 429, height: 225))
         summaryCard.autoresizingMask = [.width, .height]
         summaryCard.wantsLayer = true
         summaryCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
@@ -2084,14 +2084,19 @@ private final class OverlayController: NSObject {
         summaryCard.layer?.borderWidth = 1
         summaryCard.layer?.cornerRadius = 13
 
-        scrollView = NSScrollView(frame: NSRect(x: 12, y: 12, width: 432, height: 230))
+        let cardMesh = PremiumMeshGradientView(frame: NSRect(x: 0, y: 0, width: 429, height: 225))
+        cardMesh.autoresizingMask = [.width, .height]
+        cardMesh.gradientOpacity = 0.15
+        summaryCard.addSubview(cardMesh)
+
+        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: 397, height: 193))
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 432, height: 230))
+        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 397, height: 193))
         textView.isEditable = false
         textView.isSelectable = true
         // Fetch Links is an explicit user action; MICE applies link
@@ -2105,17 +2110,17 @@ private final class OverlayController: NSObject {
         ]
         textView.drawsBackground = false
         textView.font = .systemFont(ofSize: 14)
-        textView.textColor = .labelColor
-        textView.textContainerInset = NSSize(width: 6, height: 6)
+        textView.textColor = NSColor(white: 0.9, alpha: 1.0)
+        textView.textContainerInset = NSSize(width: 0, height: 0)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 432, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: 397, height: CGFloat.greatestFiniteMagnitude)
         scrollView.documentView = textView
         summaryCard.addSubview(scrollView)
 
-        buttonRow = NSStackView(frame: NSRect(x: 80, y: 278, width: 388, height: 30))
+        buttonRow = NSStackView(frame: NSRect(x: 24, y: 265, width: 429, height: 28))
         buttonRow.autoresizingMask = [.width, .minYMargin]
         buttonRow.orientation = .horizontal
         buttonRow.alignment = .centerY
@@ -2422,7 +2427,15 @@ private final class OverlayController: NSObject {
         clearButtons()
         for action in actions {
             guard let id = action["id"] as? String, let title = action["label"] as? String else { continue }
-            let button = NSButton(title: title, target: self, action: #selector(actionButtonClicked(_:)))
+            
+            if id == "go_deeper" {
+                let spacer = NSView()
+                spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+                buttonRow.addArrangedSubview(spacer)
+            }
+            
+            let buttonTitle = (id == "copy") ? "" : title
+            let button = NSButton(title: buttonTitle, target: self, action: #selector(actionButtonClicked(_:)))
             button.isBordered = false
             button.wantsLayer = true
             button.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.1).cgColor
@@ -2431,10 +2444,44 @@ private final class OverlayController: NSObject {
             button.layer?.cornerRadius = 6
             button.contentTintColor = .white
             button.font = premiumDisplayFont(size: 12, weight: .semibold)
+            
+            let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+            if id == "copy" {
+                if let img = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+                    button.image = img
+                    button.imagePosition = .imageOnly
+                }
+            } else if id == "insert" {
+                if let img = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+                    button.image = img
+                    button.imagePosition = .imageLeft
+                    button.imageHugsTitle = true
+                }
+            } else if id == "send_to" {
+                if let img = NSImage(systemSymbolName: "paperplane", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+                    button.image = img
+                    button.imagePosition = .imageLeft
+                    button.imageHugsTitle = true
+                }
+            } else if id == "go_deeper" {
+                if let img = NSImage(systemSymbolName: "plus.magnifyingglass", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+                    button.image = img
+                    button.imagePosition = .imageLeft
+                    button.imageHugsTitle = true
+                }
+            }
+            
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            
             let trackingArea = NSTrackingArea(rect: NSRect(x: 0, y: 0, width: 1000, height: 1000), options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: button, userInfo: nil)
             button.addTrackingArea(trackingArea)
             button.identifier = NSUserInterfaceItemIdentifier(id)
             buttonRow.addArrangedSubview(button)
+            
+            if id == "copy" {
+                button.widthAnchor.constraint(equalToConstant: 28).isActive = true
+            }
         }
         buttonRow.isHidden = buttonRow.arrangedSubviews.isEmpty
         panel.orderFrontRegardless()
