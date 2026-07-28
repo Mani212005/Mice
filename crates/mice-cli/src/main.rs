@@ -1701,6 +1701,107 @@ fn handle_autopilot_result(bridge: &NativeBridge, message: &serde_json::Value) {
 
 /// The extension service worker may be reclaimed between dispatch and its
 /// acknowledgement. Re-observe rather than replaying an uncertain action.
+fn monitor_llm_questions(agent_writer: Arc<Mutex<std::process::ChildStdin>>) {
+    std::thread::spawn(move || {
+        let mut last_questions = std::collections::HashMap::<String, String>::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            // Check if terminal is frontmost
+            let is_terminal = if let Ok(output) = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
+                .output() {
+                let name = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                name.contains("terminal") || name.contains("iterm") || name.contains("alacritty") || name.contains("kitty") || name.contains("wezterm") || name.contains("ghostty") || name.contains("tmux")
+            } else {
+                false
+            };
+
+            if is_terminal {
+                continue;
+            }
+
+            let output = match std::process::Command::new("tmux")
+                .args(["list-panes", "-a", "-F", "#{pane_id} #{cursor_y}"])
+                .output()
+            {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+                Err(_) => continue,
+            };
+
+            for line in output.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    continue;
+                }
+                let pane_id = parts[0];
+                let cursor_y: usize = parts[1].parse().unwrap_or(0);
+
+                if let Ok(content_out) = std::process::Command::new("tmux")
+                    .args(["capture-pane", "-p", "-t", pane_id])
+                    .output()
+                {
+                    let content = String::from_utf8_lossy(&content_out.stdout);
+                    let lines: Vec<&str> = content.lines().collect();
+
+                    let mut target_line = "";
+                    for y in (0..=std::cmp::min(cursor_y, lines.len().saturating_sub(1))).rev() {
+                        let trimmed = lines[y].trim_end();
+                        if !trimmed.is_empty() && !trimmed.contains("────────") {
+                            target_line = trimmed;
+                            break;
+                        }
+                    }
+
+                    let is_q = target_line.ends_with('?')
+                        || target_line.ends_with("? ")
+                        || target_line.ends_with("(y/n)")
+                        || target_line.ends_with("(Y/n)")
+                        || target_line.ends_with("[y/N]")
+                        || target_line.contains("needs-decision:");
+
+                    if is_q {
+                        let old_q = last_questions
+                            .get(pane_id)
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        if old_q != target_line {
+                            let mut context_lines = Vec::new();
+                            for y in
+                                (0..=std::cmp::min(cursor_y, lines.len().saturating_sub(1))).rev()
+                            {
+                                let trimmed = lines[y].trim_end();
+                                if !trimmed.is_empty() && !trimmed.contains("────────")
+                                {
+                                    context_lines.push(trimmed.to_string());
+                                    if context_lines.len() >= 5 {
+                                        break;
+                                    }
+                                }
+                            }
+                            context_lines.reverse();
+
+                            let _ = send_command(
+                                &mut agent_writer.lock().unwrap(),
+                                mice_ipc::AgentCommand::OverlayPromptInput {
+                                    session_id: format!("tmux-{}", pane_id),
+                                    title: "Agent Question".into(),
+                                    placeholder: "Answer...".into(),
+                                    context: Some(context_lines.join("\n")),
+                                },
+                            );
+                            last_questions.insert(pane_id.to_string(), target_line.to_string());
+                        }
+                    } else if !target_line.is_empty() {
+                        last_questions.remove(pane_id);
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn recover_autopilot_timeouts(bridge: &NativeBridge) {
     let (directive, message): (Option<BrowserGoalDirective>, Option<String>) =
         if let Ok(mut state) = bridge.lock() {
@@ -7043,6 +7144,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 mice_providers::warm_ollama_model("http://127.0.0.1:11434/api/chat", &warm_model);
         });
     }
+
+    monitor_llm_questions(Arc::clone(&agent_writer));
+
     let watchdog_bridge = Arc::clone(&browser_goal_directive);
     std::thread::spawn(move || {
         loop {
@@ -7143,6 +7247,17 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
+            if submission.session_id.starts_with("tmux-") {
+                let pane_id = submission.session_id.trim_start_matches("tmux-");
+                let _ = std::process::Command::new("tmux")
+                    .args(["send-keys", "-t", pane_id, &submission.text, "C-m"])
+                    .status();
+                let _ = send_command(
+                    &mut agent_writer.lock().unwrap(),
+                    AgentCommand::OverlayDismiss,
+                );
+                continue;
+            }
             if let Err(error) = handle_goal_submission(
                 &agent_writer,
                 &config,
@@ -7156,6 +7271,13 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else if msg.method == "prompt.cancelled" {
             if let Some(session_id) = msg.params["sessionId"].as_str() {
+                if session_id.starts_with("tmux-") {
+                    let _ = send_command(
+                        &mut agent_writer.lock().unwrap(),
+                        AgentCommand::OverlayDismiss,
+                    );
+                    continue;
+                }
                 if let Ok(mut sessions) = goal_sessions.lock() {
                     sessions.remove(session_id);
                 }
