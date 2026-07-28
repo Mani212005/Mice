@@ -22,3 +22,8 @@ dist/
 # Multi-agent sync and local notes
 CLAUDE.md
 .agents-sync/
+
+# Housekeeping
+autopilot.md
+decisions.md
+manifest.md
