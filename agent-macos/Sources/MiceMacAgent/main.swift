@@ -2021,6 +2021,7 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
 private final class OverlayController: NSObject {
     private static weak var active: OverlayController?
     private let panel: NSPanel
+    private let summaryCard: NSView
     private let scrollView: NSScrollView
     private let textView: NSTextView
     private let buttonRow: NSStackView
@@ -2038,7 +2039,10 @@ private final class OverlayController: NSObject {
     private var reviewSessionId: String?
 
     override init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.borderless, .nonactivatingPanel, .resizable], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.titlebarAppearsTransparent = true
+        panel.titleVisibility = .hidden
+        panel.isMovableByWindowBackground = true
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
@@ -2072,13 +2076,22 @@ private final class OverlayController: NSObject {
         
         // Ensure subviews are added to material instead of panel.contentView later
 
-        scrollView = NSScrollView(frame: NSRect(x: 12, y: 52, width: 456, height: 256))
+        summaryCard = NSView(frame: NSRect(x: 12, y: 12, width: 456, height: 254))
+        summaryCard.autoresizingMask = [.width, .height]
+        summaryCard.wantsLayer = true
+        summaryCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
+        summaryCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.1).cgColor
+        summaryCard.layer?.borderWidth = 1
+        summaryCard.layer?.cornerRadius = 13
+
+        scrollView = NSScrollView(frame: NSRect(x: 12, y: 12, width: 432, height: 230))
+        scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 456, height: 256))
+        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 432, height: 230))
         textView.isEditable = false
         textView.isSelectable = true
         // Fetch Links is an explicit user action; MICE applies link
@@ -2098,10 +2111,12 @@ private final class OverlayController: NSObject {
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 456, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: 432, height: CGFloat.greatestFiniteMagnitude)
         scrollView.documentView = textView
+        summaryCard.addSubview(scrollView)
 
-        buttonRow = NSStackView(frame: NSRect(x: 12, y: 12, width: 456, height: 30))
+        buttonRow = NSStackView(frame: NSRect(x: 80, y: 278, width: 388, height: 30))
+        buttonRow.autoresizingMask = [.width, .minYMargin]
         buttonRow.orientation = .horizontal
         buttonRow.alignment = .centerY
         buttonRow.spacing = 8
@@ -2123,7 +2138,7 @@ private final class OverlayController: NSObject {
         OverlayController.active = self
 
         if let material = panel.contentView?.subviews.compactMap({ $0 as? NSVisualEffectView }).first {
-            material.addSubview(scrollView)
+            material.addSubview(summaryCard)
             material.addSubview(buttonRow)
             material.addSubview(captionLabel)
             material.addSubview(imageView)
@@ -2181,7 +2196,7 @@ private final class OverlayController: NSObject {
             guard let pngBase64 = params["pngBase64"] as? String,
                   let imageData = Data(base64Encoded: pngBase64),
                   let image = NSImage(data: imageData) else { return }
-            scrollView.isHidden = true
+            summaryCard.isHidden = true
             buttonRow.isHidden = true
             imageView.image = image
             imageView.isHidden = false
@@ -2387,11 +2402,10 @@ private final class OverlayController: NSObject {
         captionLabel.isHidden = true
         clearButtons()
         buttonRow.isHidden = true
-        panel.setContentSize(NSSize(width: 480, height: 320))
-        scrollView.frame = NSRect(x: 12, y: 52, width: 456, height: 256)
-        scrollView.isHidden = false
+        summaryCard.isHidden = false
         textView.string = text
         if positionAtMouse {
+            panel.setContentSize(NSSize(width: 480, height: 320))
             let mouse = NSEvent.mouseLocation
             let frame = panel.frame
             var origin = NSPoint(x: mouse.x + 18, y: mouse.y - frame.height - 18)
@@ -2435,6 +2449,9 @@ private final class OverlayController: NSObject {
 
     @objc private func actionButtonClicked(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue, let session = currentSessionId else { return }
+        if id == "go_deeper" {
+            sender.isHidden = true
+        }
         if id == "send_to" {
             showSendMenu(from: sender)
             return
