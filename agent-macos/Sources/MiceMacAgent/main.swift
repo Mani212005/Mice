@@ -1890,7 +1890,6 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         input.focusRingType = .none
         input.delegate = self
         input.target = self
-        input.action = #selector(submit(_:))
         inputCard.addSubview(input)
 
         hint.font = .systemFont(ofSize: 11, weight: .medium)

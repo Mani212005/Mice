@@ -399,7 +399,7 @@ models, or user configuration belong in this repository.
   resulting summary or infographic is intentionally the next clipboard value.
 - Added M6a typed prompt IPC, a portable `GoalSession` review state machine,
   strict OpenAI/Groq goal-plan schemas, goal shortcut configuration, and a
-  native macOS prompt/review dialog.
+  native macOS HUD prompt and review panel.
 - Added M6b guide-step IPC, manual guide navigation, and bounded read-only
   native AX target matching/highlighting.
 - Added M6c runtime browser-step directives and extension polling. The existing
