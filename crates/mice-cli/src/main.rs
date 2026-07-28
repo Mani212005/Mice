@@ -2066,7 +2066,51 @@ fn autopilot_subprocess_env() -> Vec<(String, String)> {
     allowed
 }
 
+fn dispatch_to_tmux() -> Result<bool, Box<dyn std::error::Error>> {
+    if env::var("MICE_IN_BACKGROUND").is_ok() {
+        return Ok(false);
+    }
+    // Check if tmux is installed
+    if Command::new("tmux").arg("-V").output().is_err() {
+        // tmux not found, fall back to foreground
+        return Ok(false);
+    }
+
+    let session_name = format!("mice-autopilot-{}", std::process::id());
+    let current_exe = env::current_exe()?;
+
+    let mut shell_cmd = format!(
+        "MICE_IN_BACKGROUND=1 '{}'",
+        current_exe.to_string_lossy().replace('\'', "'\\''")
+    );
+    for arg in env::args().skip(1) {
+        shell_cmd.push_str(&format!(" '{}'", arg.replace('\'', "'\\''")));
+    }
+    // Keep pane open on error or success so the user can review what happened
+    shell_cmd.push_str("; echo ''; echo 'Task finished. Press Enter to close this pane.'; read");
+
+    println!(
+        "MICE: Dispatching background agent in tmux session: {}",
+        session_name
+    );
+    println!("To view progress: tmux attach -t {}", session_name);
+
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session_name, &shell_cmd])
+        .status()?;
+
+    if !status.success() {
+        return Err("Failed to dispatch background task to tmux".into());
+    }
+
+    Ok(true)
+}
+
 fn autopilot_multi() -> Result<(), Box<dyn std::error::Error>> {
+    if dispatch_to_tmux()? {
+        return Ok(());
+    }
+
     let goal = env::args().skip(2).collect::<Vec<_>>().join(" ");
     if goal.trim().is_empty() {
         return Err(
@@ -2237,6 +2281,11 @@ fn autopilot() -> Result<(), Box<dyn std::error::Error>> {
         }),
         _ => None,
     };
+
+    if job_context.is_none() && dispatch_to_tmux()? {
+        return Ok(());
+    }
+
     let engine = if arguments
         .first()
         .is_some_and(|argument| argument == "--engine")
