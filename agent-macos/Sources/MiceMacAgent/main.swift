@@ -2039,7 +2039,7 @@ private final class OverlayController: NSObject {
     private var reviewSessionId: String?
 
     override init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 335), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
         panel.isMovableByWindowBackground = true
@@ -2076,7 +2076,7 @@ private final class OverlayController: NSObject {
         
         // Ensure subviews are added to material instead of panel.contentView later
 
-        summaryCard = NSView(frame: NSRect(x: 24, y: 24, width: 429, height: 225))
+        summaryCard = NSView(frame: NSRect(x: 24, y: 24, width: 432, height: 225))
         summaryCard.autoresizingMask = [.width, .height]
         summaryCard.wantsLayer = true
         summaryCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
@@ -2084,30 +2084,19 @@ private final class OverlayController: NSObject {
         summaryCard.layer?.borderWidth = 1
         summaryCard.layer?.cornerRadius = 13
 
-        let cardMesh = PremiumMeshGradientView(frame: NSRect(x: 0, y: 0, width: 429, height: 225))
+        let cardMesh = PremiumMeshGradientView(frame: NSRect(x: 0, y: 0, width: 432, height: 225))
         cardMesh.autoresizingMask = [.width, .height]
         cardMesh.gradientOpacity = 0.15
         summaryCard.addSubview(cardMesh)
 
-        let titleLabel = NSTextField(labelWithString: "Summary")
-        titleLabel.isEditable = false
-        titleLabel.isSelectable = false
-        titleLabel.isBordered = false
-        titleLabel.drawsBackground = false
-        titleLabel.font = premiumDisplayFont(size: 13, weight: .semibold)
-        titleLabel.textColor = NSColor(white: 1.0, alpha: 0.6)
-        titleLabel.frame = NSRect(x: 12, y: 225 - 12 - 16, width: 405, height: 16)
-        titleLabel.autoresizingMask = [.width, .minYMargin]
-        summaryCard.addSubview(titleLabel)
-
-        scrollView = NSScrollView(frame: NSRect(x: 12, y: 12, width: 405, height: 177))
+        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: 400, height: 193))
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 405, height: 177))
+        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 193))
         textView.isEditable = false
         textView.isSelectable = true
         // Fetch Links is an explicit user action; MICE applies link
@@ -2127,11 +2116,11 @@ private final class OverlayController: NSObject {
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 405, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude)
         scrollView.documentView = textView
         summaryCard.addSubview(scrollView)
 
-        buttonRow = NSStackView(frame: NSRect(x: 24, y: 265, width: 429, height: 28))
+        buttonRow = NSStackView(frame: NSRect(x: 24, y: 265, width: 432, height: 32))
         buttonRow.autoresizingMask = [.width, .minYMargin]
         buttonRow.orientation = .horizontal
         buttonRow.alignment = .centerY
@@ -2421,7 +2410,7 @@ private final class OverlayController: NSObject {
         summaryCard.isHidden = false
         textView.string = text
         if positionAtMouse {
-            panel.setContentSize(NSSize(width: 480, height: 320))
+            panel.setContentSize(NSSize(width: 480, height: 335))
             let mouse = NSEvent.mouseLocation
             let frame = panel.frame
             var origin = NSPoint(x: mouse.x + 18, y: mouse.y - frame.height - 18)
@@ -2484,7 +2473,7 @@ private final class OverlayController: NSObject {
             }
             
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 32).isActive = true
             
             let trackingArea = NSTrackingArea(rect: NSRect(x: 0, y: 0, width: 1000, height: 1000), options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: button, userInfo: nil)
             button.addTrackingArea(trackingArea)
@@ -2492,7 +2481,7 @@ private final class OverlayController: NSObject {
             buttonRow.addArrangedSubview(button)
             
             if id == "copy" {
-                button.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                button.widthAnchor.constraint(equalToConstant: 32).isActive = true
             }
         }
         buttonRow.isHidden = buttonRow.arrangedSubviews.isEmpty
