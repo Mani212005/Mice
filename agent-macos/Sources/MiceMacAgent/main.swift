@@ -1833,13 +1833,124 @@ private final class HomePanel: NSPanel, NSWindowDelegate {
     }
 }
 
+/// Every number here was measured off the rendered `.lavish/mice-design-system.html`
+/// mockup rather than eyeballed, because three earlier passes drifted by a few
+/// points each time and the panels stopped matching the spec. The two floating
+/// panels share one geometry so they cannot drift apart again.
+///
+/// The mockup nests a `p-[1.5px]` mesh-gradient rim around a `hud-material`
+/// surface with `p-6` padding. In AppKit that rim is the container view and the
+/// surface is the `NSVisualEffectView` inset by `border` — so a panel `width`
+/// leaves `width - border * 2 - padding * 2` for content, *not* `width -
+/// padding * 2`. Missing that 3pt inset is what made the right edge sit 3pt
+/// tighter than the left in every previous attempt.
+@MainActor
+private enum LavishMetrics {
+    static let panelWidth: CGFloat = 480
+    /// `p-[1.5px]`: the animated gradient rim showing around the HUD surface.
+    static let border: CGFloat = 1.5
+    static let panelRadius: CGFloat = 22
+    static let surfaceRadius: CGFloat = panelRadius - border
+    /// `p-6` inside the HUD surface.
+    static let padding: CGFloat = 24
+    /// `gap-4` / `mb-4` between stacked rows.
+    static let rowGap: CGFloat = 16
+
+    /// The traffic-light row the mockup draws by hand. MICE gets real window
+    /// buttons from AppKit instead, so this only reserves their band.
+    static let trafficLightsHeight: CGFloat = 12
+    static let actionsRowHeight: CGFloat = 32
+    /// Icon-only Copy is shorter than the labelled buttons in the mockup
+    /// (14pt glyph + `py-1.5` + border), and centers within the 32pt row.
+    static let iconButtonSize = NSSize(width: 32, height: 28)
+
+    static let cardRadius: CGFloat = 13
+    /// `p-4` inside the content card.
+    static let cardPadding: CGFloat = 16
+    /// `min-h-[140px]` / `max-h-[300px]` on the summary card.
+    static let cardMinHeight: CGFloat = 140
+    static let cardHeight: CGFloat = 300
+
+    static let inputHeight: CGFloat = 40
+    /// The uppercase card label, styled after the mockup's own section headers
+    /// (`font-semibold text-white/50 tracking-wider uppercase`) rather than
+    /// invented: it is the one piece of panel chrome MICE adds on top of the
+    /// mockup, so it borrows a token already in the design system.
+    static let cardLabelHeight: CGFloat = 16
+    static let cardLabelSize: CGFloat = 11
+    /// `tracking-wider` is 0.05em, which at 11pt is 0.55pt.
+    static let cardLabelKerning: CGFloat = 0.55
+    /// `leading-relaxed` on 14pt body text.
+    static let bodyLineHeight: CGFloat = 22.75
+    static let hintHeight: CGFloat = 26
+    /// `px-4` on the hint pill, applied to both sides.
+    static let hintHorizontalPadding: CGFloat = 16
+
+    /// The mockup's panels read violet because their `backdrop-filter` samples
+    /// a purple wallpaper. Reproducing that mechanism natively would mean
+    /// `.behindWindow` blending, which recolours the panel to match whatever
+    /// app it opens over — so the violet is baked in here instead. The value is
+    /// solved backwards from the rendered mockup: both its panels' HUD surfaces
+    /// measure about rgb(50,34,68), and this is the base that lands there once
+    /// `.hudWindow` and the mesh tint above it have composited — established by
+    /// capturing the real panel and sampling it, not by predicting the blend.
+    static let surfaceBaseColor = NSColor(
+        calibratedRed: 41 / 255.0, green: 16 / 255.0, blue: 56 / 255.0, alpha: 1.0
+    )
+
+    /// The mockup writes the content cards as `bg-black/40`, but that alpha is
+    /// calibrated for a card sitting on translucent glass with a bright
+    /// wallpaper behind it. On an opaque native surface the same alpha lands
+    /// far darker, so the card is pinned to the colour the mockup actually
+    /// renders — rgb(33,22,45) — pre-divided by the `opacity-[0.15]` mesh wash
+    /// that is drawn on top of it.
+    static let cardColor = NSColor(
+        calibratedRed: 27 / 255.0, green: 14 / 255.0, blue: 37 / 255.0, alpha: 1.0
+    )
+
+    /// `.hud-material` is `rgba(30,30,30,0.65)` over `backdrop-filter: blur`,
+    /// so 35% of the mesh behind it reaches the eye and gives the surface its
+    /// violet cast. `NSVisualEffectView` blurs but does not transmit colour
+    /// that way, so the same 35% is layered back on top of the blur.
+    static let surfaceTintOpacity: Float = 0.35
+    /// The mesh wash inside a content card, `opacity-[0.15]`.
+    static let cardTintOpacity: Float = 0.15
+    /// The gradient rim around the panel, `opacity-70`.
+    static let rimOpacity: Float = 0.7
+
+    static var surfaceWidth: CGFloat { panelWidth - border * 2 }
+    static var contentWidth: CGFloat { surfaceWidth - padding * 2 }
+
+    /// Everything stacked above the summary card: padding, the window-button
+    /// band, and the actions row, each separated by `rowGap`.
+    static var summaryChromeHeight: CGFloat {
+        padding + trafficLightsHeight + rowGap + actionsRowHeight + rowGap
+    }
+
+    static func summaryPanelHeight(cardHeight: CGFloat) -> CGFloat {
+        summaryChromeHeight + cardHeight + padding + border * 2
+    }
+
+    /// 14pt body text at the mockup's relaxed line height and `text-white/90`.
+    static func bodyTextAttributes() -> [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        // Only a floor: a taller run (an emoji, CJK) must still fit its line
+        // rather than being clipped by a hard maximum.
+        paragraph.minimumLineHeight = bodyLineHeight
+        return [
+            .font: NSFont.systemFont(ofSize: 14),
+            .foregroundColor: NSColor(white: 1.0, alpha: 0.9),
+            .paragraphStyle: paragraph,
+        ]
+    }
+}
+
 @MainActor
 private final class PromptPanel: NSPanel, NSTextFieldDelegate {
     private let titleLabel = NSTextField(wrappingLabelWithString: "")
     private let contextLabel = NSTextField(wrappingLabelWithString: "")
     private let input = NSTextField(string: "")
     private let inputCard = NSView(frame: .zero)
-    private let submitButton = NSButton(frame: .zero)
     private let hint = NSTextField(labelWithString: "Return sends · Esc cancels")
     private var sessionID = ""
     private var previousApp: NSRunningApplication?
@@ -1848,7 +1959,7 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
     
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
+            contentRect: NSRect(x: 0, y: 0, width: LavishMetrics.panelWidth, height: 200),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -1863,78 +1974,91 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         let container = NSView(frame: contentView?.bounds ?? .zero)
         container.autoresizingMask = [.width, .height]
         container.wantsLayer = true
-        container.layer?.cornerRadius = 22
+        container.layer?.cornerRadius = LavishMetrics.panelRadius
         container.layer?.masksToBounds = true
+        // Opaque, so the rim's `opacity-70` cannot leave 30% of the desktop
+        // showing through and tint the panel differently every time.
+        container.layer?.backgroundColor = LavishMetrics.surfaceBaseColor.cgColor
         contentView = container
 
-        let mesh = PremiumMeshGradientView(frame: container.bounds)
+        // Backdrop-less: the opaque `#0A0A0B` would cover `surfaceBaseColor`
+        // and flatten the panel back to grey.
+        let mesh = PremiumMeshGradientView(frame: container.bounds, drawsBackdrop: false)
         mesh.autoresizingMask = [.width, .height]
-        mesh.gradientOpacity = 0.7
+        mesh.gradientOpacity = LavishMetrics.rimOpacity
         container.addSubview(mesh)
 
-        let material = NSVisualEffectView(frame: container.bounds.insetBy(dx: 1.5, dy: 1.5))
+        let material = NSVisualEffectView(
+            frame: container.bounds.insetBy(
+                dx: LavishMetrics.border,
+                dy: LavishMetrics.border
+            )
+        )
         material.autoresizingMask = [.width, .height]
         material.material = .hudWindow
+        // Deliberately not `.behindWindow`, even though the mockup's
+        // `backdrop-filter` is literally a behind-the-window blur: sampling the
+        // real desktop repaints the panel a different colour over every app,
+        // which is the instability this redesign set out to remove. The violet
+        // the mockup gets from its wallpaper is supplied by `surfaceBaseColor`
+        // instead, so the panel looks the same wherever it opens.
         material.blendingMode = .withinWindow
         material.state = .active
         material.wantsLayer = true
-        material.layer?.cornerRadius = 20.5
+        material.layer?.cornerRadius = LavishMetrics.surfaceRadius
         material.layer?.masksToBounds = true
         container.addSubview(material)
 
-        titleLabel.font = premiumDisplayFont(size: 16, weight: .bold)
+        // Added before any content so it tints the surface, not the text.
+        let surfaceTint = PremiumMeshGradientView(frame: material.bounds, drawsBackdrop: false)
+        surfaceTint.autoresizingMask = [.width, .height]
+        surfaceTint.gradientOpacity = LavishMetrics.surfaceTintOpacity
+        material.addSubview(surfaceTint)
+
+        titleLabel.font = premiumDisplayFont(size: 16, weight: .semibold)
         titleLabel.textColor = .labelColor
         material.addSubview(titleLabel)
 
         contextLabel.font = .systemFont(ofSize: 13, weight: .regular)
-        contextLabel.textColor = .secondaryLabelColor
+        contextLabel.textColor = NSColor(white: 1.0, alpha: 0.7)
         material.addSubview(contextLabel)
 
         inputCard.wantsLayer = true
-        inputCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
-        inputCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.1).cgColor
-        inputCard.layer?.borderWidth = 1
-        inputCard.layer?.cornerRadius = 13
-        
+        inputCard.layer?.backgroundColor = LavishMetrics.cardColor.cgColor
+        inputCard.layer?.cornerRadius = LavishMetrics.cardRadius
+        // The mesh sublayer paints its own opaque square. Without clipping it
+        // squares off the card's rounded corners.
+        inputCard.layer?.masksToBounds = true
+
         let cardMesh = PremiumMeshGradientView(frame: .zero)
         cardMesh.autoresizingMask = [.width, .height]
-        cardMesh.gradientOpacity = 0.15
+        cardMesh.gradientOpacity = LavishMetrics.cardTintOpacity
         inputCard.addSubview(cardMesh)
-        
+
         material.addSubview(inputCard)
 
         input.font = .systemFont(ofSize: 14, weight: .regular)
         input.textColor = .labelColor
         input.backgroundColor = .clear
         input.isBordered = false
+        input.drawsBackground = false
         input.focusRingType = .none
         input.delegate = self
         input.target = self
         inputCard.addSubview(input)
-        
-        submitButton.title = "Submit"
-        submitButton.target = self
-        submitButton.action = #selector(submitAction(_:))
-        submitButton.bezelStyle = .regularSquare
-        submitButton.isBordered = false
-        submitButton.wantsLayer = true
-        submitButton.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.1).cgColor
-        submitButton.layer?.borderColor = NSColor(white: 1.0, alpha: 0.1).cgColor
-        submitButton.layer?.borderWidth = 1
-        submitButton.layer?.cornerRadius = 6
-        submitButton.contentTintColor = .white
-        submitButton.font = premiumDisplayFont(size: 12, weight: .semibold)
-        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
-        if let img = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
-            submitButton.image = img
-            submitButton.imagePosition = .imageRight
-            submitButton.imageHugsTitle = true
-        }
-        material.addSubview(submitButton)
 
+        // The mockup has no Submit control: Return is the only send affordance,
+        // which is exactly what this pill states. A button here also stole 88pt
+        // from the input, so the field could never run full width as designed.
         hint.font = .systemFont(ofSize: 11, weight: .medium)
-        hint.textColor = .secondaryLabelColor
+        hint.textColor = NSColor(white: 1.0, alpha: 0.6)
         hint.alignment = .center
+        hint.drawsBackground = false
+        hint.wantsLayer = true
+        hint.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.1).cgColor
+        hint.layer?.borderColor = NSColor(white: 1.0, alpha: 0.05).cgColor
+        hint.layer?.borderWidth = 1
+        hint.layer?.cornerRadius = LavishMetrics.hintHeight / 2
         material.addSubview(hint)
     }
 
@@ -1947,7 +2071,16 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         self.sessionID = sessionID
         self.previousApp = NSWorkspace.shared.frontmostApplication
         
-        titleLabel.stringValue = title
+        // `.premium-display-font` carries `letter-spacing: 0.05em`, which at
+        // 16pt is 0.8pt. Oswald reads noticeably cramped without it.
+        titleLabel.attributedStringValue = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: premiumDisplayFont(size: 16, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+                .kern: 0.8,
+            ]
+        )
         contextLabel.stringValue = context ?? ""
         input.stringValue = ""
         input.isEnabled = true
@@ -1956,43 +2089,70 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
             attributes: [.foregroundColor: NSColor.secondaryLabelColor]
         )
         
-        let width: CGFloat = 480
-        let padding: CGFloat = 24
-        
-        let titleHeight = titleLabel.sizeThatFits(NSSize(width: width - padding * 2, height: .greatestFiniteMagnitude)).height
-        let contextHeight = contextLabel.stringValue.isEmpty ? 0 : contextLabel.sizeThatFits(NSSize(width: width - padding * 2, height: .greatestFiniteMagnitude)).height
-        
-        let inputCardHeight: CGFloat = 40
-        let hintHeight: CGFloat = 16
-        let spacing: CGFloat = 16
-        
-        let totalHeight = padding + titleHeight + (contextHeight > 0 ? spacing + contextHeight : 0) + spacing + inputCardHeight + spacing + hintHeight + padding
+        let width = LavishMetrics.panelWidth
+        let border = LavishMetrics.border
+        let padding = LavishMetrics.padding
+        let spacing = LavishMetrics.rowGap
+        // Rows are laid out inside the HUD surface, which the gradient rim
+        // insets on every side. Measuring from the panel instead leaves the
+        // right edge `border` points tighter than the left.
+        let contentWidth = LavishMetrics.contentWidth
+
+        let unbounded = NSSize(width: contentWidth, height: .greatestFiniteMagnitude)
+        let titleHeight = titleLabel.sizeThatFits(unbounded).height
+        let contextHeight = contextLabel.stringValue.isEmpty
+            ? 0
+            : contextLabel.sizeThatFits(unbounded).height
+
+        let inputCardHeight = LavishMetrics.inputHeight
+        let hintHeight = LavishMetrics.hintHeight
+
+        let surfaceHeight = padding
+            + titleHeight
+            + (contextHeight > 0 ? spacing + contextHeight : 0)
+            + spacing + inputCardHeight
+            // The mockup gives the hint row an extra `mt-1` on top of the gap.
+            + spacing + 4 + hintHeight
+            + padding
+        let totalHeight = surfaceHeight + border * 2
         setContentSize(NSSize(width: width, height: totalHeight))
-        
-        var currentY: CGFloat = totalHeight - padding
-        
-        titleLabel.frame = NSRect(x: padding, y: currentY - titleHeight, width: width - padding * 2, height: titleHeight)
+
+        var currentY: CGFloat = surfaceHeight - padding
+
+        titleLabel.frame = NSRect(x: padding, y: currentY - titleHeight, width: contentWidth, height: titleHeight)
         currentY -= titleHeight
-        
+
         if contextHeight > 0 {
             currentY -= spacing
-            contextLabel.frame = NSRect(x: padding, y: currentY - contextHeight, width: width - padding * 2, height: contextHeight)
+            contextLabel.frame = NSRect(x: padding, y: currentY - contextHeight, width: contentWidth, height: contextHeight)
             currentY -= contextHeight
         } else {
             contextLabel.frame = .zero
         }
-        
+
         currentY -= spacing
-        inputCard.frame = NSRect(x: padding, y: currentY - inputCardHeight, width: width - padding * 2 - 88, height: inputCardHeight)
-        input.frame = NSRect(x: 12, y: (inputCardHeight - 18) / 2, width: inputCard.frame.width - 24, height: 18)
-        
-        submitButton.frame = NSRect(x: width - padding - 80, y: currentY - inputCardHeight + (inputCardHeight - 32) / 2, width: 80, height: 32)
-        
+        inputCard.frame = NSRect(x: padding, y: currentY - inputCardHeight, width: contentWidth, height: inputCardHeight)
+        let inputHeight = ceil(input.font?.boundingRectForFont.height ?? 18)
+        input.frame = NSRect(
+            x: 12,
+            y: (inputCardHeight - inputHeight) / 2,
+            width: contentWidth - 24,
+            height: inputHeight
+        )
         currentY -= inputCardHeight
-        
-        currentY -= spacing
-        hint.frame = NSRect(x: padding, y: currentY - hintHeight, width: width - padding * 2, height: hintHeight)
-        
+
+        currentY -= spacing + 4
+        let hintWidth = min(
+            ceil(hint.attributedStringValue.size().width) + LavishMetrics.hintHorizontalPadding * 2,
+            contentWidth
+        )
+        hint.frame = NSRect(
+            x: padding + (contentWidth - hintWidth) / 2,
+            y: currentY - hintHeight,
+            width: hintWidth,
+            height: hintHeight
+        )
+
         if let screen = NSScreen.main ?? NSScreen.screens.first {
             let visible = screen.visibleFrame
             setFrameOrigin(NSPoint(
@@ -2000,14 +2160,10 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
                 y: visible.maxY - totalHeight - 96
             ))
         }
-        
+
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
         makeFirstResponder(input)
-    }
-
-    @objc private func submitAction(_ sender: NSButton) {
-        submit(input)
     }
 
     @objc private func submit(_ sender: NSTextField) {
@@ -2074,7 +2230,23 @@ private final class OverlayController: NSObject {
     private var reviewSessionId: String?
 
     override init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 335), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = NSPanel(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: LavishMetrics.panelWidth,
+                height: LavishMetrics.summaryPanelHeight(cardHeight: LavishMetrics.cardHeight)
+            ),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        // `min-h-[140px]` on the content card: below this the card collapses to
+        // a sliver and the actions row starts clipping.
+        panel.contentMinSize = NSSize(
+            width: LavishMetrics.panelWidth,
+            height: LavishMetrics.summaryPanelHeight(cardHeight: LavishMetrics.cardMinHeight)
+        )
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
         panel.isMovableByWindowBackground = true
@@ -2090,55 +2262,104 @@ private final class OverlayController: NSObject {
         let container = NSView(frame: panel.contentView?.bounds ?? .zero)
         container.autoresizingMask = [.width, .height]
         container.wantsLayer = true
-        container.layer?.cornerRadius = 22
+        container.layer?.cornerRadius = LavishMetrics.panelRadius
         container.layer?.masksToBounds = true
+        // Opaque, so the rim's `opacity-70` cannot leave 30% of the desktop
+        // showing through and tint the panel differently every time.
+        container.layer?.backgroundColor = LavishMetrics.surfaceBaseColor.cgColor
         panel.contentView = container
 
-        let mesh = PremiumMeshGradientView(frame: container.bounds)
+        // Backdrop-less: the opaque `#0A0A0B` would cover `surfaceBaseColor`
+        // and flatten the panel back to grey.
+        let mesh = PremiumMeshGradientView(frame: container.bounds, drawsBackdrop: false)
         mesh.autoresizingMask = [.width, .height]
-        mesh.gradientOpacity = 0.7
+        mesh.gradientOpacity = LavishMetrics.rimOpacity
         container.addSubview(mesh)
 
-        let material = NSVisualEffectView(frame: container.bounds.insetBy(dx: 1.5, dy: 1.5))
+        let material = NSVisualEffectView(
+            frame: container.bounds.insetBy(
+                dx: LavishMetrics.border,
+                dy: LavishMetrics.border
+            )
+        )
         material.autoresizingMask = [.width, .height]
         material.material = .hudWindow
+        // Deliberately not `.behindWindow`, even though the mockup's
+        // `backdrop-filter` is literally a behind-the-window blur: sampling the
+        // real desktop repaints the panel a different colour over every app,
+        // which is the instability this redesign set out to remove. The violet
+        // the mockup gets from its wallpaper is supplied by `surfaceBaseColor`
+        // instead, so the panel looks the same wherever it opens.
         material.blendingMode = .withinWindow
         material.state = .active
         material.wantsLayer = true
-        material.layer?.cornerRadius = 20.5
+        material.layer?.cornerRadius = LavishMetrics.surfaceRadius
         material.layer?.masksToBounds = true
         container.addSubview(material)
-        
-        // Ensure subviews are added to material instead of panel.contentView later
 
-        summaryCard = NSView(frame: NSRect(x: 24, y: 24, width: 432, height: 225))
+        // Added before any content so it tints the surface, not the text.
+        let surfaceTint = PremiumMeshGradientView(frame: material.bounds, drawsBackdrop: false)
+        surfaceTint.autoresizingMask = [.width, .height]
+        surfaceTint.gradientOpacity = LavishMetrics.surfaceTintOpacity
+        material.addSubview(surfaceTint)
+
+        // Every frame below is in the HUD surface's coordinates, so the
+        // gradient rim is already excluded. Getting the initial frames exactly
+        // right is what lets plain autoresizing masks keep the layout correct
+        // through a live window resize, with no relayout pass to drift.
+        let padding = LavishMetrics.padding
+        let cardWidth = LavishMetrics.contentWidth
+        let cardHeight = material.bounds.height - LavishMetrics.summaryChromeHeight - padding
+        let cardPadding = LavishMetrics.cardPadding
+
+        summaryCard = NSView(frame: NSRect(x: padding, y: padding, width: cardWidth, height: cardHeight))
         summaryCard.autoresizingMask = [.width, .height]
         summaryCard.wantsLayer = true
-        summaryCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
+        summaryCard.layer?.backgroundColor = LavishMetrics.cardColor.cgColor
         summaryCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.1).cgColor
         summaryCard.layer?.borderWidth = 1
-        summaryCard.layer?.cornerRadius = 13
+        summaryCard.layer?.cornerRadius = LavishMetrics.cardRadius
+        // The mesh sublayer paints its own opaque square. Without clipping it
+        // squares off the card's rounded corners.
+        summaryCard.layer?.masksToBounds = true
 
-        let cardMesh = PremiumMeshGradientView(frame: NSRect(x: 0, y: 0, width: 432, height: 225))
+        let cardMesh = PremiumMeshGradientView(frame: summaryCard.bounds)
         cardMesh.autoresizingMask = [.width, .height]
-        cardMesh.gradientOpacity = 0.15
+        cardMesh.gradientOpacity = LavishMetrics.cardTintOpacity
         summaryCard.addSubview(cardMesh)
 
-        summaryHeader = NSTextField(labelWithString: "SUMMARY")
-        summaryHeader.frame = NSRect(x: 16, y: 198, width: 400, height: 16)
-        summaryHeader.font = premiumDisplayFont(size: 11, weight: .bold)
-        summaryHeader.textColor = .secondaryLabelColor
+        summaryHeader = NSTextField(labelWithString: "")
+        summaryHeader.attributedStringValue = NSAttributedString(
+            string: "SUMMARY",
+            attributes: [
+                .font: premiumDisplayFont(size: LavishMetrics.cardLabelSize, weight: .semibold),
+                .foregroundColor: NSColor(white: 1.0, alpha: 0.5),
+                .kern: LavishMetrics.cardLabelKerning,
+            ]
+        )
+        summaryHeader.frame = NSRect(
+            x: cardPadding,
+            y: cardHeight - cardPadding - LavishMetrics.cardLabelHeight,
+            width: cardWidth - cardPadding * 2,
+            height: LavishMetrics.cardLabelHeight
+        )
+        // Flexible bottom margin so the label stays at the card's top edge
+        // while the text below it takes the resize.
         summaryHeader.autoresizingMask = [.width, .minYMargin]
         summaryCard.addSubview(summaryHeader)
 
-        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: 400, height: 174))
+        // The label and its `mb-4` come out of the text's box, not out of the
+        // card's `p-4`, so the body keeps the same inset on all four sides.
+        var textFrame = summaryCard.bounds.insetBy(dx: cardPadding, dy: cardPadding)
+        textFrame.size.height -= LavishMetrics.cardLabelHeight + LavishMetrics.rowGap
+        scrollView = NSScrollView(frame: textFrame)
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 174))
+        textView = NSTextView(frame: NSRect(origin: .zero, size: textFrame.size))
         textView.isEditable = false
         textView.isSelectable = true
         // Fetch Links is an explicit user action; MICE applies link
@@ -2151,18 +2372,34 @@ private final class OverlayController: NSObject {
             .underlineStyle: NSUnderlineStyle.single.rawValue,
         ]
         textView.drawsBackground = false
-        textView.font = .systemFont(ofSize: 14)
-        textView.textColor = NSColor(white: 0.9, alpha: 1.0)
-        textView.textContainerInset = NSSize(width: 0, height: 0)
+        // The card's own `p-4` already supplies the inset; a second one here
+        // would double it and push the first line off the top.
+        textView.textContainerInset = .zero
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(
+            width: textFrame.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.font = .systemFont(ofSize: 14)
+        textView.textColor = NSColor(white: 1.0, alpha: 0.9)
+        // Set last: assigning `font` or `textColor` rebuilds typing attributes
+        // and would drop the relaxed line height.
+        textView.typingAttributes = LavishMetrics.bodyTextAttributes()
         scrollView.documentView = textView
         summaryCard.addSubview(scrollView)
 
-        buttonRow = NSStackView(frame: NSRect(x: 24, y: 265, width: 432, height: 32))
+        buttonRow = NSStackView(frame: NSRect(
+            x: padding,
+            y: material.bounds.height - padding - LavishMetrics.trafficLightsHeight
+                - LavishMetrics.rowGap - LavishMetrics.actionsRowHeight,
+            width: cardWidth,
+            height: LavishMetrics.actionsRowHeight
+        ))
+        // Flexible bottom margin: the row stays pinned below the window
+        // buttons while the card underneath absorbs a resize.
         buttonRow.autoresizingMask = [.width, .minYMargin]
         buttonRow.orientation = .horizontal
         buttonRow.alignment = .centerY
@@ -2218,17 +2455,18 @@ private final class OverlayController: NSObject {
             showText(params["text"] as? String ?? "Working…", positionAtMouse: !panel.isVisible)
         case "overlay.update":
             textView.string = params["text"] as? String ?? "Working…"
+            applyResultTextAttributes()
             panel.orderFrontRegardless()
         case "overlay.appendResult":
             textView.string += params["chunk"] as? String ?? ""
             trimOverlayTextIfNeeded()
-            applyHttpLinkAttributes()
+            applyResultTextAttributes()
             textView.scrollToEndOfDocument(nil)
         case "overlay.finishResult":
             if let text = params["text"] as? String {
                 if imageView.isHidden { textView.string = text } else { captionLabel.stringValue = text }
             }
-            applyHttpLinkAttributes()
+            applyResultTextAttributes()
         case "overlay.result":
             guard let sessionID = params["sessionId"] as? String else { return }
             currentSessionId = sessionID
@@ -2347,6 +2585,21 @@ private final class OverlayController: NSObject {
         textView.string = tail
     }
 
+    /// Restyle the whole result, then re-detect links. Assigning
+    /// `textView.string` replaces the storage wholesale and a streamed append
+    /// inherits whatever ran at the insertion point, so the design system's
+    /// 14pt/22.75pt body style has to be reasserted after every mutation
+    /// rather than configured once at init.
+    private func applyResultTextAttributes() {
+        if let storage = textView.textStorage, storage.length > 0 {
+            storage.setAttributes(
+                LavishMetrics.bodyTextAttributes(),
+                range: NSRange(location: 0, length: storage.length)
+            )
+        }
+        applyHttpLinkAttributes()
+    }
+
     /// Attribute only HTTP/HTTPS URLs as clickable links. Foundation's
     /// automatic detection would also linkify file:, mailto:, and custom URL
     /// schemes, which the result panel deliberately never offers.
@@ -2451,8 +2704,12 @@ private final class OverlayController: NSObject {
         buttonRow.isHidden = true
         summaryCard.isHidden = false
         textView.string = text
+        applyResultTextAttributes()
         if positionAtMouse {
-            panel.setContentSize(NSSize(width: 480, height: 335))
+            panel.setContentSize(NSSize(
+                width: LavishMetrics.panelWidth,
+                height: LavishMetrics.summaryPanelHeight(cardHeight: LavishMetrics.cardHeight)
+            ))
             let mouse = NSEvent.mouseLocation
             let frame = panel.frame
             var origin = NSPoint(x: mouse.x + 18, y: mouse.y - frame.height - 18)
@@ -2487,7 +2744,8 @@ private final class OverlayController: NSObject {
             button.layer?.cornerRadius = 6
             button.contentTintColor = .white
             button.font = premiumDisplayFont(size: 12, weight: .semibold)
-            
+
+
             let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
             if id == "copy" {
                 if let img = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
@@ -2515,15 +2773,24 @@ private final class OverlayController: NSObject {
             }
             
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.heightAnchor.constraint(equalToConstant: 32).isActive = true
-            
+            // The mockup sizes the icon-only Copy button by its 14pt glyph, so
+            // it is 4pt shorter than the labelled buttons and centers in the
+            // row. Forcing every button to one height, as an earlier pass did,
+            // makes Copy read as an oversized square.
+            let height = (id == "copy")
+                ? LavishMetrics.iconButtonSize.height
+                : LavishMetrics.actionsRowHeight
+            button.heightAnchor.constraint(equalToConstant: height).isActive = true
+
             let trackingArea = NSTrackingArea(rect: NSRect(x: 0, y: 0, width: 1000, height: 1000), options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: button, userInfo: nil)
             button.addTrackingArea(trackingArea)
             button.identifier = NSUserInterfaceItemIdentifier(id)
             buttonRow.addArrangedSubview(button)
-            
+
             if id == "copy" {
-                button.widthAnchor.constraint(equalToConstant: 32).isActive = true
+                button.widthAnchor
+                    .constraint(equalToConstant: LavishMetrics.iconButtonSize.width)
+                    .isActive = true
             }
         }
         buttonRow.isHidden = buttonRow.arrangedSubviews.isEmpty
@@ -2833,25 +3100,40 @@ func premiumDisplayFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFo
 
 class PremiumMeshGradientView: NSView {
     private let orbs: [CAGradientLayer] = (0..<4).map { _ in CAGradientLayer() }
+    /// `.premium-mesh-gradient` pairs the coloured orbs with an opaque
+    /// `background-color: #0A0A0B`. That is right where the mesh *is* the
+    /// surface (the gradient rim, a card's inner wash), and wrong when it only
+    /// tints something already drawn — an opaque backdrop over an
+    /// `NSVisualEffectView` would erase the blur it sits on.
+    private let drawsBackdrop: Bool
     var gradientOpacity: Float = 1.0 {
         didSet { layer?.opacity = gradientOpacity }
     }
-    
-    override init(frame frameRect: NSRect) {
+
+    init(frame frameRect: NSRect, drawsBackdrop: Bool = true) {
+        self.drawsBackdrop = drawsBackdrop
         super.init(frame: frameRect)
         setup()
     }
-    
+
     required init?(coder: NSCoder) {
+        drawsBackdrop = true
         super.init(coder: coder)
         setup()
     }
-    
+
+    /// `background-color: #0A0A0B` from `.premium-mesh-gradient`.
+    static let backdropColor = NSColor(
+        calibratedRed: 10 / 255.0, green: 10 / 255.0, blue: 11 / 255.0, alpha: 1.0
+    )
+
     private func setup() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor(calibratedRed: 10/255.0, green: 10/255.0, blue: 11/255.0, alpha: 1.0).cgColor
+        if drawsBackdrop {
+            layer?.backgroundColor = Self.backdropColor.cgColor
+        }
         layer?.masksToBounds = true
-        
+
         let colors = [
             NSColor(calibratedRed: 99/255.0, green: 102/255.0, blue: 241/255.0, alpha: 0.4).cgColor,
             NSColor(calibratedRed: 168/255.0, green: 85/255.0, blue: 247/255.0, alpha: 0.4).cgColor,
@@ -2873,11 +3155,15 @@ class PremiumMeshGradientView: NSView {
     override func layout() {
         super.layout()
         let size = max(bounds.width, bounds.height) * 1.5
+        // The CSS `circle at 20% 30%` measures 30% down from the top, while an
+        // unflipped NSView measures y up from the bottom. Using the CSS
+        // fractions directly mirrored the whole mesh, putting the warm orbs
+        // where the cool ones belong.
         let startPositions: [CGPoint] = [
-            CGPoint(x: bounds.width * 0.2, y: bounds.height * 0.3),
-            CGPoint(x: bounds.width * 0.8, y: bounds.height * 0.2),
-            CGPoint(x: bounds.width * 0.4, y: bounds.height * 0.8),
-            CGPoint(x: bounds.width * 0.8, y: bounds.height * 0.8)
+            CGPoint(x: bounds.width * 0.2, y: bounds.height * 0.7),
+            CGPoint(x: bounds.width * 0.8, y: bounds.height * 0.8),
+            CGPoint(x: bounds.width * 0.4, y: bounds.height * 0.2),
+            CGPoint(x: bounds.width * 0.8, y: bounds.height * 0.2)
         ]
         for (i, orb) in orbs.enumerated() {
             orb.bounds = NSRect(x: 0, y: 0, width: size, height: size)
