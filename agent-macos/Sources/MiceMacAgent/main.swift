@@ -1839,6 +1839,7 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
     private let contextLabel = NSTextField(wrappingLabelWithString: "")
     private let input = NSTextField(string: "")
     private let inputCard = NSView(frame: .zero)
+    private let submitButton = NSButton(frame: .zero)
     private let hint = NSTextField(labelWithString: "Return sends · Esc cancels")
     private var sessionID = ""
     private var previousApp: NSRunningApplication?
@@ -1881,7 +1882,7 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         material.layer?.masksToBounds = true
         container.addSubview(material)
 
-        titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.font = premiumDisplayFont(size: 16, weight: .bold)
         titleLabel.textColor = .labelColor
         material.addSubview(titleLabel)
 
@@ -1890,10 +1891,16 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         material.addSubview(contextLabel)
 
         inputCard.wantsLayer = true
-        inputCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.26).cgColor
-        inputCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        inputCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
+        inputCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.1).cgColor
         inputCard.layer?.borderWidth = 1
-        inputCard.layer?.cornerRadius = 12
+        inputCard.layer?.cornerRadius = 13
+        
+        let cardMesh = PremiumMeshGradientView(frame: .zero)
+        cardMesh.autoresizingMask = [.width, .height]
+        cardMesh.gradientOpacity = 0.15
+        inputCard.addSubview(cardMesh)
+        
         material.addSubview(inputCard)
 
         input.font = .systemFont(ofSize: 14, weight: .regular)
@@ -1904,6 +1911,26 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         input.delegate = self
         input.target = self
         inputCard.addSubview(input)
+        
+        submitButton.title = "Submit"
+        submitButton.target = self
+        submitButton.action = #selector(submitAction(_:))
+        submitButton.bezelStyle = .regularSquare
+        submitButton.isBordered = false
+        submitButton.wantsLayer = true
+        submitButton.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.1).cgColor
+        submitButton.layer?.borderColor = NSColor(white: 1.0, alpha: 0.1).cgColor
+        submitButton.layer?.borderWidth = 1
+        submitButton.layer?.cornerRadius = 6
+        submitButton.contentTintColor = .white
+        submitButton.font = premiumDisplayFont(size: 12, weight: .semibold)
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        if let img = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+            submitButton.image = img
+            submitButton.imagePosition = .imageRight
+            submitButton.imageHugsTitle = true
+        }
+        material.addSubview(submitButton)
 
         hint.font = .systemFont(ofSize: 11, weight: .medium)
         hint.textColor = .secondaryLabelColor
@@ -1956,8 +1983,11 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         }
         
         currentY -= spacing
-        inputCard.frame = NSRect(x: padding, y: currentY - inputCardHeight, width: width - padding * 2, height: inputCardHeight)
-        input.frame = NSRect(x: 12, y: (inputCardHeight - 18) / 2, width: width - padding * 2 - 24, height: 18)
+        inputCard.frame = NSRect(x: padding, y: currentY - inputCardHeight, width: width - padding * 2 - 88, height: inputCardHeight)
+        input.frame = NSRect(x: 12, y: (inputCardHeight - 18) / 2, width: inputCard.frame.width - 24, height: 18)
+        
+        submitButton.frame = NSRect(x: width - padding - 80, y: currentY - inputCardHeight + (inputCardHeight - 32) / 2, width: 80, height: 32)
+        
         currentY -= inputCardHeight
         
         currentY -= spacing
@@ -1974,6 +2004,10 @@ private final class PromptPanel: NSPanel, NSTextFieldDelegate {
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
         makeFirstResponder(input)
+    }
+
+    @objc private func submitAction(_ sender: NSButton) {
+        submit(input)
     }
 
     @objc private func submit(_ sender: NSTextField) {
@@ -2026,6 +2060,7 @@ private final class OverlayController: NSObject {
     private let textView: NSTextView
     private let buttonRow: NSStackView
     private let captionLabel: NSTextField
+    private let summaryHeader: NSTextField
     private let imageView: NSImageView
     private var highlightPanels: [NSPanel] = []
     private var guidePanel: GuideStepPanel?
@@ -2089,14 +2124,21 @@ private final class OverlayController: NSObject {
         cardMesh.gradientOpacity = 0.15
         summaryCard.addSubview(cardMesh)
 
-        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: 400, height: 193))
+        summaryHeader = NSTextField(labelWithString: "SUMMARY")
+        summaryHeader.frame = NSRect(x: 16, y: 198, width: 400, height: 16)
+        summaryHeader.font = premiumDisplayFont(size: 11, weight: .bold)
+        summaryHeader.textColor = .secondaryLabelColor
+        summaryHeader.autoresizingMask = [.width, .minYMargin]
+        summaryCard.addSubview(summaryHeader)
+
+        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: 400, height: 174))
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 193))
+        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 174))
         textView.isEditable = false
         textView.isSelectable = true
         // Fetch Links is an explicit user action; MICE applies link
@@ -2504,7 +2546,7 @@ private final class OverlayController: NSObject {
             let flash = CABasicAnimation(keyPath: "backgroundColor")
             flash.fromValue = NSColor(white: 1.0, alpha: 0.6).cgColor
             flash.toValue = NSColor(white: 1.0, alpha: 0.1).cgColor
-            flash.duration = 0.3
+            flash.duration = 1.0
             sender.layer?.add(flash, forKey: "flash")
         }
         if id == "send_to" {
