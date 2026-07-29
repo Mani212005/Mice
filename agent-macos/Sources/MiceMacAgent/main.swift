@@ -2089,14 +2089,25 @@ private final class OverlayController: NSObject {
         cardMesh.gradientOpacity = 0.15
         summaryCard.addSubview(cardMesh)
 
-        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: 397, height: 193))
+        let titleLabel = NSTextField(labelWithString: "Summary")
+        titleLabel.isEditable = false
+        titleLabel.isSelectable = false
+        titleLabel.isBordered = false
+        titleLabel.drawsBackground = false
+        titleLabel.font = premiumDisplayFont(size: 13, weight: .semibold)
+        titleLabel.textColor = NSColor(white: 1.0, alpha: 0.6)
+        titleLabel.frame = NSRect(x: 12, y: 225 - 12 - 16, width: 405, height: 16)
+        titleLabel.autoresizingMask = [.width, .minYMargin]
+        summaryCard.addSubview(titleLabel)
+
+        scrollView = NSScrollView(frame: NSRect(x: 12, y: 12, width: 405, height: 177))
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 397, height: 193))
+        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 405, height: 177))
         textView.isEditable = false
         textView.isSelectable = true
         // Fetch Links is an explicit user action; MICE applies link
@@ -2116,7 +2127,7 @@ private final class OverlayController: NSObject {
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 397, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: 405, height: CGFloat.greatestFiniteMagnitude)
         scrollView.documentView = textView
         summaryCard.addSubview(scrollView)
 
@@ -2436,6 +2447,7 @@ private final class OverlayController: NSObject {
             
             let buttonTitle = (id == "copy") ? "" : title
             let button = NSButton(title: buttonTitle, target: self, action: #selector(actionButtonClicked(_:)))
+            button.bezelStyle = .regularSquare
             button.isBordered = false
             button.wantsLayer = true
             button.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.1).cgColor
@@ -2498,6 +2510,13 @@ private final class OverlayController: NSObject {
         guard let id = sender.identifier?.rawValue, let session = currentSessionId else { return }
         if id == "go_deeper" {
             sender.isHidden = true
+        }
+        if id == "copy" {
+            let flash = CABasicAnimation(keyPath: "backgroundColor")
+            flash.fromValue = NSColor(white: 1.0, alpha: 0.6).cgColor
+            flash.toValue = NSColor(white: 1.0, alpha: 0.1).cgColor
+            flash.duration = 0.3
+            sender.layer?.add(flash, forKey: "flash")
         }
         if id == "send_to" {
             showSendMenu(from: sender)
