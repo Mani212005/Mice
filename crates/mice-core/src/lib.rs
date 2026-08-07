@@ -8,6 +8,9 @@ use mice_providers::{Action, CostPolicy, DEFAULT_CLOUD_MODEL, DEFAULT_LOCAL_MODE
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod finder;
+pub use finder::*;
+
 /// Model-backed planners may produce a task graph, but the portable core
 /// keeps that proposal bounded before it can become a launchable mission.
 pub const MAX_MISSION_TASKS: usize = 24;
