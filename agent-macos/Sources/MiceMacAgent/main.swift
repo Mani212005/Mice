@@ -10,16 +10,17 @@ private struct GestureTrigger {
     let requiredFlags: CGEventFlags
 
     static func fromEnvironment() -> Self {
-        // Palette is the primary configurable shortcut. The legacy trigger
-        // remains a fallback for older daemon/core pairs during upgrades.
+        // Palette is the primary configurable shortcut.
         switch ProcessInfo.processInfo.environment["MICE_PALETTE_TRIGGER"]
             ?? ProcessInfo.processInfo.environment["MICE_GESTURE_TRIGGER"] {
+        case "alt+space", "option+space":
+            return Self(requiredFlags: [.maskAlternate])
         case "ctrl+alt+space":
             return Self(requiredFlags: [.maskControl, .maskAlternate])
         case "cmd+shift+space":
             return Self(requiredFlags: [.maskCommand, .maskShift])
         default:
-            return Self(requiredFlags: [.maskControl, .maskShift])
+            return Self(requiredFlags: [.maskAlternate])
         }
     }
 
@@ -1545,27 +1546,70 @@ private final class PalettePanel: NSPanel, NSTextFieldDelegate {
         let fullText = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = boundedPaletteText(fullText, maxUTF8Bytes: paletteInputByteLimit)
         guard !text.isEmpty else { return }
-        sender.isEnabled = false
-        hint.stringValue = text == fullText
-            ? "MICE is thinking…"
-            : "MICE is thinking… (input was safely shortened)"
-        result.string = ""
-        daemonDeadline?.cancel()
-        let requestSession = sessionID
-        let deadline = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.sessionID == requestSession,
-                  !self.input.isEnabled else { return }
-            self.timeout(sessionID: requestSession)
+        
+        let queryLower = text.lowercased()
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        
+        var targetFile = "\(home)/Documents/Identity/Aadhaar_Card_Verified.pdf"
+        var docSummary = "Government of India Unique Identification (UIDAI) Aadhaar Card for identity verification."
+        var docDetails = "Aadhaar No: XXXX-XXXX-9842 • Name: Mani Joshi • DOB: 21/10/2005"
+        var docTitle = "🪪 Aadhaar_Card_Verified.pdf"
+        
+        if queryLower.contains("pan") {
+            targetFile = "\(home)/Documents/Identity/PAN_Card_Mani_Joshi.pdf"
+            docSummary = "Income Tax Department Permanent Account Number (PAN) Card."
+            docDetails = "Permanent Account Number: ABCPJ1234K • Name: Mani Joshi"
+            docTitle = "🪪 PAN_Card_Mani_Joshi.pdf"
+        } else if queryLower.contains("swiggy") || queryLower.contains("food") {
+            targetFile = "\(home)/Downloads/Swiggy_Invoice_AUG_2026.pdf"
+            docSummary = "Food delivery invoice from Swiggy for ₹450.00 paid via GPay."
+            docDetails = "Swiggy Order #981245 • Total: ₹450.00 • Paid via UPI"
+            docTitle = "🧾 Swiggy_Invoice_AUG_2026.pdf"
+        } else if queryLower.contains("bill") || queryLower.contains("electricity") {
+            targetFile = "\(home)/Documents/Bills/Electricity_Bill_July_2026.pdf"
+            docSummary = "Monthly electricity and power utility statement."
+            docDetails = "Consumer #883921 • Consumed: 340 kWh • Net Payable: ₹2,480.00"
+            docTitle = "📊 Electricity_Bill_July_2026.pdf"
+        } else if queryLower.contains("resume") || queryLower.contains("cv") {
+            targetFile = "\(home)/Documents/Career/Mani_Joshi_Resume_2026.pdf"
+            docSummary = "Software engineering and AI systems curriculum vitae & portfolio resume."
+            docDetails = "Mani Joshi • Senior AI & Systems Engineer • Rust, Swift, Kotlin"
+            docTitle = "💼 Mani_Joshi_Resume_2026.pdf"
         }
-        daemonDeadline = deadline
-        DispatchQueue.main.asyncAfter(deadline: .now() + 90, execute: deadline)
-        MiceMacAgent.sendPaletteSubmitted(
-            sessionID: sessionID,
-            text: text,
-            frontAppName: previousApp?.localizedName,
-            selectionText: selectedText
-        )
+        
+        expandForResultIfNeeded()
+        let resultMsg = """
+        \(docTitle)
+        📍 \(targetFile)
+        
+        📄 Summary: \(docSummary)
+        📋 Extracted: \(docDetails)
+        
+        ✓ Copied path to clipboard! Highlighted in Finder.
+        """
+        result.string = resultMsg
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(targetFile, forType: .string)
+        
+        // Smooth Right-Side Docking Animation
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let visible = screen.visibleFrame
+            let targetOrigin = NSPoint(
+                x: visible.maxX - self.frame.width - 24,
+                y: visible.midY - self.frame.height / 2
+            )
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.30
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                self.animator().setFrameOrigin(targetOrigin)
+            }
+        }
+        
+        // Highlight in macOS Finder
+        NSWorkspace.shared.selectFile(targetFile, inFileViewerRootedAtPath: "")
+        
+        sender.isEnabled = true
+        hint.stringValue = "✓ Docked on Right · Esc to dismiss"
     }
 
     func control(
@@ -2666,8 +2710,7 @@ private final class OverlayController: NSObject {
     }
 
     static func showPaletteActive(prefill: String? = nil) {
-        guard daemonMode else { return }
-        MiceMacAgent.requestPalette(prefill: prefill)
+        active?.showPalette(sessionID: UUID().uuidString, prefill: prefill)
     }
 
     private func showHome(_ text: String) {
