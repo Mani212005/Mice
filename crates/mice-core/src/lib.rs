@@ -12,6 +12,8 @@ pub mod finder;
 pub use finder::*;
 pub mod knowledge_graph;
 pub use knowledge_graph::*;
+pub mod sidekick;
+pub use sidekick::*;
 
 /// Model-backed planners may produce a task graph, but the portable core
 /// keeps that proposal bounded before it can become a launchable mission.
