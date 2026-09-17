@@ -23,6 +23,8 @@ pub enum SidekickTaskKind {
     TestRun,
     /// Targeted file slice read to avoid context bloat
     FileRead,
+    /// Locate and open target file in system default viewer / desktop
+    FileOpen,
     /// In-memory semantic knowledge graph traversal
     KnowledgeQuery,
     /// Multi-file batch edit or refactor
@@ -39,6 +41,7 @@ impl SidekickTaskKind {
             Self::CodePatch => "Code Patch",
             Self::TestRun => "Local Test Run",
             Self::FileRead => "File Read / Slice",
+            Self::FileOpen => "File Open",
             Self::KnowledgeQuery => "Knowledge Graph",
             Self::BatchEdit => "Batch Edit",
             Self::General => "General Routine",
@@ -52,6 +55,7 @@ impl SidekickTaskKind {
             Self::CodePatch => "🩹",
             Self::TestRun => "⚡",
             Self::FileRead => "📄",
+            Self::FileOpen => "📂",
             Self::KnowledgeQuery => "🧠",
             Self::BatchEdit => "📝",
             Self::General => "🤖",
@@ -310,6 +314,132 @@ impl SidekickEngine {
                     summary,
                     None,
                     matched,
+                    None,
+                    raw_in,
+                    inter_out,
+                )
+            }
+            SidekickTaskKind::FileOpen => {
+                let results = self.finder.search(&task.prompt);
+                let (status, summary, matched_files, raw_in, inter_out) = if let Some(top_doc) =
+                    results.first()
+                {
+                    let target_path = PathBuf::from(&top_doc.path);
+                    let open_res = if target_path.exists() {
+                        #[cfg(target_os = "macos")]
+                        {
+                            Command::new("open").arg(&target_path).output()
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            Command::new("cmd")
+                                .args(["/C", "start", "", &top_doc.path])
+                                .output()
+                        }
+                        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                        {
+                            Command::new("xdg-open").arg(&target_path).output()
+                        }
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("File at `{}` does not exist on disk", top_doc.path),
+                        ))
+                    };
+
+                    match open_res {
+                        Ok(out) if out.status.success() => {
+                            let summary = format!(
+                                "MICE located and opened `{}` ({}) from Mani Essentials:\n- Path: `{}`\n- Type: {} {}\n- Relevance Score: {:.1}\n- Summary: {}",
+                                top_doc.name,
+                                top_doc.doc_type_label,
+                                top_doc.path,
+                                top_doc.emoji,
+                                top_doc.doc_type_label,
+                                top_doc.relevance_score,
+                                top_doc.summary,
+                            );
+                            (
+                                SidekickStatus::Success,
+                                summary,
+                                vec![top_doc.path.clone()],
+                                4_500,
+                                550,
+                            )
+                        }
+                        Ok(out) => {
+                            let err_msg = String::from_utf8_lossy(&out.stderr);
+                            let summary = format!(
+                                "Found matching file `{}` at `{}` but open command returned status {:?}: {}",
+                                top_doc.name,
+                                top_doc.path,
+                                out.status.code(),
+                                err_msg
+                            );
+                            (
+                                SidekickStatus::Failed,
+                                summary,
+                                vec![top_doc.path.clone()],
+                                4_500,
+                                550,
+                            )
+                        }
+                        Err(e) => {
+                            let summary = format!(
+                                "Found matching file `{}` at `{}` but failed to open: {}",
+                                top_doc.name, top_doc.path, e
+                            );
+                            (
+                                SidekickStatus::Failed,
+                                summary,
+                                vec![top_doc.path.clone()],
+                                4_500,
+                                550,
+                            )
+                        }
+                    }
+                } else if !task.target_files.is_empty() {
+                    let file_path = task.working_dir.join(&task.target_files[0]);
+                    if file_path.exists() {
+                        let _ = Command::new("open").arg(&file_path).output();
+                        let summary = format!(
+                            "Opened target file `{}` in system viewer.",
+                            file_path.display()
+                        );
+                        (
+                            SidekickStatus::Success,
+                            summary,
+                            vec![file_path.to_string_lossy().to_string()],
+                            2_000,
+                            300,
+                        )
+                    } else {
+                        (
+                            SidekickStatus::Failed,
+                            format!("Target file `{}` not found.", file_path.display()),
+                            Vec::new(),
+                            1_000,
+                            200,
+                        )
+                    }
+                } else {
+                    (
+                        SidekickStatus::Failed,
+                        format!(
+                            "No semantic matching document found for prompt `{}`.",
+                            task.prompt
+                        ),
+                        Vec::new(),
+                        3_000,
+                        300,
+                    )
+                };
+
+                (
+                    status,
+                    summary,
+                    None,
+                    matched_files,
                     None,
                     raw_in,
                     inter_out,
@@ -883,5 +1013,25 @@ mod tests {
         let saved2 = r2.token_savings.net_tokens_saved;
         assert_eq!(engine.cumulative_tokens_saved, saved1 + saved2);
         assert!(engine.cumulative_cost_saved_usd > 0.0);
+    }
+
+    #[test]
+    fn test_sidekick_file_open_task() {
+        let mut engine = SidekickEngine::new();
+        let task = SidekickTask {
+            id: "open_test_1".into(),
+            kind: SidekickTaskKind::FileOpen,
+            prompt: "12th report card in Mani Essentials".into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Antigravity".into(),
+        };
+        let res = engine.execute(&task).unwrap();
+        assert!(!res.matched_items.is_empty());
+        assert!(res.token_savings.net_tokens_saved > 0);
     }
 }

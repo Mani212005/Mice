@@ -895,6 +895,7 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
                 if i + 1 < args.len() {
                     kind = match args[i + 1].to_lowercase().as_str() {
                         "semantic" | "search" => SidekickTaskKind::SemanticSearch,
+                        "open" | "file_open" | "launch" => SidekickTaskKind::FileOpen,
                         "ast" | "symbol" => SidekickTaskKind::AstSearch,
                         "patch" | "code_patch" => SidekickTaskKind::CodePatch,
                         "test" | "tests" => SidekickTaskKind::TestRun,
@@ -905,6 +906,9 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
                     };
                     i += 1;
                 }
+            }
+            "--open" | "-O" => {
+                kind = SidekickTaskKind::FileOpen;
             }
             "--file" | "-f" => {
                 if i + 1 < args.len() {
@@ -933,6 +937,13 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
             _ => {}
         }
         i += 1;
+    }
+
+    if kind == SidekickTaskKind::General
+        && (prompt.to_lowercase().starts_with("open ")
+            || prompt.to_lowercase().contains("open file"))
+    {
+        kind = SidekickTaskKind::FileOpen;
     }
 
     if prompt.is_empty() {
