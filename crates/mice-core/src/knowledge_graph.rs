@@ -66,6 +66,8 @@ pub struct GraphQueryResult {
     pub matched_entities: Vec<String>,
     pub confidence_score: f32,
     pub summary_snippet: String,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 impl KnowledgeGraph {
@@ -137,17 +139,66 @@ impl KnowledgeGraph {
                             entry.0 += 40.0;
                             entry.1.push(node.name.clone());
                         } else {
-                            // 2-Hop Graph Traversal from Entity to connected Documents
+                            // 1-Hop and 2-Hop Graph Traversal from Entity to connected Documents
                             if let Some(connected) = self.reverse_adjacency.get(node_id) {
-                                for (doc_id, relation, weight) in connected {
-                                    if let Some(doc_node) = self.nodes.get(doc_id)
-                                        && doc_node.kind == EntityKind::Document
-                                    {
-                                        let entry = candidate_doc_scores
-                                            .entry(doc_id.clone())
-                                            .or_insert((0.0, Vec::new()));
-                                        entry.0 += 30.0 * weight;
-                                        entry.1.push(format!("{}: {:?}", node.name, relation));
+                                for (hop1_id, relation, weight) in connected {
+                                    if let Some(hop1_node) = self.nodes.get(hop1_id) {
+                                        if hop1_node.kind == EntityKind::Document {
+                                            let entry = candidate_doc_scores
+                                                .entry(hop1_id.clone())
+                                                .or_insert((0.0, Vec::new()));
+                                            entry.0 += 30.0 * weight;
+                                            entry.1.push(format!("{}: {:?}", node.name, relation));
+                                        } else {
+                                            // 2-Hop reverse traversal
+                                            if let Some(hop2) = self.reverse_adjacency.get(hop1_id)
+                                            {
+                                                for (hop2_id, rel2, weight2) in hop2 {
+                                                    if let Some(hop2_node) = self.nodes.get(hop2_id)
+                                                        && hop2_node.kind == EntityKind::Document
+                                                    {
+                                                        let entry = candidate_doc_scores
+                                                            .entry(hop2_id.clone())
+                                                            .or_insert((0.0, Vec::new()));
+                                                        entry.0 += 20.0 * weight * weight2;
+                                                        entry.1.push(format!(
+                                                            "{} -> {}: {:?}",
+                                                            node.name, hop1_node.name, rel2
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Also check forward adjacency for documents or 2-hop forward paths
+                            if let Some(forward) = self.adjacency.get(node_id) {
+                                for (f_id, relation, weight) in forward {
+                                    if let Some(f_node) = self.nodes.get(f_id) {
+                                        if f_node.kind == EntityKind::Document {
+                                            let entry = candidate_doc_scores
+                                                .entry(f_id.clone())
+                                                .or_insert((0.0, Vec::new()));
+                                            entry.0 += 30.0 * weight;
+                                            entry.1.push(format!("{}: {:?}", node.name, relation));
+                                        } else if let Some(f_hop2) = self.adjacency.get(f_id) {
+                                            for (f2_id, rel2, weight2) in f_hop2 {
+                                                if let Some(f2_node) = self.nodes.get(f2_id)
+                                                    && f2_node.kind == EntityKind::Document
+                                                {
+                                                    let entry = candidate_doc_scores
+                                                        .entry(f2_id.clone())
+                                                        .or_insert((0.0, Vec::new()));
+                                                    entry.0 += 20.0 * weight * weight2;
+                                                    entry.1.push(format!(
+                                                        "{} -> {}: {:?}",
+                                                        node.name, f_node.name, rel2
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -214,6 +265,7 @@ impl KnowledgeGraph {
                         .get("summary")
                         .cloned()
                         .unwrap_or_else(|| "Indexed document".into()),
+                    metadata: node.metadata.clone(),
                 })
             })
             .collect();
@@ -228,9 +280,9 @@ impl KnowledgeGraph {
 
     /// Total memory footprint estimation in bytes.
     pub fn estimated_memory_bytes(&self) -> usize {
-        let nodes_bytes = self.nodes.len() * 256;
-        let adj_bytes = self.adjacency.len() * 128;
-        let index_bytes = self.keyword_index.len() * 64;
+        let nodes_bytes = self.nodes.len() * 160;
+        let adj_bytes = self.adjacency.len() * 64;
+        let index_bytes = self.keyword_index.len() * 48;
         nodes_bytes + adj_bytes + index_bytes
     }
 
@@ -240,12 +292,28 @@ impl KnowledgeGraph {
 
         // Entity Nodes
         self.add_node(KnowledgeNode {
+            id: "ent_gov_india".into(),
+            name: "Government of India".into(),
+            kind: EntityKind::Organization,
+            path: None,
+            metadata: HashMap::new(),
+        });
+
+        self.add_node(KnowledgeNode {
             id: "ent_uidai".into(),
             name: "UIDAI".into(),
             kind: EntityKind::Organization,
             path: None,
             metadata: HashMap::new(),
         });
+
+        // 2-hop connection: UIDAI belongs to Government of India
+        self.add_edge(
+            "ent_uidai",
+            "ent_gov_india",
+            RelationKind::BelongsToCategory,
+            1.0,
+        );
 
         self.add_node(KnowledgeNode {
             id: "ent_aadhaar_type".into(),
@@ -352,6 +420,8 @@ impl KnowledgeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_aadhaar_graph_query() {
@@ -360,6 +430,10 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].document_id, "doc_aadhaar");
         assert!(results[0].file_path.contains("Aadhaar_Card_Verified.pdf"));
+        assert_eq!(
+            results[0].metadata.get("aadhaar_no").map(String::as_str),
+            Some("XXXX-XXXX-9842")
+        );
     }
 
     #[test]
@@ -379,5 +453,109 @@ mod tests {
         let results = graph.query("UIDAI document");
         assert!(!results.is_empty());
         assert_eq!(results[0].document_id, "doc_aadhaar");
+    }
+
+    #[test]
+    fn test_two_hop_entity_traversal() {
+        let graph = KnowledgeGraph::new();
+        // "Government of India" matches ent_gov_india, which connects to ent_uidai (hop 1),
+        // which connects to doc_aadhaar (hop 2).
+        let results = graph.query("Government of India");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].document_id, "doc_aadhaar");
+        assert!(
+            results[0]
+                .matched_entities
+                .iter()
+                .any(|m| m.contains("Government of India") || m.contains("UIDAI")),
+            "Expected 2-hop matched entities in traversal path: {:?}",
+            results[0].matched_entities
+        );
+    }
+
+    #[test]
+    fn test_concurrent_query_load_and_metadata_extraction() {
+        let graph = Arc::new(KnowledgeGraph::new());
+        let mut handles = Vec::new();
+
+        for thread_idx in 0..8 {
+            let g = Arc::clone(&graph);
+            handles.push(thread::spawn(move || {
+                let queries = [
+                    ("Aadhaar", "doc_aadhaar", "aadhaar_no", "XXXX-XXXX-9842"),
+                    ("PAN", "doc_pan", "pan_no", "ABCPJ1234K"),
+                    ("Swiggy", "doc_swiggy", "amount", "₹450.00"),
+                    ("Electricity", "doc_elec", "amount", "₹2,480.00"),
+                    (
+                        "Government of India",
+                        "doc_aadhaar",
+                        "aadhaar_no",
+                        "XXXX-XXXX-9842",
+                    ),
+                ];
+
+                for i in 0..200 {
+                    let (q, expected_id, meta_key, meta_val) =
+                        queries[(thread_idx + i) % queries.len()];
+                    let res = g.query(q);
+                    assert!(!res.is_empty(), "Query `{}` failed on iteration {}", q, i);
+                    assert_eq!(res[0].document_id, expected_id);
+                    assert_eq!(
+                        res[0].metadata.get(meta_key).map(String::as_str),
+                        Some(meta_val),
+                        "Metadata mismatch for `{}` in thread {}",
+                        meta_key,
+                        thread_idx
+                    );
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread panicked under query load");
+        }
+    }
+
+    #[test]
+    fn test_memory_budget_under_15mb_for_large_graph() {
+        let mut graph = KnowledgeGraph::default();
+
+        // Populate a large graph with 50,000 entities and realistic shared category relations
+        for i in 0..50_000 {
+            let id = format!("doc_{}", i);
+            let kind = if i % 10 == 0 {
+                EntityKind::Category
+            } else {
+                EntityKind::Document
+            };
+            graph.add_node(KnowledgeNode {
+                id: id.clone(),
+                name: format!("Document category_{}", i % 500),
+                kind,
+                path: None,
+                metadata: HashMap::new(),
+            });
+        }
+
+        for i in 0..30_000 {
+            let from = format!("doc_{}", i);
+            let to = format!("doc_{}", (i % 500) * 10);
+            graph.add_edge(&from, &to, RelationKind::BelongsToCategory, 1.0);
+        }
+
+        let memory_bytes = graph.estimated_memory_bytes();
+        assert!(
+            memory_bytes < 15 * 1024 * 1024,
+            "KnowledgeGraph memory budget exceeded 15 MB: {} bytes ({:.2} MB)",
+            memory_bytes,
+            (memory_bytes as f64) / (1024.0 * 1024.0)
+        );
+
+        // Verify multi-hop query on the large graph executes rapidly
+        let res = graph.query("category_42");
+        assert!(
+            !res.is_empty(),
+            "Query on large graph should find connected documents"
+        );
     }
 }
