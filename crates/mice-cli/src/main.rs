@@ -10253,11 +10253,11 @@ fn mcp_tools() -> Vec<Value> {
         json!({"name": "mission_status", "description": "Read the active MICE mission's task ownership, lifecycle state, and bounded Git overlap warnings. It never launches, merges, or edits.", "inputSchema": {"type": "object", "properties": {"plan_path": {"type": "string"}}, "required": ["plan_path"]}}),
         json!({
             "name": "mice_sidekick_task",
-            "description": "Execute a high-speed delegated sub-agent routine (semantic search, AST symbol search, surgical code patch, local test run, or knowledge graph query) with token savings metrics and verified structured diff.",
+            "description": "Execute a high-speed delegated sub-agent routine (semantic search, AST symbol search, surgical code patch, local test run, file open, or knowledge graph query) with token savings metrics and verified structured diff.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["semantic_search", "ast_search", "code_patch", "test_run", "file_read", "knowledge_query", "batch_edit", "general"]},
+                    "kind": {"type": "string", "enum": ["semantic_search", "ast_search", "code_patch", "test_run", "file_read", "file_open", "knowledge_query", "batch_edit", "general"]},
                     "prompt": {"type": "string"},
                     "target_files": {"type": "array", "items": {"type": "string"}},
                     "code_patch_target": {"type": "string"},
@@ -10266,6 +10266,15 @@ fn mcp_tools() -> Vec<Value> {
                     "test_command": {"type": "string"}
                 },
                 "required": ["prompt"]
+            }
+        }),
+        json!({
+            "name": "mice_file_open",
+            "description": "Locate a user document or file semantically (e.g. 12th report card, marksheet, passport, resume, invoice) and open it natively in macOS / system viewer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
             }
         }),
         json!({
@@ -10321,6 +10330,7 @@ fn mcp_call_tool(
                 .unwrap_or("general");
             let kind = match kind_str {
                 "semantic_search" => mice_core::SidekickTaskKind::SemanticSearch,
+                "file_open" | "open" => mice_core::SidekickTaskKind::FileOpen,
                 "ast_search" => mice_core::SidekickTaskKind::AstSearch,
                 "code_patch" => mice_core::SidekickTaskKind::CodePatch,
                 "test_run" => mice_core::SidekickTaskKind::TestRun,
@@ -10370,6 +10380,27 @@ fn mcp_call_tool(
                 orchestrator: session.agent.clone(),
             };
 
+            let mut engine = session
+                .sidekick_engine
+                .lock()
+                .map_err(|e| format!("Lock error: {e}"))?;
+            let result = engine.execute(&task)?;
+            Ok(serde_json::to_string_pretty(&result)?)
+        }
+        "mice_file_open" => {
+            let query = string_argument("query")?;
+            let task = mice_core::SidekickTask {
+                id: format!("open_{}", std::process::id()),
+                kind: mice_core::SidekickTaskKind::FileOpen,
+                prompt: query.into(),
+                working_dir: env::current_dir()?,
+                target_files: Vec::new(),
+                code_patch_target: None,
+                old_content: None,
+                new_content: None,
+                test_command: None,
+                orchestrator: session.agent.clone(),
+            };
             let mut engine = session
                 .sidekick_engine
                 .lock()
