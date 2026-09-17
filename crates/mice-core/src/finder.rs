@@ -88,7 +88,7 @@ impl SemanticFinder {
     /// Add or update a document record in the local semantic index.
     pub fn index_document(&mut self, doc: DocumentRecord) {
         let doc_id = doc.id.clone();
-        
+
         // Tokenize for instant sub-millisecond inverted index matching
         let text_corpus = format!(
             "{} {} {} {}",
@@ -139,33 +139,56 @@ impl SemanticFinder {
             }
 
             // 2. Semantic Intent Classification
-            if query_trimmed.contains("aadhaar") || query_trimmed.contains("aadhar") || query_trimmed.contains("uidai") {
-                if doc.doc_type == FinderDocumentType::IdentityDocument && (name_lower.contains("aadhaar") || text_lower.contains("aadhaar") || text_lower.contains("uidai")) {
+            if query_trimmed.contains("aadhaar")
+                || query_trimmed.contains("aadhar")
+                || query_trimmed.contains("uidai")
+            {
+                if doc.doc_type == FinderDocumentType::IdentityDocument
+                    && (name_lower.contains("aadhaar")
+                        || text_lower.contains("aadhaar")
+                        || text_lower.contains("uidai"))
+                {
                     score += 150.0;
                 }
             } else if query_trimmed.contains("pan") || query_trimmed.contains("nsdl") {
-                if doc.doc_type == FinderDocumentType::IdentityDocument && (name_lower.contains("pan") || text_lower.contains("pan card")) {
+                if doc.doc_type == FinderDocumentType::IdentityDocument
+                    && (name_lower.contains("pan") || text_lower.contains("pan card"))
+                {
                     score += 150.0;
                 }
             } else if query_trimmed.contains("passport") {
-                if doc.doc_type == FinderDocumentType::IdentityDocument && name_lower.contains("passport") {
+                if doc.doc_type == FinderDocumentType::IdentityDocument
+                    && name_lower.contains("passport")
+                {
                     score += 150.0;
                 }
-            } else if query_trimmed.contains("bill") || query_trimmed.contains("electricity") || query_trimmed.contains("utility") {
-                if doc.doc_type == FinderDocumentType::ReceiptInvoice && (name_lower.contains("electricity") || name_lower.contains("bill") || text_lower.contains("kwh")) {
+            } else if query_trimmed.contains("bill")
+                || query_trimmed.contains("electricity")
+                || query_trimmed.contains("utility")
+            {
+                if doc.doc_type == FinderDocumentType::ReceiptInvoice
+                    && (name_lower.contains("electricity")
+                        || name_lower.contains("bill")
+                        || text_lower.contains("kwh"))
+                {
                     score += 120.0;
                 }
-            } else if query_trimmed.contains("receipt") || query_trimmed.contains("swiggy") || query_trimmed.contains("blinkit") || query_trimmed.contains("starbucks") || query_trimmed.contains("invoice") {
+            } else if query_trimmed.contains("receipt")
+                || query_trimmed.contains("swiggy")
+                || query_trimmed.contains("blinkit")
+                || query_trimmed.contains("starbucks")
+                || query_trimmed.contains("invoice")
+            {
                 if doc.doc_type == FinderDocumentType::ReceiptInvoice {
                     score += 80.0;
                     if name_lower.contains(&query_trimmed) || text_lower.contains(&query_trimmed) {
                         score += 80.0;
                     }
                 }
-            } else if query_trimmed.contains("resume") || query_trimmed.contains("cv") {
-                if doc.doc_type == FinderDocumentType::ResumeCareer {
-                    score += 140.0;
-                }
+            } else if (query_trimmed.contains("resume") || query_trimmed.contains("cv"))
+                && doc.doc_type == FinderDocumentType::ResumeCareer
+            {
+                score += 140.0;
             }
 
             // 3. Token-level matching
@@ -218,7 +241,7 @@ impl SemanticFinder {
     /// Retrieve the most recently modified or indexed documents
     pub fn get_recent_documents(&self, limit: usize) -> Vec<SearchResultItem> {
         let mut docs: Vec<&DocumentRecord> = self.documents.values().collect();
-        docs.sort_by(|a, b| b.modified_timestamp.cmp(&a.modified_timestamp));
+        docs.sort_by_key(|b| std::cmp::Reverse(b.modified_timestamp));
 
         docs.into_iter()
             .take(limit)

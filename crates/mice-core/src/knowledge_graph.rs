@@ -98,10 +98,11 @@ impl KnowledgeGraph {
 
     /// Connect two entity nodes with a directed relationship.
     pub fn add_edge(&mut self, from: &str, to: &str, relation: RelationKind, weight: f32) {
-        self.adjacency
-            .entry(from.to_string())
-            .or_default()
-            .push((to.to_string(), relation, weight));
+        self.adjacency.entry(from.to_string()).or_default().push((
+            to.to_string(),
+            relation,
+            weight,
+        ));
 
         self.reverse_adjacency
             .entry(to.to_string())
@@ -130,19 +131,23 @@ impl KnowledgeGraph {
                 for node_id in matching_nodes {
                     if let Some(node) = self.nodes.get(node_id) {
                         if node.kind == EntityKind::Document {
-                            let entry = candidate_doc_scores.entry(node_id.clone()).or_insert((0.0, Vec::new()));
+                            let entry = candidate_doc_scores
+                                .entry(node_id.clone())
+                                .or_insert((0.0, Vec::new()));
                             entry.0 += 40.0;
                             entry.1.push(node.name.clone());
                         } else {
                             // 2-Hop Graph Traversal from Entity to connected Documents
                             if let Some(connected) = self.reverse_adjacency.get(node_id) {
                                 for (doc_id, relation, weight) in connected {
-                                    if let Some(doc_node) = self.nodes.get(doc_id) {
-                                        if doc_node.kind == EntityKind::Document {
-                                            let entry = candidate_doc_scores.entry(doc_id.clone()).or_insert((0.0, Vec::new()));
-                                            entry.0 += 30.0 * weight;
-                                            entry.1.push(format!("{}: {:?}", node.name, relation));
-                                        }
+                                    if let Some(doc_node) = self.nodes.get(doc_id)
+                                        && doc_node.kind == EntityKind::Document
+                                    {
+                                        let entry = candidate_doc_scores
+                                            .entry(doc_id.clone())
+                                            .or_insert((0.0, Vec::new()));
+                                        entry.0 += 30.0 * weight;
+                                        entry.1.push(format!("{}: {:?}", node.name, relation));
                                     }
                                 }
                             }
@@ -159,7 +164,9 @@ impl KnowledgeGraph {
             }
             let mut semantic_boost = 0.0f32;
 
-            if (clean_query.contains("aadhaar") || clean_query.contains("aadhar") || clean_query.contains("uidai"))
+            if (clean_query.contains("aadhaar")
+                || clean_query.contains("aadhar")
+                || clean_query.contains("uidai"))
                 && (node.id.contains("aadhaar") || node.name.to_lowercase().contains("aadhaar"))
             {
                 semantic_boost += 150.0;
@@ -167,18 +174,22 @@ impl KnowledgeGraph {
                 && (node.id.contains("pan") || node.name.to_lowercase().contains("pan"))
             {
                 semantic_boost += 140.0;
-            } else if (clean_query.contains("bill") || clean_query.contains("electricity") || clean_query.contains("utility"))
-                && (node.id.contains("elec") || node.name.to_lowercase().contains("electricity"))
-            {
-                semantic_boost += 130.0;
-            } else if (clean_query.contains("swiggy") || clean_query.contains("food") || clean_query.contains("invoice"))
-                && (node.id.contains("swiggy") || node.name.to_lowercase().contains("swiggy"))
+            } else if ((clean_query.contains("bill")
+                || clean_query.contains("electricity")
+                || clean_query.contains("utility"))
+                && (node.id.contains("elec") || node.name.to_lowercase().contains("electricity")))
+                || ((clean_query.contains("swiggy")
+                    || clean_query.contains("food")
+                    || clean_query.contains("invoice"))
+                    && (node.id.contains("swiggy") || node.name.to_lowercase().contains("swiggy")))
             {
                 semantic_boost += 130.0;
             }
 
             if semantic_boost > 0.0 {
-                let entry = candidate_doc_scores.entry(doc_id.clone()).or_insert((0.0, Vec::new()));
+                let entry = candidate_doc_scores
+                    .entry(doc_id.clone())
+                    .or_insert((0.0, Vec::new()));
                 entry.0 += semantic_boost;
                 entry.1.push("Semantic Intent Match".into());
             }
@@ -191,15 +202,27 @@ impl KnowledgeGraph {
                 self.nodes.get(&doc_id).map(|node| GraphQueryResult {
                     document_id: doc_id,
                     document_name: node.name.clone(),
-                    file_path: node.path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    file_path: node
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                     matched_entities: matched,
                     confidence_score: score,
-                    summary_snippet: node.metadata.get("summary").cloned().unwrap_or_else(|| "Indexed document".into()),
+                    summary_snippet: node
+                        .metadata
+                        .get("summary")
+                        .cloned()
+                        .unwrap_or_else(|| "Indexed document".into()),
                 })
             })
             .collect();
 
-        results.sort_by(|a, b| b.confidence_score.partial_cmp(&a.confidence_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.confidence_score
+                .partial_cmp(&a.confidence_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -242,7 +265,10 @@ impl KnowledgeGraph {
 
         // Document: Aadhaar
         let mut aadhaar_meta = HashMap::new();
-        aadhaar_meta.insert("summary".into(), "Government of India Unique Identification (UIDAI) Aadhaar Card.".into());
+        aadhaar_meta.insert(
+            "summary".into(),
+            "Government of India Unique Identification (UIDAI) Aadhaar Card.".into(),
+        );
         aadhaar_meta.insert("aadhaar_no".into(), "XXXX-XXXX-9842".into());
 
         self.add_node(KnowledgeNode {
@@ -254,12 +280,25 @@ impl KnowledgeGraph {
         });
 
         self.add_edge("doc_aadhaar", "ent_uidai", RelationKind::IssuedBy, 1.0);
-        self.add_edge("doc_aadhaar", "ent_aadhaar_type", RelationKind::BelongsToCategory, 1.0);
-        self.add_edge("doc_aadhaar", "ent_mani", RelationKind::AssociatedWithPerson, 1.0);
+        self.add_edge(
+            "doc_aadhaar",
+            "ent_aadhaar_type",
+            RelationKind::BelongsToCategory,
+            1.0,
+        );
+        self.add_edge(
+            "doc_aadhaar",
+            "ent_mani",
+            RelationKind::AssociatedWithPerson,
+            1.0,
+        );
 
         // Document: PAN Card
         let mut pan_meta = HashMap::new();
-        pan_meta.insert("summary".into(), "Income Tax Department Permanent Account Number (PAN) Card.".into());
+        pan_meta.insert(
+            "summary".into(),
+            "Income Tax Department Permanent Account Number (PAN) Card.".into(),
+        );
         pan_meta.insert("pan_no".into(), "ABCPJ1234K".into());
 
         self.add_node(KnowledgeNode {
@@ -269,11 +308,19 @@ impl KnowledgeGraph {
             path: Some(home_path.join("Documents/Identity/PAN_Card_Mani_Joshi.pdf")),
             metadata: pan_meta,
         });
-        self.add_edge("doc_pan", "ent_mani", RelationKind::AssociatedWithPerson, 1.0);
+        self.add_edge(
+            "doc_pan",
+            "ent_mani",
+            RelationKind::AssociatedWithPerson,
+            1.0,
+        );
 
         // Document: Swiggy Invoice
         let mut swiggy_meta = HashMap::new();
-        swiggy_meta.insert("summary".into(), "Food delivery invoice from Swiggy for ₹450.00 paid via GPay.".into());
+        swiggy_meta.insert(
+            "summary".into(),
+            "Food delivery invoice from Swiggy for ₹450.00 paid via GPay.".into(),
+        );
         swiggy_meta.insert("amount".into(), "₹450.00".into());
 
         self.add_node(KnowledgeNode {
@@ -286,7 +333,10 @@ impl KnowledgeGraph {
 
         // Document: Electricity Bill
         let mut elec_meta = HashMap::new();
-        elec_meta.insert("summary".into(), "Monthly electricity and utility statement for 340 kWh.".into());
+        elec_meta.insert(
+            "summary".into(),
+            "Monthly electricity and utility statement for 340 kWh.".into(),
+        );
         elec_meta.insert("amount".into(), "₹2,480.00".into());
 
         self.add_node(KnowledgeNode {
@@ -316,7 +366,11 @@ mod tests {
     fn test_memory_footprint_is_under_100kb_for_seed() {
         let graph = KnowledgeGraph::new();
         let bytes = graph.estimated_memory_bytes();
-        assert!(bytes < 100_000, "Memory footprint must be under 100 KB for initial seed (was {} bytes)", bytes);
+        assert!(
+            bytes < 100_000,
+            "Memory footprint must be under 100 KB for initial seed (was {} bytes)",
+            bytes
+        );
     }
 
     #[test]

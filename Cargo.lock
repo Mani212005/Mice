@@ -501,14 +501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mice-linux-agent"
-version = "0.1.0"
-dependencies = [
- "mice-ipc",
- "serde_json",
-]
-
-[[package]]
 name = "mice-providers"
 version = "0.1.0"
 dependencies = [

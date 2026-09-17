@@ -1,47 +1,104 @@
-# MICE
+# MICE - Terminal Sidekick Sub-Agent for Coding LLMs
 
-**MICE** is an AI helper designed for people who are weak with technology. It is a screen-aware, native agent that helps users accomplish goals on their computer by either doing it for them or patiently walking them through the steps on their actual screen, in plain language.
+**MICE** is a privacy-first, high-speed terminal/TUI sidekick sub-agent designed to pair with orchestrator LLMs (such as Gemini 3.7 Flash, Claude Code, Antigravity, and Cursor). 
+
+Inspired by the **Devin SWE 2.0 sidekick architecture**, MICE offloads token-heavy, routine engineering sub-tasks:
+- Sub-millisecond semantic document and repository file retrieval
+- AST symbol search and declaration lookup
+- Surgical code patching and verified unified diff generation
+- Fast local test suite runs with noise filtering and failure extraction
+- In-memory semantic knowledge graph traversal
+
+Instead of consuming tens of thousands of tokens streaming massive raw files and compiler logs into the main orchestrator, MICE executes these routines locally and returns compact, verified diffs and structured summaries, slashing context window costs and latency.
+
+---
+
+## Key Features
+
+- **⚡ Sub-Millisecond Semantic Document Finder (`mice-core::finder`):** Instant local inverted-index semantic search across codebases, receipts, invoices, tax documents, and system files.
+- **🧠 In-Memory Semantic Knowledge Graph (`mice-core::knowledge_graph`):** Ultra-lightweight (< 15 MB RAM) 2-hop entity and relationship graph.
+- **🐭 Sidekick Execution Engine (`mice-core::sidekick`):** Deterministic and local SLM tool loops executing delegated coding sub-tasks.
+- **📊 Token Savings & Cost Metrics:** Tracks ingested vs returned tokens, context compression ratio, and estimated dollar savings.
+- **🖥️ Ratatui TUI Dashboard (`mice tui`):** Rich terminal dashboard displaying paired orchestrators, live delegated sub-agent tasks, cumulative token savings, and an interactive diff inspector.
+- **🔌 Model Context Protocol (MCP) Server (`mice mcp-server`):** Direct stdio MCP tools (`mice_sidekick_task`, `mice_semantic_find`, `mice_knowledge_query`, `mice_token_savings`) for Claude Code, Cursor, Codex, and Antigravity.
+
+---
 
 ## Architecture
 
-MICE is built with a focus on cross-platform portability and native capabilities:
+```
+projects/Mice/
+├── crates/
+│   ├── mice-core/         # Sidekick engine, SemanticFinder, KnowledgeGraph, token metrics
+│   ├── mice-cli/          # Ratatui TUI dashboard, CLI dispatcher, MCP server implementation
+│   ├── mice-ipc/          # JSON-RPC 2.0 protocol types and framing
+│   └── mice-providers/    # Local Ollama & cloud provider integrations
+├── Cargo.toml             # Workspace definition
+└── README.md
+```
 
-- **Portable Core (Rust):** The core engine, written in Rust, manages routing, state, provider communication, and logic.
-- **Native Agents (macOS & Linux):** Platform-specific agents handle surfaces, permissions, screen capture, and native UI overlays (e.g., Swift on macOS).
-- **Communication (`mice-ipc`):** The native agents communicate with the Rust core exclusively via the `mice-ipc` length-prefixed JSON-RPC 2.0 protocol.
+---
 
-### Multi-Agent Development
+## CLI Usage
 
-The repository is built iteratively by autonomous agents using a structured handoff protocol. To coordinate efforts between different AI workers on the same repository, a shared contract is maintained to ensure smooth handoffs.
+### Interactive TUI Dashboard
+Launch the interactive Ratatui dashboard:
+```bash
+mice tui
+# or simply
+mice
+```
+- `[d]` Delegate sample AST search
+- `[s]` Query Semantic Document Finder
+- `[t]` Run fast local test suite
+- `[p]` Preview & apply verified code patch
+- `[c]` Clear task history
+- `[q]` Quit dashboard
 
-## Features
+### CLI Delegation
+Run delegated routines directly from scripts or sub-agent runners:
+```bash
+# Semantic document search
+mice delegate --kind semantic --prompt "get my electricity bill"
 
-- **Observe → Decide → Act Loop:** MICE dynamically navigates and interacts with the user's screen by observing current state, making decisions, and acting upon them, rather than relying on static plans.
-- **Privacy First:** MICE prioritizes local computation. By default, it uses local, privacy-focused models like `gemma3:4b` or `phi4-mini`. Heavier opt-in models require specific hardware validation.
-- **Strict Boundaries:** Credentials, captures, clipboard contents, model weights, and user configurations are explicitly excluded from persistence.
+# AST symbol lookup
+mice delegate --kind ast --prompt "SidekickEngine" --file "crates/mice-core/src/sidekick.rs"
 
-## Development
+# Fast local test execution
+mice delegate --kind test --test-cmd "cargo test -p mice-core --lib"
 
-### Prerequisites
+# Output structured JSON for machine consumption
+mice delegate --kind semantic --prompt "Aadhaar Card" --json
+```
 
-- macOS (for `agent-macos`) or Linux (for `agent-linux`).
-- Rust (Cargo) for the core `crates/` workspace.
-- Swift for building native macOS agents.
+### Model Context Protocol (MCP) Server
+Register MICE with Claude Code, Codex, or Cursor:
+```bash
+# Start MCP server over stdio
+mice mcp-server
 
-### Building & Verification
+# Connect automatically to available coding harnesses
+mice connect all
+```
 
-- **macOS Agent:** Run `swift build` in the `agent-macos/` directory.
-- **Rust Core:** Run the following commands in the root directory:
-  - Format check: `cargo fmt --check`
-  - Linting: `cargo clippy --workspace --all-targets -- -D warnings`
-  - Tests: `cargo test --workspace`
+---
 
-### Configuration
+## Development & Verification
 
-For local development:
-- The default configuration path is `~/Library/Application Support/MICE/config.toml` (macOS). Never add a real configuration file to source control.
-- Read API keys (e.g., `OPENAI_API_KEY`) only from environment variables at runtime.
-- Automated tests must run completely network-free using mock HTTP servers.
+All changes in the workspace are validated with standard Rust tooling:
+
+```bash
+# Format check
+cargo fmt --check
+
+# Strict Clippy lint check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Comprehensive automated test suite
+cargo test --workspace
+```
+
+---
 
 ## License
 

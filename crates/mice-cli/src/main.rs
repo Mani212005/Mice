@@ -9,6 +9,7 @@ mod grounding;
 mod mcp_client;
 mod memory;
 mod mission;
+mod sidekick_cli;
 mod tidy;
 mod tools;
 
@@ -86,7 +87,17 @@ fn main() {
         .is_some_and(|argument| argument.starts_with("chrome-extension://"))
         || (command.is_none() && !std::io::stdin().is_terminal() && !packaged_app_launch);
     let result = match command.as_deref() {
-        None if !chrome_native_host => launch(),
+        None if !chrome_native_host => {
+            if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                sidekick_cli::run_sidekick_tui()
+            } else {
+                launch()
+            }
+        }
+        Some("tui") | Some("sidekick") => sidekick_cli::run_sidekick_tui(),
+        Some("delegate") => {
+            sidekick_cli::execute_delegate_cli(&env::args().skip(2).collect::<Vec<_>>())
+        }
         Some("help") | Some("--help") | Some("-h") => usage(),
         Some("install") => install(),
         Some("home") => home(),
@@ -135,10 +146,13 @@ fn main() {
 }
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
-    println!("MICE — native, privacy-aware desktop assistance");
+    println!("🐭 MICE - Terminal Sidekick Sub-Agent for Coding LLMs");
     println!("Usage: mice [command]");
     println!(
-        "\nApp\n  mice                     Start/reuse MICE and open MICE Home\n  mice start | stop | home | setup | install | status | doctor | settings\n  mice keys <set|status|delete> [groq|openai]"
+        "\nSidekick & TUI Dashboard\n  mice                     Open interactive Sidekick TUI dashboard\n  mice tui | sidekick      Launch Ratatui Sidekick Dashboard (live tasks, token savings, diffs)\n  mice delegate [options]  Delegate sub-agent routine (--kind semantic|ast|patch|test|read|kg, --prompt <text>, --json)"
+    );
+    println!(
+        "\nApp & Management\n  mice start | stop | home | setup | install | status | doctor | settings\n  mice keys <set|status|delete> [groq|openai]"
     );
     println!(
         "\nAsk and screen\n  mice ask [--action <preset>] <instruction>\n  mice see [--display|--sheet] <question>\n  mice history [query] | mice history --clear | mice plans\n  mice actions | route"
@@ -10216,6 +10230,46 @@ fn mcp_tools() -> Vec<Value> {
         json!({"name": "memory_query", "description": "Search shared MICE events, decisions, and recent work deterministically.", "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}),
         json!({"name": "team_status", "description": "Show active MICE sessions and early file-overlap warnings.", "inputSchema": {"type": "object", "properties": {}}}),
         json!({"name": "mission_status", "description": "Read the active MICE mission's task ownership, lifecycle state, and bounded Git overlap warnings. It never launches, merges, or edits.", "inputSchema": {"type": "object", "properties": {"plan_path": {"type": "string"}}, "required": ["plan_path"]}}),
+        json!({
+            "name": "mice_sidekick_task",
+            "description": "Execute a high-speed delegated sub-agent routine (semantic search, AST symbol search, surgical code patch, local test run, or knowledge graph query) with token savings metrics and verified structured diff.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["semantic_search", "ast_search", "code_patch", "test_run", "file_read", "knowledge_query", "batch_edit", "general"]},
+                    "prompt": {"type": "string"},
+                    "target_files": {"type": "array", "items": {"type": "string"}},
+                    "code_patch_target": {"type": "string"},
+                    "old_content": {"type": "string"},
+                    "new_content": {"type": "string"},
+                    "test_command": {"type": "string"}
+                },
+                "required": ["prompt"]
+            }
+        }),
+        json!({
+            "name": "mice_semantic_find",
+            "description": "Sub-millisecond local semantic document & file retrieval across system documents (identity, invoices, receipts, tax, career, code).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "mice_knowledge_query",
+            "description": "Query the in-memory lightweight semantic knowledge graph (< 15 MB) for connected entities, organizations, and document relationships.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "mice_token_savings",
+            "description": "Inspect cumulative token savings, estimated dollar cost savings, and context compression ratio achieved by MICE Sidekick sub-agent.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
     ];
     values.extend(tools::tool_schema());
     values
@@ -10239,6 +10293,88 @@ fn mcp_call_tool(
             .ok_or_else(|| format!("Missing non-empty `{key}` argument"))
     };
     match name {
+        "mice_sidekick_task" => {
+            let kind_str = arguments
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("general");
+            let kind = match kind_str {
+                "semantic_search" => mice_core::SidekickTaskKind::SemanticSearch,
+                "ast_search" => mice_core::SidekickTaskKind::AstSearch,
+                "code_patch" => mice_core::SidekickTaskKind::CodePatch,
+                "test_run" => mice_core::SidekickTaskKind::TestRun,
+                "file_read" => mice_core::SidekickTaskKind::FileRead,
+                "knowledge_query" => mice_core::SidekickTaskKind::KnowledgeQuery,
+                "batch_edit" => mice_core::SidekickTaskKind::BatchEdit,
+                _ => mice_core::SidekickTaskKind::General,
+            };
+            let prompt = string_argument("prompt")?;
+            let target_files = arguments
+                .get("target_files")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let code_patch_target = arguments
+                .get("code_patch_target")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let old_content = arguments
+                .get("old_content")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let new_content = arguments
+                .get("new_content")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let test_command = arguments
+                .get("test_command")
+                .and_then(Value::as_str)
+                .map(String::from);
+
+            let task = mice_core::SidekickTask {
+                id: format!("mcp_{}", std::process::id()),
+                kind,
+                prompt: prompt.into(),
+                working_dir: env::current_dir()?,
+                target_files,
+                code_patch_target,
+                old_content,
+                new_content,
+                test_command,
+                orchestrator: session.agent.clone(),
+            };
+
+            let mut engine = mice_core::SidekickEngine::new();
+            let result = engine.execute(&task)?;
+            Ok(serde_json::to_string_pretty(&result)?)
+        }
+        "mice_semantic_find" => {
+            let query = string_argument("query")?;
+            let finder = mice_core::SemanticFinder::new();
+            let results = finder.search(query);
+            Ok(serde_json::to_string_pretty(&results)?)
+        }
+        "mice_knowledge_query" => {
+            let query = string_argument("query")?;
+            let kg = mice_core::KnowledgeGraph::new();
+            let results = kg.query(query);
+            Ok(serde_json::to_string_pretty(&results)?)
+        }
+        "mice_token_savings" => {
+            let engine = mice_core::SidekickEngine::new();
+            let stats = json!({
+                "cumulative_tokens_saved": engine.cumulative_tokens_saved,
+                "cumulative_cost_saved_usd": engine.cumulative_cost_saved_usd,
+                "paired_orchestrator": "Gemini 3.7 Flash / Claude / Antigravity",
+                "status": "active"
+            });
+            Ok(serde_json::to_string_pretty(&stats)?)
+        }
         "summarize_text" => mcp_summarize(config, string_argument("text")?),
         "summarize_file" => {
             let path = string_argument("path")?;
