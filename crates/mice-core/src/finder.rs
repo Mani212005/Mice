@@ -64,6 +64,7 @@ pub struct SearchResultItem {
 }
 
 /// High-performance, sub-millisecond local semantic search and document retrieval engine.
+#[derive(Debug, Clone)]
 pub struct SemanticFinder {
     documents: HashMap<String, DocumentRecord>,
     inverted_index: HashMap<String, Vec<String>>,
@@ -332,6 +333,7 @@ impl SemanticFinder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_aadhaar_query_resolution() {
@@ -356,5 +358,94 @@ mod tests {
         let finder = SemanticFinder::new();
         let recents = finder.get_recent_documents(3);
         assert_eq!(recents.len(), 3);
+    }
+
+    #[test]
+    fn test_complex_multi_token_search_phrases() {
+        let finder = SemanticFinder::new();
+
+        // 1. Conversational Aadhaar query with punctuation and filler words
+        let q1 =
+            "Hey MICE, can you please find my official UIDAI government identity Aadhaar card?";
+        let res1 = finder.search(q1);
+        assert!(!res1.is_empty(), "Expected match for complex Aadhaar query");
+        assert_eq!(res1[0].id, "doc_aadhaar");
+        assert_eq!(res1[0].doc_type, FinderDocumentType::IdentityDocument);
+        assert!(res1[0].relevance_score > 100.0);
+
+        // 2. Complex PAN card query with tax keywords and account code
+        let q2 = "Where is my permanent account number (PAN) card from the income tax department ABCPJ1234K?";
+        let res2 = finder.search(q2);
+        assert!(!res2.is_empty(), "Expected match for complex PAN query");
+        assert_eq!(res2[0].id, "doc_pan");
+        assert_eq!(res2[0].doc_type, FinderDocumentType::IdentityDocument);
+
+        // 3. Multi-token receipt query with vendor, payment method, and amount context
+        let q3 = "Find my food delivery invoice receipt from Swiggy paid through UPI GPay";
+        let res3 = finder.search(q3);
+        assert!(!res3.is_empty(), "Expected match for Swiggy receipt query");
+        assert_eq!(res3[0].id, "doc_swiggy_receipt");
+        assert_eq!(res3[0].doc_type, FinderDocumentType::ReceiptInvoice);
+
+        // 4. Multi-token utility bill query with energy unit specifications
+        let q4 = "Show me the monthly electricity utility power bill statement with 340 kWh units";
+        let res4 = finder.search(q4);
+        assert!(
+            !res4.is_empty(),
+            "Expected match for electricity bill query"
+        );
+        assert_eq!(res4[0].id, "doc_elec_bill");
+        assert_eq!(res4[0].doc_type, FinderDocumentType::ReceiptInvoice);
+
+        // 5. Multi-token career and engineering CV query
+        let q5 = "Fetch the senior AI systems software engineer curriculum vitae portfolio resume for Mani";
+        let res5 = finder.search(q5);
+        assert!(!res5.is_empty(), "Expected match for resume query");
+        assert_eq!(res5[0].id, "doc_resume");
+        assert_eq!(res5[0].doc_type, FinderDocumentType::ResumeCareer);
+
+        // 6. Mixed casing and identifier token query
+        let q6 = "uIdAi CaRd 9842";
+        let res6 = finder.search(q6);
+        assert!(!res6.is_empty());
+        assert_eq!(res6[0].id, "doc_aadhaar");
+    }
+
+    #[test]
+    fn test_semantic_finder_sub_millisecond_benchmark() {
+        let finder = SemanticFinder::new();
+        let queries = [
+            "get my Aadhaar card",
+            "electricity utility power bill statement July 340 kWh",
+            "Swiggy food delivery invoice receipt paid via GPay",
+            "Income tax department PAN permanent account number",
+            "senior AI systems engineer resume portfolio CV",
+            "UIDAI identity card verified",
+            "recent monthly power bills",
+            "software engineering curriculum vitae",
+        ];
+
+        // Warm up
+        for q in &queries {
+            let _ = finder.search(q);
+        }
+
+        // Benchmark across 1,000 queries
+        let iterations = 1_000;
+        let start = Instant::now();
+        for i in 0..iterations {
+            let q = queries[i % queries.len()];
+            let res = finder.search(q);
+            assert!(!res.is_empty());
+        }
+        let total_duration = start.elapsed();
+        let avg_latency = total_duration / (iterations as u32);
+
+        // Verify sub-millisecond retrieval (< 1 ms = 1,000,000 ns)
+        assert!(
+            avg_latency.as_micros() < 1000,
+            "Average query latency must be under 1 ms (was {} µs)",
+            avg_latency.as_micros()
+        );
     }
 }

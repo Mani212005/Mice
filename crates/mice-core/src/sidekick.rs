@@ -187,6 +187,7 @@ pub enum SidekickError {
 }
 
 /// High-speed local Sidekick Sub-Agent Engine.
+#[derive(Debug, Clone)]
 pub struct SidekickEngine {
     pub finder: SemanticFinder,
     pub knowledge_graph: KnowledgeGraph,
@@ -488,13 +489,36 @@ impl SidekickEngine {
 
         fs::write(&file_path, patched)?;
 
-        let diff = format!(
-            "--- a/{}\n+++ b/{}\n@@ -1,5 +1,5 @@\n-{}\n+{}",
-            target_file_rel,
-            target_file_rel,
-            old_content.lines().collect::<Vec<_>>().join("\n-"),
-            new_content.lines().collect::<Vec<_>>().join("\n+")
-        );
+        let (start_line, old_line_count, new_line_count) = if old_content.is_empty() {
+            let total_lines = content.lines().count();
+            (total_lines + 1, 0, new_content.lines().count())
+        } else {
+            let prefix = content.split(old_content).next().unwrap_or("");
+            let line_idx = prefix.lines().count() + if prefix.ends_with('\n') { 1 } else { 0 };
+            (
+                line_idx.max(1),
+                old_content.lines().count(),
+                new_content.lines().count(),
+            )
+        };
+
+        let mut diff_lines = Vec::new();
+        diff_lines.push(format!("--- a/{}", target_file_rel));
+        diff_lines.push(format!("+++ b/{}", target_file_rel));
+        diff_lines.push(format!(
+            "@@ -{},{} +{},{} @@",
+            start_line,
+            old_line_count.max(1),
+            start_line,
+            new_line_count.max(1),
+        ));
+        for line in old_content.lines() {
+            diff_lines.push(format!("-{line}"));
+        }
+        for line in new_content.lines() {
+            diff_lines.push(format!("+{line}"));
+        }
+        let diff = diff_lines.join("\n");
 
         let summary = format!(
             "Successfully applied verified code patch to `{}`.",
@@ -703,5 +727,161 @@ mod tests {
             .expect("knowledge query should succeed");
         assert_eq!(result.status, SidekickStatus::Success);
         assert!(!result.matched_items.is_empty());
+    }
+
+    #[test]
+    fn test_sidekick_multi_line_code_patch_and_diff_shape() {
+        let temp_dir = std::env::temp_dir().join(format!("mice_patch_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let file_name = "calculator.rs";
+        let test_file = temp_dir.join(file_name);
+
+        let initial_code = "pub fn calculate(val: i32) -> i32 {\n    let step1 = val * 2;\n    let step2 = step1 - 10;\n    step2\n}\n";
+        fs::write(&test_file, initial_code).unwrap();
+
+        let old_block = "    let step1 = val * 2;\n    let step2 = step1 - 10;";
+        let new_block = "    let step1 = val * 4;\n    let step2 = step1 + 20;";
+
+        let mut engine = SidekickEngine::new();
+        let task = SidekickTask {
+            id: "patch_multiline_1".into(),
+            kind: SidekickTaskKind::CodePatch,
+            prompt: "update multiplication and offset".into(),
+            working_dir: temp_dir.clone(),
+            target_files: vec![file_name.into()],
+            code_patch_target: Some(file_name.into()),
+            old_content: Some(old_block.into()),
+            new_content: Some(new_block.into()),
+            test_command: None,
+            orchestrator: "Claude 3.7 Sonnet".into(),
+        };
+
+        let result = engine.execute(&task).expect("patch should succeed");
+        assert_eq!(result.status, SidekickStatus::Success);
+
+        let diff = result.diff_preview.expect("diff should be present");
+        assert!(diff.contains(&format!("--- a/{file_name}")));
+        assert!(diff.contains(&format!("+++ b/{file_name}")));
+        assert!(diff.contains("@@ -2,2 +2,2 @@"));
+        assert!(diff.contains("-    let step1 = val * 2;"));
+        assert!(diff.contains("-    let step2 = step1 - 10;"));
+        assert!(diff.contains("+    let step1 = val * 4;"));
+        assert!(diff.contains("+    let step2 = step1 + 20;"));
+
+        let updated_content = fs::read_to_string(&test_file).unwrap();
+        assert!(updated_content.contains("val * 4"));
+        assert!(updated_content.contains("step1 + 20"));
+        assert!(!updated_content.contains("val * 2"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sidekick_pure_addition_diff() {
+        let temp_dir = std::env::temp_dir().join(format!("mice_add_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let file_name = "helpers.rs";
+        let test_file = temp_dir.join(file_name);
+
+        fs::write(&test_file, "// Helpers module\n").unwrap();
+
+        let mut engine = SidekickEngine::new();
+        let task = SidekickTask {
+            id: "patch_add_1".into(),
+            kind: SidekickTaskKind::CodePatch,
+            prompt: "append helper function".into(),
+            working_dir: temp_dir.clone(),
+            target_files: vec![file_name.into()],
+            code_patch_target: Some(file_name.into()),
+            old_content: None,
+            new_content: Some("pub fn helper() -> bool { true }".into()),
+            test_command: None,
+            orchestrator: "Gemini 3.7 Flash".into(),
+        };
+
+        let result = engine.execute(&task).expect("patch should succeed");
+        let diff = result.diff_preview.expect("diff should exist");
+        assert!(diff.contains("+pub fn helper() -> bool { true }"));
+        assert!(
+            !diff
+                .lines()
+                .any(|l| l.starts_with('-') && !l.starts_with("---"))
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sidekick_code_patch_target_not_found() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("mice_notfound_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let file_name = "test.rs";
+        let test_file = temp_dir.join(file_name);
+        fs::write(&test_file, "const X: usize = 42;\n").unwrap();
+
+        let mut engine = SidekickEngine::new();
+        let task = SidekickTask {
+            id: "patch_err_1".into(),
+            kind: SidekickTaskKind::CodePatch,
+            prompt: "replace non-existent line".into(),
+            working_dir: temp_dir.clone(),
+            target_files: vec![file_name.into()],
+            code_patch_target: Some(file_name.into()),
+            old_content: Some("const Y: usize = 99;".into()),
+            new_content: Some("const Y: usize = 100;".into()),
+            test_command: None,
+            orchestrator: "Claude 3.7 Sonnet".into(),
+        };
+
+        let err = engine.execute(&task).unwrap_err();
+        match err {
+            SidekickError::TargetNotFound(msg) => {
+                assert!(msg.contains("Snippet to replace not found"));
+            }
+            other => panic!("Expected TargetNotFound, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cumulative_token_savings_tracking() {
+        let mut engine = SidekickEngine::new();
+        assert_eq!(engine.cumulative_tokens_saved, 0);
+        assert_eq!(engine.cumulative_cost_saved_usd, 0.0);
+
+        let task1 = SidekickTask {
+            id: "t1".into(),
+            kind: SidekickTaskKind::SemanticSearch,
+            prompt: "Swiggy invoice".into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Gemini 3.7 Flash".into(),
+        };
+        let r1 = engine.execute(&task1).unwrap();
+        let saved1 = r1.token_savings.net_tokens_saved;
+        assert_eq!(engine.cumulative_tokens_saved, saved1);
+
+        let task2 = SidekickTask {
+            id: "t2".into(),
+            kind: SidekickTaskKind::KnowledgeQuery,
+            prompt: "Aadhaar".into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Claude 3.7 Sonnet".into(),
+        };
+        let r2 = engine.execute(&task2).unwrap();
+        let saved2 = r2.token_savings.net_tokens_saved;
+        assert_eq!(engine.cumulative_tokens_saved, saved1 + saved2);
+        assert!(engine.cumulative_cost_saved_usd > 0.0);
     }
 }

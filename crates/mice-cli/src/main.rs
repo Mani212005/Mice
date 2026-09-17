@@ -10086,71 +10086,87 @@ fn mcp_server() -> Result<(), Box<dyn std::error::Error>> {
 
     for line in stdin.lock().lines() {
         let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                write_mcp_message(
-                    &mut output,
-                    &mcp_error(Value::Null, -32700, format!("Invalid JSON: {error}")),
-                )?;
-                continue;
-            }
-        };
-        let id = request.get("id").cloned();
-        let Some(method) = request.get("method").and_then(Value::as_str) else {
-            if let Some(id) = id {
-                write_mcp_message(&mut output, &mcp_error(id, -32600, "Missing method"))?;
-            }
-            continue;
-        };
-
-        let response = match method {
-            "initialize" => id.map(|id| {
-                session = McpSession::from_initialize(request.get("params"));
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "mice", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": "You are paired with MICE, a local execution manager. Delegate mechanical or token-heavy work through delegate_task or run_tool; MICE first uses deterministic local CLIs and returns bounded results. Check mission_status before editing an assigned mission task, check team_status before editing shared files, and record durable decisions with memory_note."
-                    }
-                })
-            }),
-            "tools/list" => id.map(|id| mcp_result(id, json!({"tools": mcp_tools()}))),
-            "tools/call" => id.map(|id| {
-                let result = match request.get("params") {
-                    Some(params) => mcp_call_tool(&config, &session, params),
-                    None => Err("Missing tool parameters".into()),
-                };
-                match result {
-                    Ok(text) => mcp_result(
-                        id,
-                        json!({"content": [{"type": "text", "text": text}], "isError": false}),
-                    ),
-                    Err(error) => mcp_result(
-                        id,
-                        json!({"content": [{"type": "text", "text": error.to_string()}], "isError": true}),
-                    ),
-                }
-            }),
-            _ => id.map(|id| mcp_error(id, -32601, format!("Unknown method: {method}"))),
-        };
-        if let Some(response) = response {
+        if let Some(response) = process_mcp_line(&config, &mut session, &line) {
             write_mcp_message(&mut output, &response)?;
         }
     }
     Ok(())
 }
 
+fn process_mcp_message(
+    config: &mice_core::Config,
+    session: &mut McpSession,
+    request: &Value,
+) -> Option<Value> {
+    let id = request.get("id").cloned();
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        if let Some(id) = id {
+            return Some(mcp_error(id, -32600, "Missing method"));
+        }
+        return None;
+    };
+
+    match method {
+        "initialize" => id.map(|id| {
+            *session = McpSession::from_initialize(request.get("params"));
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "mice", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": "You are paired with MICE, a local execution manager. Delegate mechanical or token-heavy work through delegate_task or run_tool; MICE first uses deterministic local CLIs and returns bounded results. Check mission_status before editing an assigned mission task, check team_status before editing shared files, and record durable decisions with memory_note."
+                }
+            })
+        }),
+        "tools/list" => id.map(|id| mcp_result(id, json!({"tools": mcp_tools()}))),
+        "tools/call" => id.map(|id| {
+            let result = match request.get("params") {
+                Some(params) => mcp_call_tool(config, session, params),
+                None => Err("Missing tool parameters".into()),
+            };
+            match result {
+                Ok(text) => mcp_result(
+                    id,
+                    json!({"content": [{"type": "text", "text": text}], "isError": false}),
+                ),
+                Err(error) => mcp_result(
+                    id,
+                    json!({"content": [{"type": "text", "text": error.to_string()}], "isError": true}),
+                ),
+            }
+        }),
+        _ => id.map(|id| mcp_error(id, -32601, format!("Unknown method: {method}"))),
+    }
+}
+
+fn process_mcp_line(
+    config: &mice_core::Config,
+    session: &mut McpSession,
+    line: &str,
+) -> Option<Value> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    let request: Value = match serde_json::from_str(line) {
+        Ok(request) => request,
+        Err(error) => {
+            return Some(mcp_error(
+                Value::Null,
+                -32700,
+                format!("Invalid JSON: {error}"),
+            ));
+        }
+    };
+    process_mcp_message(config, session, &request)
+}
+
 #[derive(Debug, Clone)]
 struct McpSession {
     id: String,
     agent: String,
+    sidekick_engine: Arc<Mutex<mice_core::SidekickEngine>>,
 }
 
 impl Default for McpSession {
@@ -10159,6 +10175,7 @@ impl Default for McpSession {
         Self {
             agent: id.clone(),
             id,
+            sidekick_engine: Arc::new(Mutex::new(mice_core::SidekickEngine::new())),
         }
     }
 }
@@ -10173,7 +10190,11 @@ impl McpSession {
             .unwrap_or("mcp-agent")
             .to_owned();
         let id = format!("{}-{}", agent, std::process::id());
-        Self { id, agent }
+        Self {
+            id,
+            agent,
+            sidekick_engine: Arc::new(Mutex::new(mice_core::SidekickEngine::new())),
+        }
     }
 }
 
@@ -10349,7 +10370,10 @@ fn mcp_call_tool(
                 orchestrator: session.agent.clone(),
             };
 
-            let mut engine = mice_core::SidekickEngine::new();
+            let mut engine = session
+                .sidekick_engine
+                .lock()
+                .map_err(|e| format!("Lock error: {e}"))?;
             let result = engine.execute(&task)?;
             Ok(serde_json::to_string_pretty(&result)?)
         }
@@ -10366,7 +10390,10 @@ fn mcp_call_tool(
             Ok(serde_json::to_string_pretty(&results)?)
         }
         "mice_token_savings" => {
-            let engine = mice_core::SidekickEngine::new();
+            let engine = session
+                .sidekick_engine
+                .lock()
+                .map_err(|e| format!("Lock error: {e}"))?;
             let stats = json!({
                 "cumulative_tokens_saved": engine.cumulative_tokens_saved,
                 "cumulative_cost_saved_usd": engine.cumulative_cost_saved_usd,
@@ -10565,6 +10592,292 @@ fn mcp_summarize(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+    }
+}
+
+#[cfg(test)]
+mod mcp_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_tool_schemas() {
+        let tools = mcp_tools();
+
+        // 1. Verify mice_sidekick_task
+        let sidekick = tools
+            .iter()
+            .find(|t| t["name"] == "mice_sidekick_task")
+            .expect("mice_sidekick_task schema must be present");
+        assert!(
+            sidekick["description"]
+                .as_str()
+                .unwrap()
+                .contains("sub-agent")
+        );
+        let s_props = &sidekick["inputSchema"]["properties"];
+        assert!(s_props.get("kind").is_some());
+        assert!(s_props.get("prompt").is_some());
+        assert!(s_props.get("target_files").is_some());
+        assert!(s_props.get("code_patch_target").is_some());
+        assert!(s_props.get("old_content").is_some());
+        assert!(s_props.get("new_content").is_some());
+        assert!(s_props.get("test_command").is_some());
+        let s_req = sidekick["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(s_req.iter().any(|v| v == "prompt"));
+
+        // 2. Verify mice_semantic_find
+        let sem_find = tools
+            .iter()
+            .find(|t| t["name"] == "mice_semantic_find")
+            .expect("mice_semantic_find schema must be present");
+        assert!(sem_find["inputSchema"]["properties"].get("query").is_some());
+        let sem_req = sem_find["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(sem_req.iter().any(|v| v == "query"));
+
+        // 3. Verify mice_knowledge_query
+        let kg_query = tools
+            .iter()
+            .find(|t| t["name"] == "mice_knowledge_query")
+            .expect("mice_knowledge_query schema must be present");
+        assert!(kg_query["inputSchema"]["properties"].get("query").is_some());
+        let kg_req = kg_query["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(kg_req.iter().any(|v| v == "query"));
+
+        // 4. Verify mice_token_savings
+        let savings = tools
+            .iter()
+            .find(|t| t["name"] == "mice_token_savings")
+            .expect("mice_token_savings schema must be present");
+        assert_eq!(savings["inputSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn test_mcp_semantic_find_response() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": "test_sem_1",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_semantic_find",
+                "arguments": {
+                    "query": "Aadhaar"
+                }
+            }
+        });
+
+        let resp = process_mcp_message(&config, &mut session, &req).expect("response expected");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], "test_sem_1");
+        assert_eq!(resp["result"]["isError"], false);
+
+        let content_text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        let results: Vec<mice_core::SearchResultItem> =
+            serde_json::from_str(content_text).expect("valid SearchResultItem json");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, "doc_aadhaar");
+    }
+
+    #[test]
+    fn test_mcp_knowledge_query_response() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "mice_knowledge_query",
+                "arguments": {
+                    "query": "UIDAI"
+                }
+            }
+        });
+
+        let resp = process_mcp_message(&config, &mut session, &req).expect("response expected");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 42);
+        assert_eq!(resp["result"]["isError"], false);
+
+        let content_text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        let results: Vec<mice_core::GraphQueryResult> =
+            serde_json::from_str(content_text).expect("valid GraphQueryResult json");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].document_id, "doc_aadhaar");
+    }
+
+    #[test]
+    fn test_mcp_sidekick_task_and_token_savings_cumulative() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        let task_req = json!({
+            "jsonrpc": "2.0",
+            "id": "task_1",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_sidekick_task",
+                "arguments": {
+                    "kind": "semantic_search",
+                    "prompt": "electricity bill"
+                }
+            }
+        });
+
+        let resp1 =
+            process_mcp_message(&config, &mut session, &task_req).expect("response expected");
+        assert_eq!(resp1["result"]["isError"], false);
+        let task_res: mice_core::SidekickResult =
+            serde_json::from_str(resp1["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("valid SidekickResult");
+        let saved = task_res.token_savings.net_tokens_saved;
+        assert!(saved > 0);
+
+        let savings_req = json!({
+            "jsonrpc": "2.0",
+            "id": "savings_1",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_token_savings",
+                "arguments": {}
+            }
+        });
+
+        let resp2 =
+            process_mcp_message(&config, &mut session, &savings_req).expect("response expected");
+        assert_eq!(resp2["result"]["isError"], false);
+        let savings_data: Value =
+            serde_json::from_str(resp2["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("valid savings json");
+        assert_eq!(
+            savings_data["cumulative_tokens_saved"].as_u64().unwrap() as usize,
+            saved
+        );
+        assert_eq!(savings_data["status"], "active");
+    }
+
+    #[test]
+    fn test_mcp_tool_validation_missing_arguments() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        // 1. Missing query in semantic_find
+        let req1 = json!({
+            "jsonrpc": "2.0",
+            "id": "err_1",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_semantic_find",
+                "arguments": {}
+            }
+        });
+        let resp1 = process_mcp_message(&config, &mut session, &req1).expect("response");
+        assert_eq!(resp1["result"]["isError"], true);
+        assert!(
+            resp1["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Missing non-empty `query` argument")
+        );
+
+        // 2. Missing prompt in sidekick_task
+        let req2 = json!({
+            "jsonrpc": "2.0",
+            "id": "err_2",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_sidekick_task",
+                "arguments": {}
+            }
+        });
+        let resp2 = process_mcp_message(&config, &mut session, &req2).expect("response");
+        assert_eq!(resp2["result"]["isError"], true);
+        assert!(
+            resp2["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Missing non-empty `prompt` argument")
+        );
+
+        // 3. Unknown tool
+        let req3 = json!({
+            "jsonrpc": "2.0",
+            "id": "err_3",
+            "method": "tools/call",
+            "params": {
+                "name": "unknown_dummy_tool",
+                "arguments": {}
+            }
+        });
+        let resp3 = process_mcp_message(&config, &mut session, &req3).expect("response");
+        assert_eq!(resp3["result"]["isError"], true);
+        assert!(
+            resp3["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown MICE tool")
+        );
+    }
+
+    #[test]
+    fn test_mcp_json_rpc_2_0_error_protocol_compliance() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        // 1. Parse error (-32700)
+        let parse_err_resp = process_mcp_line(&config, &mut session, "{not a valid json")
+            .expect("should return parse error");
+        assert_eq!(parse_err_resp["jsonrpc"], "2.0");
+        assert_eq!(parse_err_resp["id"], Value::Null);
+        assert_eq!(parse_err_resp["error"]["code"], -32700);
+        assert!(
+            parse_err_resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid JSON")
+        );
+
+        // 2. Missing method (-32600)
+        let missing_method_resp = process_mcp_line(
+            &config,
+            &mut session,
+            r#"{"jsonrpc": "2.0", "id": "req-missing-method"}"#,
+        )
+        .expect("should return missing method error");
+        assert_eq!(missing_method_resp["jsonrpc"], "2.0");
+        assert_eq!(missing_method_resp["id"], "req-missing-method");
+        assert_eq!(missing_method_resp["error"]["code"], -32600);
+        assert_eq!(missing_method_resp["error"]["message"], "Missing method");
+
+        // 3. Unknown method (-32601)
+        let unknown_method_resp = process_mcp_line(
+            &config,
+            &mut session,
+            r#"{"jsonrpc": "2.0", "id": 101, "method": "invalid/rpc/method"}"#,
+        )
+        .expect("should return unknown method error");
+        assert_eq!(unknown_method_resp["jsonrpc"], "2.0");
+        assert_eq!(unknown_method_resp["id"], 101);
+        assert_eq!(unknown_method_resp["error"]["code"], -32601);
+        assert!(
+            unknown_method_resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown method: invalid/rpc/method")
+        );
     }
 }
 
