@@ -14,6 +14,8 @@ pub mod knowledge_graph;
 pub use knowledge_graph::*;
 pub mod sidekick;
 pub use sidekick::*;
+pub mod jev;
+pub use jev::*;
 
 /// Model-backed planners may produce a task graph, but the portable core
 /// keeps that proposal bounded before it can become a launchable mission.
@@ -43,6 +45,8 @@ pub struct Config {
     pub autopilot: AutopilotConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub jev: JevConfig,
 }
 
 /// External MCP servers the user has explicitly granted. MICE only ever
@@ -88,6 +92,7 @@ impl Default for Config {
             gesture: GestureConfig::default(),
             autopilot: AutopilotConfig::default(),
             mcp: McpConfig::default(),
+            jev: JevConfig::default(),
         }
     }
 }
