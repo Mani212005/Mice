@@ -7,15 +7,189 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use mice_core::{SidekickEngine, SidekickStatus, SidekickTask, SidekickTaskKind};
+use mice_core::{
+    ConfidenceLevel, IntentRoutingContext, JevRoutingDecision, SidekickEngine, SidekickStatus,
+    SidekickTask, SidekickTaskKind, create_default_router,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+
+/// Closed set of candidate local sidekick tools presented for intent clarification.
+pub const CLARIFICATION_CANDIDATE_TOOLS: &[SidekickTaskKind] = &[
+    SidekickTaskKind::CodePatch,
+    SidekickTaskKind::TestRun,
+    SidekickTaskKind::AstSearch,
+    SidekickTaskKind::SemanticSearch,
+    SidekickTaskKind::FileOpen,
+    SidekickTaskKind::FileRead,
+    SidekickTaskKind::KnowledgeQuery,
+    SidekickTaskKind::General,
+];
+
+/// Interactive state for pausing and prompting the user in the Ratatui TUI
+/// when Jev intent routing returns Medium or Low confidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClarificationPromptState {
+    pub instruction: String,
+    pub suggested_tool: SidekickTaskKind,
+    pub confidence: f64,
+    pub confidence_level: ConfidenceLevel,
+    pub reasoning: String,
+    pub selected_idx: usize,
+}
+
+impl ClarificationPromptState {
+    pub fn from_decision(instruction: impl Into<String>, decision: &JevRoutingDecision) -> Self {
+        let suggested_idx = CLARIFICATION_CANDIDATE_TOOLS
+            .iter()
+            .position(|&t| t == decision.tool)
+            .unwrap_or(0);
+
+        Self {
+            instruction: instruction.into(),
+            suggested_tool: decision.tool,
+            confidence: decision.confidence,
+            confidence_level: decision.confidence_level,
+            reasoning: decision.reasoning.clone(),
+            selected_idx: suggested_idx,
+        }
+    }
+
+    pub fn selected_tool(&self) -> SidekickTaskKind {
+        CLARIFICATION_CANDIDATE_TOOLS
+            .get(self.selected_idx)
+            .copied()
+            .unwrap_or(self.suggested_tool)
+    }
+
+    pub fn next(&mut self) {
+        if self.selected_idx + 1 < CLARIFICATION_CANDIDATE_TOOLS.len() {
+            self.selected_idx += 1;
+        } else {
+            self.selected_idx = 0;
+        }
+    }
+
+    pub fn prev(&mut self) {
+        if self.selected_idx > 0 {
+            self.selected_idx -= 1;
+        } else {
+            self.selected_idx = CLARIFICATION_CANDIDATE_TOOLS.len().saturating_sub(1);
+        }
+    }
+}
+
+/// Create a concrete SidekickTask configured for the given tool kind and prompt.
+pub fn task_for_tool(kind: SidekickTaskKind, prompt: &str, task_num: usize) -> SidekickTask {
+    match kind {
+        SidekickTaskKind::CodePatch => SidekickTask {
+            id: format!("task_patch_{task_num}"),
+            kind: SidekickTaskKind::CodePatch,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("crates/mice-core/src"),
+            target_files: vec!["sidekick.rs".into()],
+            code_patch_target: Some("sidekick.rs".into()),
+            old_content: Some("// Sub-millisecond semantic document & file retrieval".into()),
+            new_content: Some("/// Sub-millisecond semantic document & file retrieval".into()),
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+        SidekickTaskKind::TestRun => SidekickTask {
+            id: format!("task_test_{task_num}"),
+            kind: SidekickTaskKind::TestRun,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: Some("cargo test -p mice-core --lib jev".into()),
+            orchestrator: "Jev System One".into(),
+        },
+        SidekickTaskKind::AstSearch => SidekickTask {
+            id: format!("task_ast_{task_num}"),
+            kind: SidekickTaskKind::AstSearch,
+            prompt: if prompt.contains("Sidekick") {
+                "SidekickEngine".into()
+            } else {
+                prompt.into()
+            },
+            working_dir: PathBuf::from("crates/mice-core/src"),
+            target_files: vec!["sidekick.rs".into(), "lib.rs".into()],
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+        SidekickTaskKind::SemanticSearch => SidekickTask {
+            id: format!("task_sem_{task_num}"),
+            kind: SidekickTaskKind::SemanticSearch,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+        SidekickTaskKind::FileOpen => SidekickTask {
+            id: format!("task_open_{task_num}"),
+            kind: SidekickTaskKind::FileOpen,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+        SidekickTaskKind::FileRead => SidekickTask {
+            id: format!("task_read_{task_num}"),
+            kind: SidekickTaskKind::FileRead,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("."),
+            target_files: vec!["Cargo.toml".into()],
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+        SidekickTaskKind::KnowledgeQuery => SidekickTask {
+            id: format!("task_kg_{task_num}"),
+            kind: SidekickTaskKind::KnowledgeQuery,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+        _ => SidekickTask {
+            id: format!("task_gen_{task_num}"),
+            kind: SidekickTaskKind::General,
+            prompt: prompt.into(),
+            working_dir: PathBuf::from("."),
+            target_files: Vec::new(),
+            code_patch_target: None,
+            old_content: None,
+            new_content: None,
+            test_command: None,
+            orchestrator: "Jev System One".into(),
+        },
+    }
+}
 
 /// Run the MICE Sidekick Interactive TUI dashboard.
 pub fn run_sidekick_tui() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,6 +202,9 @@ pub fn run_sidekick_tui() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = SidekickEngine::new();
     let mut selected_task_idx: usize = 0;
     let mut notification: Option<(String, Instant)> = None;
+    let router = create_default_router(None);
+    let mut clarification_prompt: Option<ClarificationPromptState> = None;
+    let mut route_sample_idx: usize = 0;
 
     // Seed initial demo/welcome tasks
     let welcome_task = SidekickTask {
@@ -62,7 +239,13 @@ pub fn run_sidekick_tui() -> Result<(), Box<dyn std::error::Error>> {
 
     'app: loop {
         terminal.draw(|f| {
-            render_sidekick_dashboard(f, &engine, selected_task_idx, notification.as_ref());
+            render_sidekick_dashboard(
+                f,
+                &engine,
+                selected_task_idx,
+                notification.as_ref(),
+                clarification_prompt.as_ref(),
+            );
         })?;
 
         if event::poll(Duration::from_millis(30))? {
@@ -70,121 +253,215 @@ pub fn run_sidekick_tui() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(ev) = current_ev {
                 match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break 'app,
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                selected_task_idx = navigate_selection(
-                                    selected_task_idx,
-                                    -1,
-                                    engine.task_history.len(),
-                                );
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                selected_task_idx = navigate_selection(
-                                    selected_task_idx,
-                                    1,
-                                    engine.task_history.len(),
-                                );
-                            }
-                            KeyCode::Home => {
-                                selected_task_idx = 0;
-                            }
-                            KeyCode::End => {
-                                selected_task_idx = if engine.task_history.is_empty() {
-                                    0
-                                } else {
-                                    engine.task_history.len().saturating_sub(1)
-                                };
-                            }
-                            KeyCode::PageUp => {
-                                selected_task_idx = navigate_selection(
-                                    selected_task_idx,
-                                    -5,
-                                    engine.task_history.len(),
-                                );
-                            }
-                            KeyCode::PageDown => {
-                                selected_task_idx = navigate_selection(
-                                    selected_task_idx,
-                                    5,
-                                    engine.task_history.len(),
-                                );
-                            }
-                            KeyCode::Char('d') => {
-                                // Delegate sample AST search task
-                                let new_task = SidekickTask {
-                                    id: format!("task_ast_{}", engine.task_history.len() + 1),
-                                    kind: SidekickTaskKind::AstSearch,
-                                    prompt: "SidekickEngine".into(),
-                                    working_dir: PathBuf::from("crates/mice-core/src"),
-                                    target_files: vec!["sidekick.rs".into(), "lib.rs".into()],
-                                    code_patch_target: None,
-                                    old_content: None,
-                                    new_content: None,
-                                    test_command: None,
-                                    orchestrator: "Gemini 3.7 Flash".into(),
-                                };
-                                if let Ok(res) = engine.execute(&new_task) {
-                                    selected_task_idx = engine.task_history.len().saturating_sub(1);
-                                    notification = Some((
-                                        format!(
-                                            "Delegated AST search: saved {} tokens!",
-                                            res.token_savings.net_tokens_saved
-                                        ),
-                                        Instant::now(),
-                                    ));
+                        if let Some(ref mut prompt) = clarification_prompt {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    clarification_prompt = None;
+                                    notification =
+                                        Some(("Clarification cancelled.".into(), Instant::now()));
                                 }
-                            }
-                            KeyCode::Char('s') => {
-                                // Run semantic search
-                                let s_task = SidekickTask {
-                                    id: format!("task_sem_{}", engine.task_history.len() + 1),
-                                    kind: SidekickTaskKind::SemanticSearch,
-                                    prompt: "electricity bill utility".into(),
-                                    working_dir: PathBuf::from("."),
-                                    target_files: Vec::new(),
-                                    code_patch_target: None,
-                                    old_content: None,
-                                    new_content: None,
-                                    test_command: None,
-                                    orchestrator: "Antigravity".into(),
-                                };
-                                if let Ok(res) = engine.execute(&s_task) {
-                                    selected_task_idx = engine.task_history.len().saturating_sub(1);
-                                    notification = Some((
-                                        format!(
-                                            "Semantic Finder resolved query: saved {} tokens",
-                                            res.token_savings.net_tokens_saved
-                                        ),
-                                        Instant::now(),
-                                    ));
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    prompt.prev();
                                 }
-                            }
-                            KeyCode::Char('t') => {
-                                // Run local test
-                                let t_task = SidekickTask {
-                                    id: format!("task_test_{}", engine.task_history.len() + 1),
-                                    kind: SidekickTaskKind::TestRun,
-                                    prompt: "Run fast test suite".into(),
-                                    working_dir: PathBuf::from("."),
-                                    target_files: Vec::new(),
-                                    code_patch_target: None,
-                                    old_content: None,
-                                    new_content: None,
-                                    test_command: Some("cargo test -p mice-core --lib".into()),
-                                    orchestrator: "Gemini 3.7 Flash".into(),
-                                };
-                                if let Ok(res) = engine.execute(&t_task) {
-                                    selected_task_idx = engine.task_history.len().saturating_sub(1);
-                                    notification = Some((
-                                        format!("Test run finished: status {:?}", res.status),
-                                        Instant::now(),
-                                    ));
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    prompt.next();
                                 }
+                                KeyCode::Char(c) if ('1'..='8').contains(&c) => {
+                                    let idx = (c as usize) - ('1' as usize);
+                                    if idx < CLARIFICATION_CANDIDATE_TOOLS.len() {
+                                        prompt.selected_idx = idx;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let chosen_tool = prompt.selected_tool();
+                                    let new_task = task_for_tool(
+                                        chosen_tool,
+                                        &prompt.instruction,
+                                        engine.task_history.len() + 1,
+                                    );
+                                    if let Ok(res) = engine.execute(&new_task) {
+                                        selected_task_idx =
+                                            engine.task_history.len().saturating_sub(1);
+                                        notification = Some((
+                                            format!(
+                                                "Clarified & Executed {}: saved {} tokens!",
+                                                chosen_tool.display_label(),
+                                                res.token_savings.net_tokens_saved
+                                            ),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                    clarification_prompt = None;
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char('p') => {
-                                // Apply sample code patch
-                                let p_task = SidekickTask {
+                        } else {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => break 'app,
+                                KeyCode::Char('r') | KeyCode::Char('i') => {
+                                    let sample_commands = [
+                                        "fix the lint error in lib.rs",
+                                        "run tests for mice-core",
+                                        "where is SidekickEngine defined",
+                                        "locate my electricity bill invoice",
+                                        "open 12th report card in system viewer",
+                                    ];
+                                    let cmd =
+                                        sample_commands[route_sample_idx % sample_commands.len()];
+                                    route_sample_idx += 1;
+
+                                    let ctx = IntentRoutingContext::current();
+                                    let decision = router.route(cmd, &ctx);
+
+                                    if decision.confidence_level.should_auto_run() {
+                                        let new_task = task_for_tool(
+                                            decision.tool,
+                                            cmd,
+                                            engine.task_history.len() + 1,
+                                        );
+                                        if let Ok(res) = engine.execute(&new_task) {
+                                            selected_task_idx =
+                                                engine.task_history.len().saturating_sub(1);
+                                            notification = Some((
+                                                format!(
+                                                    "⚡ Jev Auto-run (High {:.0}%): Executed {} (+{} tok)",
+                                                    decision.confidence * 100.0,
+                                                    decision.tool.display_label(),
+                                                    res.token_savings.net_tokens_saved
+                                                ),
+                                                Instant::now(),
+                                            ));
+                                        }
+                                    } else {
+                                        clarification_prompt = Some(
+                                            ClarificationPromptState::from_decision(cmd, &decision),
+                                        );
+                                    }
+                                }
+                                KeyCode::Char('v') => {
+                                    let cmd = "help me think about stuff";
+                                    let ctx = IntentRoutingContext::current();
+                                    let decision = router.route(cmd, &ctx);
+                                    clarification_prompt = Some(
+                                        ClarificationPromptState::from_decision(cmd, &decision),
+                                    );
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    selected_task_idx = navigate_selection(
+                                        selected_task_idx,
+                                        -1,
+                                        engine.task_history.len(),
+                                    );
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    selected_task_idx = navigate_selection(
+                                        selected_task_idx,
+                                        1,
+                                        engine.task_history.len(),
+                                    );
+                                }
+                                KeyCode::Home => {
+                                    selected_task_idx = 0;
+                                }
+                                KeyCode::End => {
+                                    selected_task_idx = if engine.task_history.is_empty() {
+                                        0
+                                    } else {
+                                        engine.task_history.len().saturating_sub(1)
+                                    };
+                                }
+                                KeyCode::PageUp => {
+                                    selected_task_idx = navigate_selection(
+                                        selected_task_idx,
+                                        -5,
+                                        engine.task_history.len(),
+                                    );
+                                }
+                                KeyCode::PageDown => {
+                                    selected_task_idx = navigate_selection(
+                                        selected_task_idx,
+                                        5,
+                                        engine.task_history.len(),
+                                    );
+                                }
+                                KeyCode::Char('d') => {
+                                    // Delegate sample AST search task
+                                    let new_task = SidekickTask {
+                                        id: format!("task_ast_{}", engine.task_history.len() + 1),
+                                        kind: SidekickTaskKind::AstSearch,
+                                        prompt: "SidekickEngine".into(),
+                                        working_dir: PathBuf::from("crates/mice-core/src"),
+                                        target_files: vec!["sidekick.rs".into(), "lib.rs".into()],
+                                        code_patch_target: None,
+                                        old_content: None,
+                                        new_content: None,
+                                        test_command: None,
+                                        orchestrator: "Gemini 3.7 Flash".into(),
+                                    };
+                                    if let Ok(res) = engine.execute(&new_task) {
+                                        selected_task_idx =
+                                            engine.task_history.len().saturating_sub(1);
+                                        notification = Some((
+                                            format!(
+                                                "Delegated AST search: saved {} tokens!",
+                                                res.token_savings.net_tokens_saved
+                                            ),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                KeyCode::Char('s') => {
+                                    // Run semantic search
+                                    let s_task = SidekickTask {
+                                        id: format!("task_sem_{}", engine.task_history.len() + 1),
+                                        kind: SidekickTaskKind::SemanticSearch,
+                                        prompt: "electricity bill utility".into(),
+                                        working_dir: PathBuf::from("."),
+                                        target_files: Vec::new(),
+                                        code_patch_target: None,
+                                        old_content: None,
+                                        new_content: None,
+                                        test_command: None,
+                                        orchestrator: "Antigravity".into(),
+                                    };
+                                    if let Ok(res) = engine.execute(&s_task) {
+                                        selected_task_idx =
+                                            engine.task_history.len().saturating_sub(1);
+                                        notification = Some((
+                                            format!(
+                                                "Semantic Finder resolved query: saved {} tokens",
+                                                res.token_savings.net_tokens_saved
+                                            ),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                KeyCode::Char('t') => {
+                                    // Run local test
+                                    let t_task = SidekickTask {
+                                        id: format!("task_test_{}", engine.task_history.len() + 1),
+                                        kind: SidekickTaskKind::TestRun,
+                                        prompt: "Run fast test suite".into(),
+                                        working_dir: PathBuf::from("."),
+                                        target_files: Vec::new(),
+                                        code_patch_target: None,
+                                        old_content: None,
+                                        new_content: None,
+                                        test_command: Some("cargo test -p mice-core --lib".into()),
+                                        orchestrator: "Gemini 3.7 Flash".into(),
+                                    };
+                                    if let Ok(res) = engine.execute(&t_task) {
+                                        selected_task_idx =
+                                            engine.task_history.len().saturating_sub(1);
+                                        notification = Some((
+                                            format!("Test run finished: status {:?}", res.status),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                KeyCode::Char('p') => {
+                                    // Apply sample code patch
+                                    let p_task = SidekickTask {
                                     id: format!("task_patch_{}", engine.task_history.len() + 1),
                                     kind: SidekickTaskKind::CodePatch,
                                     prompt: "Verified code patch preview".into(),
@@ -202,24 +479,26 @@ pub fn run_sidekick_tui() -> Result<(), Box<dyn std::error::Error>> {
                                     test_command: None,
                                     orchestrator: "Claude 3.7 Sonnet".into(),
                                 };
-                                if let Ok(res) = engine.execute(&p_task) {
-                                    selected_task_idx = engine.task_history.len().saturating_sub(1);
-                                    notification = Some((
-                                        format!(
-                                            "Patch verified and applied! (+{} tokens saved)",
-                                            res.token_savings.net_tokens_saved
-                                        ),
-                                        Instant::now(),
-                                    ));
+                                    if let Ok(res) = engine.execute(&p_task) {
+                                        selected_task_idx =
+                                            engine.task_history.len().saturating_sub(1);
+                                        notification = Some((
+                                            format!(
+                                                "Patch verified and applied! (+{} tokens saved)",
+                                                res.token_savings.net_tokens_saved
+                                            ),
+                                            Instant::now(),
+                                        ));
+                                    }
                                 }
+                                KeyCode::Char('c') => {
+                                    engine.task_history.clear();
+                                    selected_task_idx = 0;
+                                    notification =
+                                        Some(("Task history cleared.".into(), Instant::now()));
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char('c') => {
-                                engine.task_history.clear();
-                                selected_task_idx = 0;
-                                notification =
-                                    Some(("Task history cleared.".into(), Instant::now()));
-                            }
-                            _ => {}
                         }
                     }
                     Event::Resize(_, _) => {
@@ -278,6 +557,7 @@ pub fn render_sidekick_dashboard(
     engine: &SidekickEngine,
     selected_idx: usize,
     notification: Option<&(String, std::time::Instant)>,
+    clarification_prompt: Option<&ClarificationPromptState>,
 ) {
     let size = f.area();
     let effective_idx = clamp_selected_idx(selected_idx, engine.task_history.len());
@@ -764,22 +1044,36 @@ pub fn render_sidekick_dashboard(
     }
 
     // 4. Footer & Keybindings
-    let mut footer_spans = if size.width >= 100 {
+    let mut footer_spans = if size.width >= 120 {
         vec![
+            Span::styled(
+                "[r] ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Route Intent  "),
+            Span::styled(
+                "[v] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Vague Test  "),
             Span::styled(
                 "[d] ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Delegate AST  "),
+            Span::raw("AST  "),
             Span::styled(
                 "[s] ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Semantic Search  "),
+            Span::raw("Semantic  "),
             Span::styled(
                 "[t] ",
                 Style::default()
@@ -807,35 +1101,49 @@ pub fn render_sidekick_dashboard(
     } else {
         vec![
             Span::styled(
+                "[r] ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Route "),
+            Span::styled(
+                "[v] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Vague "),
+            Span::styled(
                 "[d] ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("AST  "),
+            Span::raw("AST "),
             Span::styled(
                 "[s] ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Semantic  "),
+            Span::raw("Search "),
             Span::styled(
                 "[t] ",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Test  "),
+            Span::raw("Test "),
             Span::styled(
                 "[p] ",
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Patch  "),
+            Span::raw("Patch "),
             Span::styled("[c] ", Style::default().fg(Color::Red)),
-            Span::raw("Clear  "),
+            Span::raw("Clr "),
             Span::styled(
                 "[q] ",
                 Style::default()
@@ -865,6 +1173,199 @@ pub fn render_sidekick_dashboard(
                 .border_style(Style::default().fg(Color::Cyan)),
         );
     f.render_widget(footer_p, chunks[3]);
+
+    if let Some(prompt) = clarification_prompt {
+        render_clarification_dialog(f, prompt);
+    }
+}
+
+/// Render an interactive modal dialog when Jev intent routing pauses for clarification.
+pub fn render_clarification_dialog(f: &mut ratatui::Frame, prompt: &ClarificationPromptState) {
+    let area = f.area();
+    let popup_width = 74.min(area.width.saturating_sub(4));
+    let popup_height = 18.min(area.height.saturating_sub(2));
+
+    let vertical_pad = (area.height.saturating_sub(popup_height)) / 2;
+    let horizontal_pad = (area.width.saturating_sub(popup_width)) / 2;
+
+    let popup_area = Rect {
+        x: area.x + horizontal_pad,
+        y: area.y + vertical_pad,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let border_color = match prompt.confidence_level {
+        ConfidenceLevel::High => Color::Green,
+        ConfidenceLevel::Medium => Color::Yellow,
+        ConfidenceLevel::Low => Color::Red,
+    };
+
+    let block = Block::default()
+        .title(" 🐭 JEV INTENT ROUTING - CLARIFICATION PAUSED ")
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    let inner_area = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let dialog_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Instruction & confidence banner
+            Constraint::Min(8),    // Candidate tools list
+            Constraint::Length(2), // Footer buttons
+        ])
+        .split(inner_area);
+
+    let banner = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Command: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("\"{}\"", prompt.instruction),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Suggested: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} ({})",
+                    prompt.suggested_tool.display_label(),
+                    prompt.suggested_tool.tool_name()
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  |  Confidence: "),
+            Span::styled(
+                format!(
+                    "{:.1}% ({})",
+                    prompt.confidence * 100.0,
+                    prompt.confidence_level.label()
+                ),
+                Style::default()
+                    .fg(border_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Confidence is below 80% auto-run threshold. Please confirm or pick the intended tool:",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .block(Block::default().borders(Borders::NONE));
+    f.render_widget(banner, dialog_chunks[0]);
+
+    let tool_items: Vec<ListItem> = CLARIFICATION_CANDIDATE_TOOLS
+        .iter()
+        .enumerate()
+        .map(|(idx, &tool)| {
+            let is_selected = idx == prompt.selected_idx;
+            let is_suggested = tool == prompt.suggested_tool;
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let num = idx + 1;
+
+            let mut spans = vec![
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{num}] "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{} ", tool.emoji())),
+                Span::styled(
+                    format!("{:<18}", tool.display_label()),
+                    if is_selected {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                ),
+                Span::styled(
+                    format!("({})", tool.tool_name()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+
+            if is_suggested {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    "[Jev Suggested]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            let style = if is_selected {
+                Style::default().bg(Color::Rgb(30, 40, 60))
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(Line::from(spans)).style(style)
+        })
+        .collect();
+
+    let list = List::new(tool_items).block(
+        Block::default()
+            .title(" Candidate Tools ")
+            .title_style(Style::default().fg(Color::DarkGray))
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(list, dialog_chunks[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "[↑/↓ or 1-8] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Select  |  "),
+        Span::styled(
+            "[Enter] ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Confirm & Run  |  "),
+        Span::styled(
+            "[Esc] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Cancel"),
+    ]))
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(footer, dialog_chunks[2]);
 }
 
 fn format_number(n: usize) -> String {
@@ -881,7 +1382,9 @@ fn format_number(n: usize) -> String {
 
 /// Execute a delegated task via CLI arguments and print output or JSON.
 pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut kind = SidekickTaskKind::General;
+    use std::io::Write;
+
+    let mut explicit_kind = None;
     let mut prompt = String::new();
     let mut target_files = Vec::new();
     let mut test_cmd = None;
@@ -893,7 +1396,7 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
         match args[i].as_str() {
             "--kind" | "-k" => {
                 if i + 1 < args.len() {
-                    kind = match args[i + 1].to_lowercase().as_str() {
+                    explicit_kind = Some(match args[i + 1].to_lowercase().as_str() {
                         "semantic" | "search" => SidekickTaskKind::SemanticSearch,
                         "open" | "file_open" | "launch" => SidekickTaskKind::FileOpen,
                         "ast" | "symbol" => SidekickTaskKind::AstSearch,
@@ -903,12 +1406,12 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
                         "kg" | "knowledge" => SidekickTaskKind::KnowledgeQuery,
                         "batch" => SidekickTaskKind::BatchEdit,
                         _ => SidekickTaskKind::General,
-                    };
+                    });
                     i += 1;
                 }
             }
             "--open" | "-O" => {
-                kind = SidekickTaskKind::FileOpen;
+                explicit_kind = Some(SidekickTaskKind::FileOpen);
             }
             "--file" | "-f" => {
                 if i + 1 < args.len() {
@@ -939,15 +1442,100 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
         i += 1;
     }
 
-    if kind == SidekickTaskKind::General
-        && (prompt.to_lowercase().starts_with("open ")
-            || prompt.to_lowercase().contains("open file"))
-    {
-        kind = SidekickTaskKind::FileOpen;
-    }
-
     if prompt.is_empty() {
         prompt = "Execute delegated sub-agent routine".into();
+    }
+
+    // Determine task kind: either explicit or Jev intent routed
+    let (mut kind, routing_decision) = if let Some(k) = explicit_kind {
+        (k, None)
+    } else {
+        let router = create_default_router(None);
+        let ctx = IntentRoutingContext::current();
+        let dec = router.route(&prompt, &ctx);
+        (dec.tool, Some(dec))
+    };
+
+    if let Some(ref dec) = routing_decision {
+        if dec.confidence_level.should_auto_run() {
+            if !as_json {
+                println!(
+                    "⚡ Jev High Confidence ({:.1}%): Auto-running '{}' ({})",
+                    dec.confidence * 100.0,
+                    kind.tool_name(),
+                    kind.display_label()
+                );
+            }
+        } else {
+            // Medium/Low confidence: pause and prompt in terminal if interactive
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && !as_json {
+                println!(
+                    "\n🐭 Jev Intent Routing: Clarification Required\n  Instruction: \"{}\"\n  Suggested:   {} ({}) [Confidence: {:.1}%, {}]\n  Reasoning:   {}\n",
+                    prompt,
+                    kind.display_label(),
+                    kind.tool_name(),
+                    dec.confidence * 100.0,
+                    dec.confidence_level.label(),
+                    dec.reasoning
+                );
+                println!("Available tools:");
+                for (idx, candidate) in CLARIFICATION_CANDIDATE_TOOLS.iter().enumerate() {
+                    let mark = if *candidate == kind {
+                        " [Jev Suggested]"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  [{}] {} ({}){}",
+                        idx + 1,
+                        candidate.display_label(),
+                        candidate.tool_name(),
+                        mark
+                    );
+                }
+                print!(
+                    "\nConfirm [{}]? (Press Enter to run, 1-8 to switch, or 'q' to cancel): ",
+                    kind.tool_name()
+                );
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let trimmed = line.trim();
+                if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("cancel") {
+                    println!("Execution cancelled.");
+                    return Ok(());
+                } else if let Ok(num) = trimmed.parse::<usize>()
+                    && (1..=CLARIFICATION_CANDIDATE_TOOLS.len()).contains(&num)
+                {
+                    kind = CLARIFICATION_CANDIDATE_TOOLS[num - 1];
+                    println!("Switched to: {}", kind.display_label());
+                }
+            } else if !as_json {
+                println!(
+                    "ℹ Jev Routed: '{}' ({:.1}% confidence, {})",
+                    kind.display_label(),
+                    dec.confidence * 100.0,
+                    dec.confidence_level.label()
+                );
+            }
+        }
+    }
+
+    if target_files.is_empty() {
+        for word in prompt.split_whitespace() {
+            let clean = word.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '.' && c != '/' && c != '_' && c != '-'
+            });
+            if clean.ends_with(".rs")
+                || clean.ends_with(".toml")
+                || clean.ends_with(".json")
+                || clean.ends_with(".md")
+            {
+                target_files.push(clean.to_string());
+                break;
+            }
+        }
     }
 
     let task = SidekickTask {
@@ -967,7 +1555,23 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
     let result = engine.execute(&task)?;
 
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        let mut json_val = serde_json::to_value(&result)?;
+        if let Some(dec) = routing_decision
+            && let Some(map) = json_val.as_object_mut()
+        {
+            map.insert(
+                "jev_routing".to_string(),
+                serde_json::json!({
+                    "tool": dec.tool.tool_name(),
+                    "confidence": dec.confidence,
+                    "confidence_level": dec.confidence_level,
+                    "should_auto_run": dec.confidence_level.should_auto_run(),
+                    "reasoning": dec.reasoning,
+                    "is_fallback": dec.is_fallback,
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&json_val)?);
     } else {
         println!("🐭 MICE Sidekick Sub-Agent Result");
         println!("Task ID:     {}", result.task_id);
@@ -1084,7 +1688,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_sidekick_dashboard(f, &engine, 0, None);
+                render_sidekick_dashboard(f, &engine, 0, None, None);
             })
             .unwrap();
 
@@ -1121,7 +1725,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_sidekick_dashboard(f, &engine, 0, None);
+                render_sidekick_dashboard(f, &engine, 0, None, None);
             })
             .unwrap();
 
@@ -1147,13 +1751,13 @@ mod tests {
         // Draw with arbitrary out-of-bounds selected_idx to verify no panic
         terminal
             .draw(|f| {
-                render_sidekick_dashboard(f, &engine, 0, None);
+                render_sidekick_dashboard(f, &engine, 0, None, None);
             })
             .unwrap();
 
         terminal
             .draw(|f| {
-                render_sidekick_dashboard(f, &engine, 999, None);
+                render_sidekick_dashboard(f, &engine, 999, None, None);
             })
             .unwrap();
 
@@ -1192,13 +1796,13 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_sidekick_dashboard(f, &engine, 0, None);
+                render_sidekick_dashboard(f, &engine, 0, None, None);
             })
             .unwrap();
 
         terminal
             .draw(|f| {
-                render_sidekick_dashboard(f, &engine, 10, None);
+                render_sidekick_dashboard(f, &engine, 10, None, None);
             })
             .unwrap();
 
@@ -1256,5 +1860,101 @@ mod tests {
         // Line 6: " context_line();" -> Context (DarkGray)
         assert_eq!(lines[6].spans[0].content, " context_line();");
         assert_eq!(lines[6].spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn test_clarification_prompt_state_navigation() {
+        let decision = JevRoutingDecision {
+            tool: SidekickTaskKind::AstSearch,
+            confidence: 0.65,
+            confidence_level: ConfidenceLevel::Medium,
+            probabilities: std::collections::HashMap::new(),
+            model: "mock-jev".into(),
+            reasoning: "Ambiguous symbol query".into(),
+            is_fallback: false,
+        };
+
+        let mut prompt =
+            ClarificationPromptState::from_decision("find where Sidekick is defined", &decision);
+        assert_eq!(prompt.suggested_tool, SidekickTaskKind::AstSearch);
+        assert_eq!(prompt.confidence_level, ConfidenceLevel::Medium);
+        assert_eq!(prompt.selected_tool(), SidekickTaskKind::AstSearch);
+
+        // Test next navigation wraps through CLARIFICATION_CANDIDATE_TOOLS
+        let total = CLARIFICATION_CANDIDATE_TOOLS.len();
+        let initial_idx = prompt.selected_idx;
+
+        prompt.next();
+        assert_eq!(prompt.selected_idx, (initial_idx + 1) % total);
+
+        // Navigate backwards
+        prompt.prev();
+        assert_eq!(prompt.selected_idx, initial_idx);
+
+        // Wrap around backwards from 0
+        prompt.selected_idx = 0;
+        prompt.prev();
+        assert_eq!(prompt.selected_idx, total - 1);
+
+        // Wrap around forwards from last
+        prompt.next();
+        assert_eq!(prompt.selected_idx, 0);
+    }
+
+    #[test]
+    fn test_task_for_tool_mapping() {
+        for &tool in CLARIFICATION_CANDIDATE_TOOLS {
+            let task = task_for_tool(tool, "sample prompt", 42);
+            assert_eq!(task.kind, tool);
+            assert_eq!(task.orchestrator, "Jev System One");
+            assert!(task.id.contains("42"));
+        }
+    }
+
+    #[test]
+    fn test_render_clarification_dialog_standard_and_wide() {
+        let decision = JevRoutingDecision {
+            tool: SidekickTaskKind::SemanticSearch,
+            confidence: 0.45,
+            confidence_level: ConfidenceLevel::Low,
+            probabilities: std::collections::HashMap::new(),
+            model: "mock-jev".into(),
+            reasoning: "Search keyword matched".into(),
+            is_fallback: false,
+        };
+        let prompt = ClarificationPromptState::from_decision("where is my invoice", &decision);
+
+        // Test on standard 80x24 terminal
+        let backend_80 = TestBackend::new(80, 24);
+        let mut terminal_80 = Terminal::new(backend_80).unwrap();
+        let engine = SidekickEngine::new();
+
+        terminal_80
+            .draw(|f| {
+                render_sidekick_dashboard(f, &engine, 0, None, Some(&prompt));
+            })
+            .unwrap();
+
+        let buffer_80 = terminal_80.backend().buffer();
+        let content_80: String = buffer_80.content().iter().map(|c| c.symbol()).collect();
+        assert!(content_80.contains("CLARIFICATION PAUSED"));
+        assert!(content_80.contains("where is my invoice"));
+        assert!(content_80.contains("Low"));
+        assert!(content_80.contains("Candidate Tools"));
+
+        // Test on wide 160x40 terminal
+        let backend_160 = TestBackend::new(160, 40);
+        let mut terminal_160 = Terminal::new(backend_160).unwrap();
+
+        terminal_160
+            .draw(|f| {
+                render_sidekick_dashboard(f, &engine, 0, None, Some(&prompt));
+            })
+            .unwrap();
+
+        let buffer_160 = terminal_160.backend().buffer();
+        let content_160: String = buffer_160.content().iter().map(|c| c.symbol()).collect();
+        assert!(content_160.contains("CLARIFICATION PAUSED"));
+        assert!(content_160.contains("where is my invoice"));
     }
 }

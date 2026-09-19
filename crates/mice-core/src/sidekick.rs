@@ -61,6 +61,34 @@ impl SidekickTaskKind {
             Self::General => "🤖",
         }
     }
+
+    pub fn tool_name(self) -> &'static str {
+        match self {
+            Self::SemanticSearch => "semantic_find",
+            Self::AstSearch => "ast_lookup",
+            Self::CodePatch => "apply_patch",
+            Self::TestRun => "run_tests",
+            Self::FileRead => "file_read",
+            Self::FileOpen => "file_open",
+            Self::KnowledgeQuery => "knowledge_query",
+            Self::BatchEdit => "batch_edit",
+            Self::General => "general",
+        }
+    }
+
+    pub fn from_tool_name(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "semantic_find" | "semantic_search" | "semantic" | "search" => Self::SemanticSearch,
+            "ast_lookup" | "ast_search" | "ast" | "symbol" => Self::AstSearch,
+            "apply_patch" | "code_patch" | "patch" => Self::CodePatch,
+            "run_tests" | "test_run" | "test" | "tests" => Self::TestRun,
+            "file_read" | "read" | "file" => Self::FileRead,
+            "file_open" | "open" | "launch" => Self::FileOpen,
+            "knowledge_query" | "knowledge_graph" | "kg" => Self::KnowledgeQuery,
+            "batch_edit" | "batch" => Self::BatchEdit,
+            _ => Self::General,
+        }
+    }
 }
 
 /// Execution status of a delegated sidekick task.

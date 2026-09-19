@@ -10300,6 +10300,18 @@ fn mcp_tools() -> Vec<Value> {
             "description": "Inspect cumulative token savings, estimated dollar cost savings, and context compression ratio achieved by MICE Sidekick sub-agent.",
             "inputSchema": {"type": "object", "properties": {}}
         }),
+        json!({
+            "name": "mice_route_intent",
+            "description": "Route a vague natural-language orchestrator instruction to the right local sidekick tool using TypeSafe Jev System One decision model, returning the chosen tool, confidence score, and auto-run recommendation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instruction": {"type": "string"},
+                    "cwd": {"type": "string"}
+                },
+                "required": ["instruction"]
+            }
+        }),
     ];
     values.extend(tools::tool_schema());
     values
@@ -10324,22 +10336,25 @@ fn mcp_call_tool(
     };
     match name {
         "mice_sidekick_task" => {
-            let kind_str = arguments
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("general");
-            let kind = match kind_str {
-                "semantic_search" => mice_core::SidekickTaskKind::SemanticSearch,
-                "file_open" | "open" => mice_core::SidekickTaskKind::FileOpen,
-                "ast_search" => mice_core::SidekickTaskKind::AstSearch,
-                "code_patch" => mice_core::SidekickTaskKind::CodePatch,
-                "test_run" => mice_core::SidekickTaskKind::TestRun,
-                "file_read" => mice_core::SidekickTaskKind::FileRead,
-                "knowledge_query" => mice_core::SidekickTaskKind::KnowledgeQuery,
-                "batch_edit" => mice_core::SidekickTaskKind::BatchEdit,
-                _ => mice_core::SidekickTaskKind::General,
-            };
             let prompt = string_argument("prompt")?;
+            let kind_opt = arguments.get("kind").and_then(Value::as_str);
+            let kind = match kind_opt {
+                Some("semantic_search") => mice_core::SidekickTaskKind::SemanticSearch,
+                Some("file_open") | Some("open") => mice_core::SidekickTaskKind::FileOpen,
+                Some("ast_search") => mice_core::SidekickTaskKind::AstSearch,
+                Some("code_patch") => mice_core::SidekickTaskKind::CodePatch,
+                Some("test_run") => mice_core::SidekickTaskKind::TestRun,
+                Some("file_read") => mice_core::SidekickTaskKind::FileRead,
+                Some("knowledge_query") => mice_core::SidekickTaskKind::KnowledgeQuery,
+                Some("batch_edit") => mice_core::SidekickTaskKind::BatchEdit,
+                Some("general") => mice_core::SidekickTaskKind::General,
+                _ => {
+                    let ctx = mice_core::IntentRoutingContext::current();
+                    let router = mice_core::create_default_router(Some(&config.jev));
+                    let decision = router.route(prompt, &ctx);
+                    decision.tool
+                }
+            };
             let target_files = arguments
                 .get("target_files")
                 .and_then(Value::as_array)
@@ -10432,6 +10447,29 @@ fn mcp_call_tool(
                 "status": "active"
             });
             Ok(serde_json::to_string_pretty(&stats)?)
+        }
+        "mice_route_intent" => {
+            let instruction = string_argument("instruction")?;
+            let cwd = arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let ctx = mice_core::IntentRoutingContext::new(cwd);
+            let router = mice_core::create_default_router(Some(&config.jev));
+            let decision = router.route(instruction, &ctx);
+            let response = json!({
+                "tool": decision.tool.tool_name(),
+                "display_label": decision.tool.display_label(),
+                "confidence": decision.confidence,
+                "confidence_level": decision.confidence_level,
+                "should_auto_run": decision.confidence_level.should_auto_run(),
+                "probabilities": decision.probabilities,
+                "model": decision.model,
+                "reasoning": decision.reasoning,
+                "is_fallback": decision.is_fallback,
+            });
+            Ok(serde_json::to_string_pretty(&response)?)
         }
         "summarize_text" => mcp_summarize(config, string_argument("text")?),
         "summarize_file" => {
@@ -10686,6 +10724,21 @@ mod mcp_protocol_tests {
             .find(|t| t["name"] == "mice_token_savings")
             .expect("mice_token_savings schema must be present");
         assert_eq!(savings["inputSchema"]["type"], "object");
+
+        // 5. Verify mice_route_intent
+        let route = tools
+            .iter()
+            .find(|t| t["name"] == "mice_route_intent")
+            .expect("mice_route_intent schema must be present");
+        assert!(
+            route["inputSchema"]["properties"]
+                .get("instruction")
+                .is_some()
+        );
+        let route_req = route["inputSchema"]["required"]
+            .as_array()
+            .expect("required array");
+        assert!(route_req.iter().any(|v| v == "instruction"));
     }
 
     #[test]
@@ -10801,6 +10854,83 @@ mod mcp_protocol_tests {
     }
 
     #[test]
+    fn test_mcp_route_intent_tool_calls() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        // 1. High confidence route (e.g. test command)
+        let req1 = json!({
+            "jsonrpc": "2.0",
+            "id": "route_1",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_route_intent",
+                "arguments": {
+                    "instruction": "run tests for mice-core"
+                }
+            }
+        });
+
+        let resp1 = process_mcp_message(&config, &mut session, &req1).expect("response expected");
+        assert_eq!(resp1["result"]["isError"], false);
+        let route_data: Value =
+            serde_json::from_str(resp1["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("valid route intent json");
+        assert_eq!(route_data["tool"], "run_tests");
+        assert!(route_data["confidence"].as_f64().unwrap() >= 0.80);
+        assert_eq!(route_data["confidence_level"], "high");
+        assert_eq!(route_data["should_auto_run"], true);
+
+        // 2. Vague intent requiring clarification
+        let req2 = json!({
+            "jsonrpc": "2.0",
+            "id": "route_2",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_route_intent",
+                "arguments": {
+                    "instruction": "think about new features"
+                }
+            }
+        });
+
+        let resp2 = process_mcp_message(&config, &mut session, &req2).expect("response expected");
+        assert_eq!(resp2["result"]["isError"], false);
+        let route_data2: Value =
+            serde_json::from_str(resp2["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("valid route intent json");
+        assert_eq!(route_data2["should_auto_run"], false);
+        assert_ne!(route_data2["confidence_level"], "high");
+    }
+
+    #[test]
+    fn test_mcp_sidekick_task_auto_routes_when_kind_omitted() {
+        let config = mice_core::Config::default();
+        let mut session = McpSession::default();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": "task_auto_1",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_sidekick_task",
+                "arguments": {
+                    "prompt": "locate my electricity bill invoice"
+                }
+            }
+        });
+
+        let resp = process_mcp_message(&config, &mut session, &req).expect("response expected");
+        assert_eq!(resp["result"]["isError"], false);
+        let task_res: mice_core::SidekickResult =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("valid SidekickResult");
+        assert_eq!(task_res.status, mice_core::SidekickStatus::Success);
+        assert!(task_res.summary.contains("Semantic") || !task_res.matched_items.is_empty());
+        assert!(task_res.token_savings.net_tokens_saved > 0);
+    }
+
+    #[test]
     fn test_mcp_tool_validation_missing_arguments() {
         let config = mice_core::Config::default();
         let mut session = McpSession::default();
@@ -10860,6 +10990,25 @@ mod mcp_protocol_tests {
                 .as_str()
                 .unwrap()
                 .contains("Unknown MICE tool")
+        );
+
+        // 4. Missing instruction in mice_route_intent
+        let req4 = json!({
+            "jsonrpc": "2.0",
+            "id": "err_4",
+            "method": "tools/call",
+            "params": {
+                "name": "mice_route_intent",
+                "arguments": {}
+            }
+        });
+        let resp4 = process_mcp_message(&config, &mut session, &req4).expect("response");
+        assert_eq!(resp4["result"]["isError"], true);
+        assert!(
+            resp4["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Missing non-empty `instruction` argument")
         );
     }
 
