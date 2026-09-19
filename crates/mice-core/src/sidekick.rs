@@ -84,7 +84,7 @@ impl SidekickTaskKind {
             "run_tests" | "test_run" | "test" | "tests" => Self::TestRun,
             "file_read" | "read" | "file" => Self::FileRead,
             "file_open" | "open" | "launch" => Self::FileOpen,
-            "knowledge_query" | "knowledge_graph" | "kg" => Self::KnowledgeQuery,
+            "knowledge_query" | "knowledge_graph" | "kg" | "knowledge" => Self::KnowledgeQuery,
             "batch_edit" | "batch" => Self::BatchEdit,
             _ => Self::General,
         }
@@ -1061,5 +1061,69 @@ mod tests {
         let res = engine.execute(&task).unwrap();
         assert!(!res.matched_items.is_empty());
         assert!(res.token_savings.net_tokens_saved > 0);
+    }
+
+    #[test]
+    fn test_sidekick_task_kind_from_tool_name() {
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("apply_patch"),
+            SidekickTaskKind::CodePatch
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("code_patch"),
+            SidekickTaskKind::CodePatch
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("run_tests"),
+            SidekickTaskKind::TestRun
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("test_run"),
+            SidekickTaskKind::TestRun
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("ast_lookup"),
+            SidekickTaskKind::AstSearch
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("ast_search"),
+            SidekickTaskKind::AstSearch
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("semantic_find"),
+            SidekickTaskKind::SemanticSearch
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("semantic_search"),
+            SidekickTaskKind::SemanticSearch
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("file_read"),
+            SidekickTaskKind::FileRead
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("file_open"),
+            SidekickTaskKind::FileOpen
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("knowledge_query"),
+            SidekickTaskKind::KnowledgeQuery
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("knowledge"),
+            SidekickTaskKind::KnowledgeQuery
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("batch_edit"),
+            SidekickTaskKind::BatchEdit
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("general"),
+            SidekickTaskKind::General
+        );
+        assert_eq!(
+            SidekickTaskKind::from_tool_name("unknown_tool"),
+            SidekickTaskKind::General
+        );
     }
 }

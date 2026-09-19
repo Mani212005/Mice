@@ -230,8 +230,8 @@ pub fn build_decision_request(
 pub fn parse_decision_response(val: &serde_json::Value) -> Result<JevRoutingDecision, JevError> {
     if let Some(err) = val.get("error") {
         let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
+            .as_str()
+            .or_else(|| err.get("message").and_then(|m| m.as_str()))
             .unwrap_or("unknown Jev API error");
         return Err(JevError::Api(msg.to_string()));
     }
@@ -639,6 +639,12 @@ pub fn read_recent_terminal_history(max_lines: usize) -> Vec<String> {
 /// 3. `OPENROUTER_API_KEY` (targets OpenRouter endpoint)
 /// 4. `config.jev.api_key`
 pub fn resolve_jev_credentials(config: Option<&JevConfig>) -> Option<(String, String, String)> {
+    if let Some(cfg) = config
+        && !cfg.enabled
+    {
+        return None;
+    }
+
     let mut api_key = None;
     let mut endpoint = None;
     let mut model = None;
@@ -691,6 +697,11 @@ pub fn resolve_jev_credentials(config: Option<&JevConfig>) -> Option<(String, St
 
 /// Create a configured JevIntentRouter ready for production use.
 pub fn create_default_router(config: Option<&JevConfig>) -> JevIntentRouter {
+    if let Some(cfg) = config
+        && !cfg.enabled
+    {
+        return JevIntentRouter::new(None);
+    }
     let timeout_ms = config.map(|c| c.timeout_ms).unwrap_or(DEFAULT_TIMEOUT_MS);
     let client = resolve_jev_credentials(config).map(|(key, endpoint, model)| {
         let c: Arc<dyn JevClient> = Arc::new(HttpJevClient::new(endpoint, key, model, timeout_ms));
@@ -816,6 +827,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_decision_response_string_error() {
+        let json_str = r#"{
+            "error": "Unauthorized"
+        }"#;
+
+        let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let err = parse_decision_response(&val).unwrap_err();
+        assert!(err.to_string().contains("Unauthorized"));
+    }
+
+    #[test]
     fn test_heuristic_fallback_routing() {
         let ctx = IntentRoutingContext::new(PathBuf::from("."));
 
@@ -888,6 +910,24 @@ mod tests {
 
         let decision = router.route("run tests for mice-core", &ctx);
         assert_eq!(decision.tool, SidekickTaskKind::TestRun);
+        assert!(decision.is_fallback);
+    }
+
+    #[test]
+    fn test_disabled_jev_config_bypasses_credentials() {
+        let disabled_cfg = JevConfig {
+            enabled: false,
+            endpoint: DEFAULT_TYPESAFE_ENDPOINT.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            api_key: Some("explicit_key".to_string()),
+        };
+
+        assert!(resolve_jev_credentials(Some(&disabled_cfg)).is_none());
+        let router = create_default_router(Some(&disabled_cfg));
+        let ctx = IntentRoutingContext::new(PathBuf::from("."));
+        let decision = router.route("fix the lint error in lib.rs", &ctx);
+        assert_eq!(decision.tool, SidekickTaskKind::CodePatch);
         assert!(decision.is_fallback);
     }
 }

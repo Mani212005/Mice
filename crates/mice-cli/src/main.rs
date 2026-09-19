@@ -10257,7 +10257,7 @@ fn mcp_tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["semantic_search", "ast_search", "code_patch", "test_run", "file_read", "file_open", "knowledge_query", "batch_edit", "general"]},
+                    "kind": {"type": "string", "enum": ["apply_patch", "code_patch", "run_tests", "test_run", "ast_lookup", "ast_search", "semantic_find", "semantic_search", "file_read", "file_open", "knowledge_query", "batch_edit", "general", "auto"]},
                     "prompt": {"type": "string"},
                     "target_files": {"type": "array", "items": {"type": "string"}},
                     "code_patch_target": {"type": "string"},
@@ -10339,15 +10339,9 @@ fn mcp_call_tool(
             let prompt = string_argument("prompt")?;
             let kind_opt = arguments.get("kind").and_then(Value::as_str);
             let kind = match kind_opt {
-                Some("semantic_search") => mice_core::SidekickTaskKind::SemanticSearch,
-                Some("file_open") | Some("open") => mice_core::SidekickTaskKind::FileOpen,
-                Some("ast_search") => mice_core::SidekickTaskKind::AstSearch,
-                Some("code_patch") => mice_core::SidekickTaskKind::CodePatch,
-                Some("test_run") => mice_core::SidekickTaskKind::TestRun,
-                Some("file_read") => mice_core::SidekickTaskKind::FileRead,
-                Some("knowledge_query") => mice_core::SidekickTaskKind::KnowledgeQuery,
-                Some("batch_edit") => mice_core::SidekickTaskKind::BatchEdit,
-                Some("general") => mice_core::SidekickTaskKind::General,
+                Some(k) if !k.trim().is_empty() && !k.trim().eq_ignore_ascii_case("auto") => {
+                    mice_core::SidekickTaskKind::from_tool_name(k)
+                }
                 _ => {
                     let ctx = mice_core::IntentRoutingContext::current();
                     let router = mice_core::create_default_router(Some(&config.jev));

@@ -1396,17 +1396,10 @@ pub fn execute_delegate_cli(args: &[String]) -> Result<(), Box<dyn std::error::E
         match args[i].as_str() {
             "--kind" | "-k" => {
                 if i + 1 < args.len() {
-                    explicit_kind = Some(match args[i + 1].to_lowercase().as_str() {
-                        "semantic" | "search" => SidekickTaskKind::SemanticSearch,
-                        "open" | "file_open" | "launch" => SidekickTaskKind::FileOpen,
-                        "ast" | "symbol" => SidekickTaskKind::AstSearch,
-                        "patch" | "code_patch" => SidekickTaskKind::CodePatch,
-                        "test" | "tests" => SidekickTaskKind::TestRun,
-                        "read" | "file" => SidekickTaskKind::FileRead,
-                        "kg" | "knowledge" => SidekickTaskKind::KnowledgeQuery,
-                        "batch" => SidekickTaskKind::BatchEdit,
-                        _ => SidekickTaskKind::General,
-                    });
+                    let val = &args[i + 1];
+                    if !val.trim().is_empty() && !val.trim().eq_ignore_ascii_case("auto") {
+                        explicit_kind = Some(SidekickTaskKind::from_tool_name(val));
+                    }
                     i += 1;
                 }
             }
