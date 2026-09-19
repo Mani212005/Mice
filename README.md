@@ -17,10 +17,11 @@ Instead of consuming tens of thousands of tokens streaming massive raw files and
 
 - **⚡ Sub-Millisecond Semantic Document Finder (`mice-core::finder`):** Instant local inverted-index semantic search across codebases, receipts, invoices, tax documents, and system files.
 - **🧠 In-Memory Semantic Knowledge Graph (`mice-core::knowledge_graph`):** Ultra-lightweight (< 15 MB RAM) 2-hop entity and relationship graph.
+- **🎯 TypeSafe Jev Intent Router (`mice-core::jev`):** Fast predictive decision model routing vague instructions to the right local tool with confidence gating (auto-run on high confidence, pause-and-prompt on medium/low) and deterministic fallback.
 - **🐭 Sidekick Execution Engine (`mice-core::sidekick`):** Deterministic and local SLM tool loops executing delegated coding sub-tasks.
 - **📊 Token Savings & Cost Metrics:** Tracks ingested vs returned tokens, context compression ratio, and estimated dollar savings.
 - **🖥️ Ratatui TUI Dashboard (`mice tui`):** Rich terminal dashboard displaying paired orchestrators, live delegated sub-agent tasks, cumulative token savings, and an interactive diff inspector.
-- **🔌 Model Context Protocol (MCP) Server (`mice mcp-server`):** Direct stdio MCP tools (`mice_sidekick_task`, `mice_semantic_find`, `mice_knowledge_query`, `mice_token_savings`) for Claude Code, Cursor, Codex, and Antigravity.
+- **🔌 Model Context Protocol (MCP) Server (`mice mcp-server`):** Direct stdio MCP tools (`mice_sidekick_task`, `mice_route_intent`, `mice_semantic_find`, `mice_knowledge_query`, `mice_token_savings`) for Claude Code, Cursor, Codex, and Antigravity.
 
 ---
 
@@ -29,7 +30,7 @@ Instead of consuming tens of thousands of tokens streaming massive raw files and
 ```
 projects/Mice/
 ├── crates/
-│   ├── mice-core/         # Sidekick engine, SemanticFinder, KnowledgeGraph, token metrics
+│   ├── mice-core/         # Sidekick engine, Jev intent router, SemanticFinder, KnowledgeGraph, token metrics
 │   ├── mice-cli/          # Ratatui TUI dashboard, CLI dispatcher, MCP server implementation
 │   ├── mice-ipc/          # JSON-RPC 2.0 protocol types and framing
 │   └── mice-providers/    # Local Ollama & cloud provider integrations
@@ -48,6 +49,8 @@ mice tui
 # or simply
 mice
 ```
+- `[r]` / `[i]` Route intent via Jev System One
+- `[v]` Trigger vague intent clarification prompt
 - `[d]` Delegate sample AST search
 - `[s]` Query Semantic Document Finder
 - `[t]` Run fast local test suite
@@ -58,6 +61,9 @@ mice
 ### CLI Delegation
 Run delegated routines directly from scripts or sub-agent runners:
 ```bash
+# Automatic intent routing via Jev System One
+mice delegate "run the core unit tests"
+
 # Semantic document search
 mice delegate --kind semantic --prompt "get my electricity bill"
 

@@ -16,6 +16,7 @@ It executes token-heavy routine engineering tasks locally (semantic document ret
 - For basic architecture boundaries, see [README.md](README.md).
 - Add or change wire protocol types in `crates/mice-ipc`.
 - Sidekick task types and token metrics live in `crates/mice-core/src/sidekick.rs`.
+- Intent routing and TypeSafe Jev System One decision models live in `crates/mice-core/src/jev.rs`.
 - Interactive terminal dashboards live in `crates/mice-cli/src/sidekick_cli.rs` using Ratatui.
 - MCP tool endpoints are defined in `crates/mice-cli/src/main.rs`.
 
@@ -62,6 +63,6 @@ Targeted technical question or validation request.
 
 ## Local Development & Defaults
 
-- Read API keys (`OPENAI_API_KEY`, `GROQ_API_KEY`) only from environment variables at runtime.
+- Read API keys (`OPENAI_API_KEY`, `GROQ_API_KEY`, `TYPESAFE_API_KEY`, `JEV_API_KEY`, `OPENROUTER_API_KEY`) only from environment variables at runtime.
 - The default configuration path is `~/Library/Application Support/MICE/config.toml`; never add a real config file to git.
 - Automated tests must run completely network-free using mock servers and deterministic fixtures.
